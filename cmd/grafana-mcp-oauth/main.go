@@ -59,13 +59,20 @@ func main() {
 
 	cfg := config.LoadFromEnv()
 
-	// Apply CLI flag overrides to configuration
+	// Apply CLI flag overrides to configuration with proper port precedence
 	if *flagMode != "" {
 		cfg.Mode = strings.ToLower(strings.TrimSpace(*flagMode))
 	}
 	if *flagPort != "" {
 		cfg.HTTPPort = *flagPort
+	} else if os.Getenv("PORT") == "" && os.Getenv("HTTP_PORT") == "" {
+		if cfg.Mode == server.ModeExtAuthz {
+			cfg.HTTPPort = "8081"
+		} else {
+			cfg.HTTPPort = "8080"
+		}
 	}
+
 	if *flagGRPCPort != "" {
 		cfg.GRPCPort = *flagGRPCPort
 	}
@@ -104,15 +111,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Listen for OS signals for graceful shutdown
+	// Listen for OS signals or fatal server errors
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
+	var fatalErr error
 	select {
 	case sig := <-sigChan:
 		logger.Info("Received termination signal, shutting down gracefully", "signal", sig.String())
-	case err := <-errChan:
-		logger.Error("Server encountered fatal error", "error", err)
+	case fatalErr = <-errChan:
+		logger.Error("Server encountered fatal error", "error", fatalErr)
 	}
 
 	ctxShutdown, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
@@ -120,6 +128,11 @@ func main() {
 
 	if err := srv.Shutdown(ctxShutdown); err != nil {
 		logger.Error("Error during server shutdown", "error", err)
+		os.Exit(1)
+	}
+
+	if fatalErr != nil {
+		logger.Error("Server exited abnormally due to fatal error", "error", fatalErr)
 		os.Exit(1)
 	}
 

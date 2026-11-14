@@ -75,6 +75,13 @@ func New(opts Options) (*Server, error) {
 	}
 	cfg.Mode = mode
 
+	// Ensure ExtAuthz mode defaults HTTP port to 8081 if no explicit PORT/HTTP_PORT was provided
+	if mode == ModeExtAuthz {
+		if cfg.HTTPPort == "" || (cfg.HTTPPort == "8080" && os.Getenv("PORT") == "" && os.Getenv("HTTP_PORT") == "") {
+			cfg.HTTPPort = "8081"
+		}
+	}
+
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
@@ -133,11 +140,9 @@ func New(opts Options) (*Server, error) {
 	if mode == ModeExtAuthz || mode == ModeAll {
 		extAuthServer := extauthz.NewServer(sessionStore, cfg.BaseURL, logger)
 
-		// HTTP Check endpoints (compatible with Envoy HTTP filter, NGINX auth_request, Traefik ForwardAuth)
-		mux.HandleFunc("GET /extauthz/check", extAuthServer.HandleHTTPCheck)
-		mux.HandleFunc("POST /extauthz/check", extAuthServer.HandleHTTPCheck)
-		mux.HandleFunc("GET /mcp/auth/check", extAuthServer.HandleHTTPCheck)
-		mux.HandleFunc("POST /mcp/auth/check", extAuthServer.HandleHTTPCheck)
+		// HTTP Check endpoints (method-agnostic: supports GET, POST, PUT, DELETE, OPTIONS for Envoy/NGINX/Traefik)
+		mux.HandleFunc("/extauthz/check", extAuthServer.HandleHTTPCheck)
+		mux.HandleFunc("/mcp/auth/check", extAuthServer.HandleHTTPCheck)
 
 		// gRPC Server setup
 		grpcServer := grpc.NewServer()
@@ -156,6 +161,7 @@ func New(opts Options) (*Server, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize reverse proxy: %w", err)
 		}
+		mux.Handle("/mcp", mcpProxy)
 		mux.Handle("/mcp/", mcpProxy)
 	}
 
@@ -190,7 +196,7 @@ func New(opts Options) (*Server, error) {
 	return s, nil
 }
 
-// Start starts listening and serving HTTP (and gRPC if enabled).
+// Start binds listeners upfront and starts serving HTTP (and gRPC if enabled).
 // Returns an error channel that will receive any fatal server errors.
 func (s *Server) Start() (<-chan error, error) {
 	s.mu.Lock()
@@ -200,9 +206,7 @@ func (s *Server) Start() (<-chan error, error) {
 		return nil, fmt.Errorf("server is already running")
 	}
 
-	errChan := make(chan error, 2)
-
-	// 1. Start HTTP Listener
+	// 1. Bind HTTP Listener upfront before launching any background goroutines
 	if s.httpListener == nil {
 		ln, err := net.Listen("tcp", ":"+s.cfg.HTTPPort)
 		if err != nil {
@@ -212,6 +216,23 @@ func (s *Server) Start() (<-chan error, error) {
 	}
 	s.httpAddr = s.httpListener.Addr().String()
 
+	// 2. Bind gRPC Listener upfront if in extauthz or all mode
+	if s.grpcServer != nil {
+		if s.grpcListener == nil {
+			ln, err := net.Listen("tcp", ":"+s.cfg.GRPCPort)
+			if err != nil {
+				_ = s.httpListener.Close()
+				s.httpListener = nil
+				return nil, fmt.Errorf("failed to listen on gRPC port %s: %w", s.cfg.GRPCPort, err)
+			}
+			s.grpcListener = ln
+		}
+		s.grpcAddr = s.grpcListener.Addr().String()
+	}
+
+	errChan := make(chan error, 2)
+
+	// 3. Launch HTTP serving goroutine
 	go func() {
 		s.logger.Info("HTTP server listening", "mode", s.cfg.Mode, "addr", s.httpAddr)
 		if err := s.httpServer.Serve(s.httpListener); err != nil && err != http.ErrServerClosed {
@@ -219,18 +240,8 @@ func (s *Server) Start() (<-chan error, error) {
 		}
 	}()
 
-	// 2. Start gRPC Listener if in extauthz or all mode
-	if s.grpcServer != nil {
-		if s.grpcListener == nil {
-			ln, err := net.Listen("tcp", ":"+s.cfg.GRPCPort)
-			if err != nil {
-				_ = s.httpListener.Close()
-				return nil, fmt.Errorf("failed to listen on gRPC port %s: %w", s.cfg.GRPCPort, err)
-			}
-			s.grpcListener = ln
-		}
-		s.grpcAddr = s.grpcListener.Addr().String()
-
+	// 4. Launch gRPC serving goroutine if enabled
+	if s.grpcServer != nil && s.grpcListener != nil {
 		go func() {
 			s.logger.Info("gRPC Envoy ext_authz server listening", "mode", s.cfg.Mode, "addr", s.grpcAddr)
 			if err := s.grpcServer.Serve(s.grpcListener); err != nil {
@@ -262,7 +273,7 @@ func (s *Server) Mode() string {
 	return s.cfg.Mode
 }
 
-// Shutdown gracefully stops both HTTP and gRPC servers.
+// Shutdown gracefully stops both HTTP and gRPC servers concurrently within the context deadline.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -273,14 +284,38 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 	s.logger.Info("Shutting down Grafana MCP Gateway gracefully...", "mode", s.cfg.Mode)
 
+	var wg sync.WaitGroup
+	var httpErr error
+
+	// Concurrently drain gRPC server with deadline protection
 	if s.grpcServer != nil {
-		s.grpcServer.GracefulStop()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			stopped := make(chan struct{})
+			go func() {
+				s.grpcServer.GracefulStop()
+				close(stopped)
+			}()
+			select {
+			case <-ctx.Done():
+				s.logger.Warn("gRPC ext_authz graceful stop timed out, forcing immediate stop")
+				s.grpcServer.Stop()
+			case <-stopped:
+			}
+		}()
 	}
 
-	var httpErr error
+	// Concurrently drain HTTP server
 	if s.httpServer != nil {
-		httpErr = s.httpServer.Shutdown(ctx)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			httpErr = s.httpServer.Shutdown(ctx)
+		}()
 	}
+
+	wg.Wait()
 
 	if s.rdb != nil {
 		_ = s.rdb.Close()

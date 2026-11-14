@@ -232,3 +232,66 @@ func TestServer_AllMode(t *testing.T) {
 	default:
 	}
 }
+
+func TestServer_DefaultListenerBinding(t *testing.T) {
+	_, rdb := setupTestRedis(t)
+
+	cfg := &config.AppConfig{
+		Mode:         server.ModeAll,
+		HTTPPort:     "0",
+		GRPCPort:     "0",
+		BaseURL:      "http://localhost",
+		TargetMCPURL: "http://127.0.0.1:9999",
+		MasterSecret: []byte("01234567890123456789012345678901"),
+		SessionTTL:   time.Hour,
+		RefreshTTL:   time.Hour * 24,
+	}
+
+	// Supply nil listeners to exercise internal net.Listen socket creation
+	srv, err := server.New(server.Options{
+		Config:      cfg,
+		RedisClient: rdb,
+	})
+	require.NoError(t, err)
+
+	errChan, err := srv.Start()
+	require.NoError(t, err)
+
+	require.NotEmpty(t, srv.HTTPAddr())
+	require.NotEmpty(t, srv.GRPCAddr())
+
+	client := testHTTPClient()
+	resp, err := client.Get("http://" + srv.HTTPAddr() + "/healthz")
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	_ = resp.Body.Close()
+
+	ctxShut, cancelShut := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelShut()
+	err = srv.Shutdown(ctxShut)
+	require.NoError(t, err)
+
+	select {
+	case srvErr := <-errChan:
+		t.Fatalf("Unexpected server error: %v", srvErr)
+	default:
+	}
+}
+
+func TestServer_ExtAuthzDefaultPortResolution(t *testing.T) {
+	_, rdb := setupTestRedis(t)
+
+	cfg := &config.AppConfig{
+		Mode:         server.ModeExtAuthz,
+		HTTPPort:     "", // unset HTTPPort
+		MasterSecret: []byte("01234567890123456789012345678901"),
+	}
+
+	srv, err := server.New(server.Options{
+		Config:      cfg,
+		RedisClient: rdb,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "8081", cfg.HTTPPort, "ExtAuthz mode must default HTTP port to 8081")
+	assert.Equal(t, server.ModeExtAuthz, srv.Mode())
+}

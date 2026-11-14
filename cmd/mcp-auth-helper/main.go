@@ -15,6 +15,9 @@ import (
 func main() {
 	cfg := config.LoadFromEnv()
 	cfg.Mode = server.ModeExtAuthz
+	if os.Getenv("PORT") == "" && os.Getenv("HTTP_PORT") == "" {
+		cfg.HTTPPort = "8081"
+	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	slog.SetDefault(logger)
@@ -39,16 +42,25 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
+	var fatalErr error
 	select {
 	case sig := <-sigChan:
 		logger.Info("Received termination signal, shutting down gracefully", "signal", sig.String())
-	case err := <-errChan:
-		logger.Error("Server encountered fatal error", "error", err)
+	case fatalErr = <-errChan:
+		logger.Error("Server encountered fatal error", "error", fatalErr)
 	}
 
 	ctxShutdown, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelShutdown()
 
-	_ = srv.Shutdown(ctxShutdown)
+	if err := srv.Shutdown(ctxShutdown); err != nil {
+		logger.Error("Error during server shutdown", "error", err)
+		os.Exit(1)
+	}
+
+	if fatalErr != nil {
+		os.Exit(1)
+	}
+
 	logger.Info("Shutdown complete")
 }
