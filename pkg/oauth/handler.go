@@ -198,7 +198,7 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Set browser state cookie to protect against OAuth Login CSRF / Session Fixation
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- state cookie Secure flag matches scheme (allows HTTP in local dev/testing)
 		Name:     "mcp_auth_state",
 		Value:    internalState,
 		Path:     "/mcp/auth",
@@ -245,11 +245,13 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Clear the state cookie
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- state cookie clearance
 		Name:     "mcp_auth_state",
 		Value:    "",
 		Path:     "/mcp/auth",
 		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   strings.HasPrefix(h.cfg.BaseURL, "https://"),
 		MaxAge:   -1,
 	})
 
@@ -330,6 +332,7 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 			"username", userInfo.Login,
 		)
 
+		// #nosec G710 -- req.RedirectURI is strictly validated against local loopback whitelist in HandleAuthorize
 		http.Redirect(w, r, redirectTarget.String(), http.StatusFound)
 		return
 	}
@@ -466,6 +469,7 @@ func (h *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")
 	w.WriteHeader(http.StatusOK)
+	// #nosec G117 -- TokenResponse explicitly returns refresh_token per RFC 6749 Section 5.1
 	_ = json.NewEncoder(w).Encode(TokenResponse{
 		AccessToken:  accessToken,
 		TokenType:    "Bearer",
@@ -529,6 +533,7 @@ func (h *Handler) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")
 	w.WriteHeader(http.StatusOK)
+	// #nosec G117 -- TokenResponse explicitly returns refresh_token per RFC 6749 Section 5.1
 	_ = json.NewEncoder(w).Encode(TokenResponse{
 		AccessToken:  newAccessToken,
 		TokenType:    "Bearer",

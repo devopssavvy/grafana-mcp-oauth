@@ -208,7 +208,7 @@ func (s *Server) Start() (<-chan error, error) {
 
 	// 1. Bind HTTP Listener upfront before launching any background goroutines
 	if s.httpListener == nil {
-		ln, err := net.Listen("tcp", ":"+s.cfg.HTTPPort)
+		ln, err := net.Listen("tcp", ":"+s.cfg.HTTPPort) // #nosec G102 -- Server intentionally binds to all interfaces in container environment
 		if err != nil {
 			return nil, fmt.Errorf("failed to listen on HTTP port %s: %w", s.cfg.HTTPPort, err)
 		}
@@ -219,7 +219,7 @@ func (s *Server) Start() (<-chan error, error) {
 	// 2. Bind gRPC Listener upfront if in extauthz or all mode
 	if s.grpcServer != nil {
 		if s.grpcListener == nil {
-			ln, err := net.Listen("tcp", ":"+s.cfg.GRPCPort)
+			ln, err := net.Listen("tcp", ":"+s.cfg.GRPCPort) // #nosec G102 -- gRPC Server intentionally binds to all interfaces in container environment
 			if err != nil {
 				_ = s.httpListener.Close()
 				s.httpListener = nil
