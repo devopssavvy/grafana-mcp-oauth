@@ -26,10 +26,11 @@ var (
 )
 
 const (
-	sessionKeyPrefix     = "mcp:session:"
-	refreshKeyPrefix     = "mcp:refresh:"
-	pendingAuthKeyPrefix = "mcp:pending_auth:"
-	authCodeKeyPrefix    = "mcp:auth_code:"
+	sessionKeyPrefix       = "mcp:session:"
+	refreshKeyPrefix       = "mcp:refresh:"
+	legacyRefreshKeyPrefix = "mcp:legacy_refresh:"
+	pendingAuthKeyPrefix   = "mcp:pending_auth:"
+	authCodeKeyPrefix      = "mcp:auth_code:"
 
 	hkdfInfoSession     = "mcp-session-encryption"
 	hkdfInfoRefresh     = "mcp-refresh-encryption"
@@ -95,11 +96,13 @@ type SessionStore interface {
 	// Distributed pending auth flows (login -> callback)
 	SavePendingAuth(ctx context.Context, state string, req *PendingAuthRequest, ttl time.Duration) error
 	GetPendingAuth(ctx context.Context, state string) (*PendingAuthRequest, error)
+	GetAndDeletePendingAuth(ctx context.Context, state string) (*PendingAuthRequest, error)
 	DeletePendingAuth(ctx context.Context, state string) error
 
 	// Distributed authorization codes (callback -> token exchange)
 	SaveAuthCode(ctx context.Context, code string, authCode *AuthCodeContext, ttl time.Duration) error
 	GetAuthCode(ctx context.Context, code string) (*AuthCodeContext, error)
+	GetAndDeleteAuthCode(ctx context.Context, code string) (*AuthCodeContext, error)
 	DeleteAuthCode(ctx context.Context, code string) error
 }
 
@@ -109,10 +112,13 @@ type RedisSessionStore struct {
 	masterSecret []byte
 }
 
-// NewRedisSessionStore creates a new RedisSessionStore with the given master secret.
+// NewRedisSessionStore creates a new RedisSessionStore.
+// If masterSecret is nil or empty, it operates in Pure Client-Derived Key mode (zero-config, RFC 5869),
+// deriving deterministic Redis keys and encryption keys from the client token and domain separation salt.
+// If masterSecret is provided, it must be at least 16 bytes.
 func NewRedisSessionStore(client redis.UniversalClient, masterSecret []byte) (*RedisSessionStore, error) {
-	if len(masterSecret) < 16 {
-		return nil, errors.New("master secret must be at least 16 bytes")
+	if len(masterSecret) > 0 && len(masterSecret) < 16 {
+		return nil, errors.New("master secret must be at least 16 bytes when provided")
 	}
 	return &RedisSessionStore{
 		client:       client,
@@ -129,8 +135,7 @@ func (s *RedisSessionStore) SaveSession(ctx context.Context, token string, sessi
 		return fmt.Errorf("failed to derive encryption key: %w", err)
 	}
 
-	// #nosec G117 -- session payload is encrypted with AES-256-GCM before storage
-	payload, err := json.Marshal(session)
+	payload, err := json.Marshal(sessionToMap(session))
 	if err != nil {
 		return fmt.Errorf("failed to marshal session: %w", err)
 	}
@@ -213,8 +218,7 @@ func (s *RedisSessionStore) SaveRefreshTokenSession(ctx context.Context, refresh
 		return fmt.Errorf("failed to derive refresh encryption key: %w", err)
 	}
 
-	// #nosec G117 -- session payload is encrypted with AES-256-GCM before storage
-	payload, err := json.Marshal(session)
+	payload, err := json.Marshal(sessionToMap(session))
 	if err != nil {
 		return fmt.Errorf("failed to marshal refresh session: %w", err)
 	}
@@ -272,7 +276,7 @@ func (s *RedisSessionStore) GetAndDeleteRefreshSession(ctx context.Context, refr
 
 // SaveRefreshToken stores a mapping from refresh_token to access_token.
 func (s *RedisSessionStore) SaveRefreshToken(ctx context.Context, refreshToken string, token string, ttl time.Duration) error {
-	redisKey := refreshKeyPrefix + crypto.HashTokenKey(refreshToken, s.masterSecret)
+	redisKey := legacyRefreshKeyPrefix + crypto.HashTokenKey(refreshToken, s.masterSecret)
 
 	encKey, err := crypto.DeriveKeyHKDF(refreshToken, s.masterSecret, []byte(hkdfInfoRefresh))
 	if err != nil {
@@ -293,7 +297,7 @@ func (s *RedisSessionStore) SaveRefreshToken(ctx context.Context, refreshToken s
 
 // GetTokenByRefreshToken retrieves the access token associated with a refresh token.
 func (s *RedisSessionStore) GetTokenByRefreshToken(ctx context.Context, refreshToken string) (string, error) {
-	redisKey := refreshKeyPrefix + crypto.HashTokenKey(refreshToken, s.masterSecret)
+	redisKey := legacyRefreshKeyPrefix + crypto.HashTokenKey(refreshToken, s.masterSecret)
 
 	encrypted, err := s.client.Get(ctx, redisKey).Bytes()
 	if errors.Is(err, redis.Nil) {
@@ -317,7 +321,7 @@ func (s *RedisSessionStore) GetTokenByRefreshToken(ctx context.Context, refreshT
 
 // DeleteRefreshToken removes a refresh token mapping from Redis.
 func (s *RedisSessionStore) DeleteRefreshToken(ctx context.Context, refreshToken string) error {
-	redisKey := refreshKeyPrefix + crypto.HashTokenKey(refreshToken, s.masterSecret)
+	redisKey := legacyRefreshKeyPrefix + crypto.HashTokenKey(refreshToken, s.masterSecret)
 	return s.client.Del(ctx, redisKey).Err()
 }
 
@@ -364,6 +368,44 @@ func (s *RedisSessionStore) GetPendingAuth(ctx context.Context, state string) (*
 	}
 
 	decrypted, err := crypto.Decrypt(encrypted, encKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt pending auth: %w", err)
+	}
+
+	var req PendingAuthRequest
+	if err := json.Unmarshal(decrypted, &req); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal pending auth: %w", err)
+	}
+
+	return &req, nil
+}
+
+// GetAndDeletePendingAuth atomically retrieves and deletes a pending auth request using a Lua script.
+// This enforces single-use state consumption and eliminates race conditions.
+func (s *RedisSessionStore) GetAndDeletePendingAuth(ctx context.Context, state string) (*PendingAuthRequest, error) {
+	redisKey := pendingAuthKeyPrefix + crypto.HashTokenKey(state, s.masterSecret)
+
+	luaScript := redis.NewScript(`
+		local val = redis.call('GET', KEYS[1])
+		if val then
+			redis.call('DEL', KEYS[1])
+		end
+		return val
+	`)
+
+	res, err := luaScript.Run(ctx, s.client, []string{redisKey}).Text()
+	if errors.Is(err, redis.Nil) || res == "" {
+		return nil, ErrPendingAuthNotFound
+	} else if err != nil {
+		return nil, fmt.Errorf("redis getdel pending auth failed: %w", err)
+	}
+
+	encKey, err := crypto.DeriveKeyHKDF(state, s.masterSecret, []byte(hkdfInfoPendingAuth))
+	if err != nil {
+		return nil, fmt.Errorf("failed to derive pending auth encryption key: %w", err)
+	}
+
+	decrypted, err := crypto.Decrypt([]byte(res), encKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decrypt pending auth: %w", err)
 	}
@@ -437,8 +479,60 @@ func (s *RedisSessionStore) GetAuthCode(ctx context.Context, code string) (*Auth
 	return &authCtx, nil
 }
 
+// GetAndDeleteAuthCode atomically retrieves and deletes an authorization code using a Lua script.
+// This enforces single-use authorization code consumption per RFC 6749 Section 4.1.2 and eliminates race conditions.
+func (s *RedisSessionStore) GetAndDeleteAuthCode(ctx context.Context, code string) (*AuthCodeContext, error) {
+	redisKey := authCodeKeyPrefix + crypto.HashTokenKey(code, s.masterSecret)
+
+	luaScript := redis.NewScript(`
+		local val = redis.call('GET', KEYS[1])
+		if val then
+			redis.call('DEL', KEYS[1])
+		end
+		return val
+	`)
+
+	res, err := luaScript.Run(ctx, s.client, []string{redisKey}).Text()
+	if errors.Is(err, redis.Nil) || res == "" {
+		return nil, ErrAuthCodeNotFound
+	} else if err != nil {
+		return nil, fmt.Errorf("redis getdel auth code failed: %w", err)
+	}
+
+	encKey, err := crypto.DeriveKeyHKDF(code, s.masterSecret, []byte(hkdfInfoAuthCode))
+	if err != nil {
+		return nil, fmt.Errorf("failed to derive auth code encryption key: %w", err)
+	}
+
+	decrypted, err := crypto.Decrypt([]byte(res), encKey)
+	if err != nil {
+		return nil, ErrAuthCodeNotFound
+	}
+
+	var authCtx AuthCodeContext
+	if err := json.Unmarshal(decrypted, &authCtx); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal auth code context: %w", err)
+	}
+
+	return &authCtx, nil
+}
+
 // DeleteAuthCode removes an authorization code from Redis.
 func (s *RedisSessionStore) DeleteAuthCode(ctx context.Context, code string) error {
 	redisKey := authCodeKeyPrefix + crypto.HashTokenKey(code, s.masterSecret)
 	return s.client.Del(ctx, redisKey).Err()
+}
+
+func sessionToMap(s *SessionData) map[string]any {
+	return map[string]any{
+		"user_id":         s.UserID,
+		"username":        s.Username,
+		"email":           s.Email,
+		"grafana_session": s.GrafanaSession,
+		"refresh_token":   s.RefreshToken,
+		"id_token":        s.IDToken,
+		"user_claims":     s.UserClaims,
+		"created_at":      s.CreatedAt,
+		"expires_at":      s.ExpiresAt,
+	}
 }

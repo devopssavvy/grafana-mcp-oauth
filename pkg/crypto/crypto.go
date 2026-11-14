@@ -23,20 +23,31 @@ var (
 	ErrInvalidKeySize = errors.New("invalid key size: must be 32 bytes")
 )
 
-// HashTokenKey computes an HMAC-SHA3-512 over the token using the provided server secret.
-// This produces a 128-character hex string suitable for use as a deterministic, collision-resistant
-// Redis key without revealing the token or allowing offline rainbow table attacks.
+// DefaultDomainSalt is the standard domain separation salt for Pure Client-Derived Key mode (RFC 5869).
+// When no server master secret is configured, this static domain salt provides cryptographic domain
+// separation. Since client tokens contain 256 bits of high entropy, precomputation/rainbow tables
+// are mathematically impossible.
+const DefaultDomainSalt = "grafana-mcp-oauth-v1-domain-salt"
+
+// HashTokenKey computes a deterministic, collision-resistant hash of the token for use as a Redis key.
+// If secret is nil or empty, DefaultDomainSalt is used as the HMAC key (Pure Client-Derived Key mode per RFC 5869).
+// Since the token has 256 bits of cryptographic entropy, the resulting 128-char hex string is irreversible
+// and immune to rainbow tables or offline brute-force attacks.
 func HashTokenKey(token string, secret []byte) string {
+	if len(secret) == 0 {
+		secret = []byte(DefaultDomainSalt)
+	}
 	mac := hmac.New(sha3.New512, secret)
 	mac.Write([]byte(token))
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
 // DeriveKeyHKDF derives a 32-byte symmetric key from the token using HKDF-SHA3-512.
+// If salt is nil or empty, DefaultDomainSalt is used as the domain-separation salt.
 // It is designed for low-latency (< 0.1ms), high-throughput cryptographic operations.
 func DeriveKeyHKDF(token string, salt []byte, info []byte) ([]byte, error) {
 	if len(salt) == 0 {
-		return nil, errors.New("salt cannot be empty")
+		salt = []byte(DefaultDomainSalt)
 	}
 	kdf := hkdf.New(sha3.New512, []byte(token), salt, info)
 	key := make([]byte, chacha20poly1305.KeySize)

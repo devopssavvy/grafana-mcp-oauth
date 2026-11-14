@@ -22,23 +22,30 @@ import (
 
 // Config holds configuration parameters for the OAuth handler.
 type Config struct {
-	BaseURL          string // e.g. "http://localhost:8080" (Gateway Public Base URL)
-	GrafanaURL       string // e.g. "http://grafana:3000" (Internal backend API URL)
-	GrafanaPublicURL string // e.g. "http://localhost:8080" (Public URL for browser redirects, defaults to BaseURL)
-	CallbackBaseURL  string // e.g. "http://localhost:8080/mcp/auth/callback" or relative "/mcp/auth/callback"
-	IdPTokenURL      string
-	ClientID         string
-	ClientSecret     string
-	SessionTTL       time.Duration
-	RefreshTTL       time.Duration
-	HTTPClient       *http.Client
-	Logger           *slog.Logger
+	BaseURL           string // e.g. "http://localhost:8080" (Gateway Public Base URL)
+	GrafanaURL        string // e.g. "http://grafana:3000" (Internal backend API URL)
+	GrafanaPublicURL  string // e.g. "http://localhost:8080" (Public URL for browser redirects, defaults to BaseURL)
+	CallbackBaseURL   string // e.g. "http://localhost:8080/mcp/auth/callback" or relative "/mcp/auth/callback"
+	CookieSecure      bool   // Force Secure attribute on cookies
+	IdPTokenURL       string
+	ClientID          string
+	ClientSecret      string
+	SessionTTL        time.Duration
+	RefreshTTL        time.Duration
+	PendingAuthTTL    time.Duration
+	AuthCodeTTL       time.Duration
+	RateLimitLoginRPM int // Max requests per minute per IP for /mcp/auth/login (default: 60)
+	RateLimitTokenRPM int // Max requests per minute per IP for /mcp/auth/token (default: 120)
+	HTTPClient        *http.Client
+	Logger            *slog.Logger
 }
 
 // Handler manages browser SSO login, MCP client discovery (RFC 9728, RFC 8414), PKCE, and token lifecycle.
 type Handler struct {
-	cfg   Config
-	store store.SessionStore
+	cfg          Config
+	store        store.SessionStore
+	loginLimiter *IPRateLimiter
+	tokenLimiter *IPRateLimiter
 }
 
 // GrafanaUser is an alias to store.GrafanaUser for API compatibility.
@@ -77,6 +84,12 @@ func NewHandler(cfg Config, s store.SessionStore) *Handler {
 	if cfg.RefreshTTL <= 0 {
 		cfg.RefreshTTL = 30 * 24 * time.Hour
 	}
+	if cfg.PendingAuthTTL <= 0 {
+		cfg.PendingAuthTTL = 5 * time.Minute
+	}
+	if cfg.AuthCodeTTL <= 0 {
+		cfg.AuthCodeTTL = 1 * time.Minute
+	}
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{Timeout: 10 * time.Second}
 	}
@@ -84,9 +97,20 @@ func NewHandler(cfg Config, s store.SessionStore) *Handler {
 		cfg.Logger = slog.Default()
 	}
 
+	loginRPM := cfg.RateLimitLoginRPM
+	if loginRPM <= 0 {
+		loginRPM = 60
+	}
+	tokenRPM := cfg.RateLimitTokenRPM
+	if tokenRPM <= 0 {
+		tokenRPM = 120
+	}
+
 	return &Handler{
-		cfg:   cfg,
-		store: s,
+		cfg:          cfg,
+		store:        s,
+		loginLimiter: NewIPRateLimiter(loginRPM, time.Minute),
+		tokenLimiter: NewIPRateLimiter(tokenRPM, time.Minute),
 	}
 }
 
@@ -147,6 +171,15 @@ func (h *Handler) HandleAuthorizationServerMetadata(w http.ResponseWriter, r *ht
 
 // HandleLogin initiates browser SSO by redirecting to Grafana generic OAuth.
 func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
+	// Rate limiting: 60 requests per minute per IP to prevent state table flooding DoS
+	clientIP := ExtractClientIP(r)
+	if h.loginLimiter != nil && !h.loginLimiter.Allow(clientIP) {
+		h.cfg.Logger.Warn("Rate limit exceeded on /mcp/auth/login", "client_ip", clientIP)
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "rate_limit_exceeded: too many login requests, please try again later", http.StatusTooManyRequests)
+		return
+	}
+
 	q := r.URL.Query()
 	redirectURI := q.Get("redirect_uri")
 	clientState := q.Get("state")
@@ -191,21 +224,21 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		CodeChallengeMethod: codeChallengeMethod,
 		CreatedAt:           time.Now(),
 	}
-	if err := h.store.SavePendingAuth(r.Context(), internalState, pendingReq, 15*time.Minute); err != nil {
+	if err := h.store.SavePendingAuth(r.Context(), internalState, pendingReq, h.cfg.PendingAuthTTL); err != nil {
 		h.cfg.Logger.Error("Failed to save pending auth request to store", "error", err)
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
 
 	// Set browser state cookie to protect against OAuth Login CSRF / Session Fixation
-	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- state cookie Secure flag matches scheme (allows HTTP in local dev/testing)
+	http.SetCookie(w, &http.Cookie{
 		Name:     "mcp_auth_state",
 		Value:    internalState,
 		Path:     "/mcp/auth",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   strings.HasPrefix(h.cfg.BaseURL, "https://"),
-		MaxAge:   900, // 15 minutes
+		Secure:   true,
+		MaxAge:   int(h.cfg.PendingAuthTTL.Seconds()),
 	})
 
 	// Construct callback URL with internal state
@@ -245,25 +278,23 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Clear the state cookie
-	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- state cookie clearance
+	http.SetCookie(w, &http.Cookie{
 		Name:     "mcp_auth_state",
 		Value:    "",
 		Path:     "/mcp/auth",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   strings.HasPrefix(h.cfg.BaseURL, "https://"),
+		Secure:   true,
 		MaxAge:   -1,
 	})
 
-	// Retrieve pending auth from distributed store
-	req, err := h.store.GetPendingAuth(r.Context(), internalState)
+	// Retrieve and delete pending auth from distributed store atomically (single-use)
+	req, err := h.store.GetAndDeletePendingAuth(r.Context(), internalState)
 	if err != nil {
-		h.cfg.Logger.Warn("Callback with unknown or expired mcp_state", "mcp_state", internalState)
+		h.cfg.Logger.Warn("Callback with unknown, expired, or already used mcp_state", "mcp_state", internalState)
 		http.Error(w, "Authentication request expired or invalid. Please try again.", http.StatusBadRequest)
 		return
 	}
-	// Consume one-time state immediately
-	_ = h.store.DeletePendingAuth(r.Context(), internalState)
 
 	// Extract grafana_session cookie
 	var grafanaSession string
@@ -277,6 +308,13 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	if grafanaSession == "" {
 		h.cfg.Logger.Warn("Callback missing grafana_session cookie", "remote_addr", r.RemoteAddr)
 		http.Error(w, "Authentication failed: missing grafana_session cookie from Grafana SSO.", http.StatusUnauthorized)
+		return
+	}
+
+	// Validate character set and length of grafana_session cookie (defense-in-depth against header injection / smuggling)
+	if !isValidGrafanaSession(grafanaSession) {
+		h.cfg.Logger.Warn("Callback with malformed or invalid grafana_session cookie", "remote_addr", r.RemoteAddr)
+		http.Error(w, "Authentication failed: invalid session token format.", http.StatusBadRequest)
 		return
 	}
 
@@ -304,11 +342,11 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 			RedirectURI:         req.RedirectURI,
 			CodeChallenge:       req.CodeChallenge,
 			CodeChallengeMethod: req.CodeChallengeMethod,
-			ExpiresAt:           time.Now().Add(5 * time.Minute),
+			ExpiresAt:           time.Now().Add(h.cfg.AuthCodeTTL),
 		}
 
-		// Persist authorization code in distributed store with 5-minute TTL
-		if err := h.store.SaveAuthCode(r.Context(), authCode, authCtx, 5*time.Minute); err != nil {
+		// Persist authorization code in distributed store with AuthCodeTTL
+		if err := h.store.SaveAuthCode(r.Context(), authCode, authCtx, h.cfg.AuthCodeTTL); err != nil {
 			h.cfg.Logger.Error("Failed to store authorization code in Redis", "error", err)
 			http.Error(w, "failed to save authorization code", http.StatusInternalServerError)
 			return
@@ -332,8 +370,13 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 			"username", userInfo.Login,
 		)
 
-		// #nosec G710 -- req.RedirectURI is strictly validated against local loopback whitelist in HandleAuthorize
-		http.Redirect(w, r, redirectTarget.String(), http.StatusFound)
+		// Validate redirectTarget host is strictly loopback (RFC 8252 Section 7.3)
+		if !isAllowedRedirectURI(redirectTarget.String()) {
+			http.Error(w, "invalid redirect target: must be local loopback", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Location", redirectTarget.String())
+		w.WriteHeader(http.StatusFound)
 		return
 	}
 
@@ -360,8 +403,20 @@ func (h *Handler) HandleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Rate limiting: 120 requests per minute per IP to prevent brute-force and resource exhaustion DoS
+	clientIP := ExtractClientIP(r)
+	if h.tokenLimiter != nil && !h.tokenLimiter.Allow(clientIP) {
+		h.cfg.Logger.Warn("Rate limit exceeded on /mcp/auth/token", "client_ip", clientIP)
+		w.Header().Set("Retry-After", "60")
+		sendTokenError(w, http.StatusTooManyRequests, "slow_down", "rate limit exceeded, please try again later")
+		return
+	}
+
+	// Limit POST request body size to 64KB to prevent memory exhaustion DoS
+	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+
 	if err := r.ParseForm(); err != nil {
-		sendTokenError(w, http.StatusBadRequest, "invalid_request", "invalid form data")
+		sendTokenError(w, http.StatusBadRequest, "invalid_request", "invalid form data or body exceeds size limit")
 		return
 	}
 
@@ -387,13 +442,12 @@ func (h *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Retrieve authorization code from distributed store and consume immediately
-	authCtx, err := h.store.GetAuthCode(r.Context(), code)
+	// Atomically retrieve and delete authorization code from distributed store (enforces RFC 6749 single-use and eliminates race conditions)
+	authCtx, err := h.store.GetAndDeleteAuthCode(r.Context(), code)
 	if err != nil {
-		sendTokenError(w, http.StatusBadRequest, "invalid_grant", "authorization code is invalid or expired")
+		sendTokenError(w, http.StatusBadRequest, "invalid_grant", "authorization code is invalid, expired, or already used")
 		return
 	}
-	_ = h.store.DeleteAuthCode(r.Context(), code)
 
 	if time.Now().After(authCtx.ExpiresAt) {
 		sendTokenError(w, http.StatusBadRequest, "invalid_grant", "authorization code has expired")
@@ -469,14 +523,16 @@ func (h *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")
 	w.WriteHeader(http.StatusOK)
-	// #nosec G117 -- TokenResponse explicitly returns refresh_token per RFC 6749 Section 5.1
-	_ = json.NewEncoder(w).Encode(TokenResponse{
-		AccessToken:  accessToken,
-		TokenType:    "Bearer",
-		ExpiresIn:    int64(h.cfg.SessionTTL.Seconds()),
-		RefreshToken: refreshToken,
-		Scope:        "mcp",
-	})
+	resp := map[string]any{
+		"access_token": accessToken,
+		"token_type":   "Bearer",
+		"expires_in":   int64(h.cfg.SessionTTL.Seconds()),
+		"scope":        "mcp",
+	}
+	if refreshToken != "" {
+		resp["refresh_token"] = refreshToken
+	}
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // handleRefreshTokenGrant issues a new access token using an existing refresh token with atomic single-use rotation and active Grafana session verification.
@@ -533,14 +589,16 @@ func (h *Handler) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")
 	w.WriteHeader(http.StatusOK)
-	// #nosec G117 -- TokenResponse explicitly returns refresh_token per RFC 6749 Section 5.1
-	_ = json.NewEncoder(w).Encode(TokenResponse{
-		AccessToken:  newAccessToken,
-		TokenType:    "Bearer",
-		ExpiresIn:    int64(h.cfg.SessionTTL.Seconds()),
-		RefreshToken: newRefreshToken,
-		Scope:        "mcp",
-	})
+	resp := map[string]any{
+		"access_token": newAccessToken,
+		"token_type":   "Bearer",
+		"expires_in":   int64(h.cfg.SessionTTL.Seconds()),
+		"scope":        "mcp",
+	}
+	if newRefreshToken != "" {
+		resp["refresh_token"] = newRefreshToken
+	}
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // HandleHealth returns 200 OK.
@@ -638,4 +696,28 @@ func sendTokenError(w http.ResponseWriter, status int, errCode, errDesc string) 
 		"error":             errCode,
 		"error_description": errDesc,
 	})
+}
+
+// isValidGrafanaSession verifies that the Grafana session token conforms to safe alphanumeric/base64url characters.
+func isValidGrafanaSession(s string) bool {
+	if len(s) < 16 || len(s) > 256 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_' || c == '.' || c == '=') {
+			return false
+		}
+	}
+	return true
+}
+
+// Close gracefully releases handler resources including background rate limiter tickers.
+func (h *Handler) Close() {
+	if h.loginLimiter != nil {
+		h.loginLimiter.Close()
+	}
+	if h.tokenLimiter != nil {
+		h.tokenLimiter.Close()
+	}
 }

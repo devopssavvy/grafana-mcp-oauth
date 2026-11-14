@@ -62,12 +62,16 @@ func main() {
 			redirectTarget = "/"
 		}
 		// Simulate successful SSO login: set grafana_session cookie and redirect
+		// #nosec G124 -- local test mock setting mock session cookie over HTTP
 		http.SetCookie(w, &http.Cookie{
 			Name:     "grafana_session",
 			Value:    "live_demo_grafana_session_secret_999",
 			Path:     "/",
 			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+			Secure:   false,
 		})
+		// #nosec G710 -- demo runner mock redirecting to callback URL
 		http.Redirect(w, r, redirectTarget, http.StatusFound)
 	})
 	grafanaMux.HandleFunc("GET /api/user", func(w http.ResponseWriter, r *http.Request) {
@@ -104,7 +108,10 @@ func main() {
 		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"__name__":"node_cpu_utilization_ratio","instance":"prod-cluster-01"},"values":[[1700000000,"0.14"]]}]}}`))
 	})
 
-	grafanaServer := &http.Server{Handler: grafanaMux}
+	grafanaServer := &http.Server{
+		Handler:           grafanaMux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 	go func() { _ = grafanaServer.Serve(mockGrafanaListener) }()
 	logger.Info("Mock Grafana Server running", "url", "http://127.0.0.1:3000")
 
@@ -278,7 +285,7 @@ func main() {
 				}
 			} else {
 				respBody, _ := io.ReadAll(grafanaResp.Body)
-				grafanaResp.Body.Close()
+				_ = grafanaResp.Body.Close()
 				respData = map[string]interface{}{
 					"jsonrpc": "2.0",
 					"id":      id,
@@ -313,7 +320,10 @@ func main() {
 		_, _ = w.Write([]byte(`{"status":"accepted"}`))
 	})
 
-	mcpServer := &http.Server{Handler: mcpMux}
+	mcpServer := &http.Server{
+		Handler:           mcpMux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 	go func() { _ = mcpServer.Serve(mcpListener) }()
 	logger.Info("Upstream mcp-grafana Simulation Server running", "url", "http://127.0.0.1:8000")
 
@@ -330,8 +340,6 @@ func main() {
 	// Route 1: RFC 9728 Discovery & OAuth Endpoints
 	oauthMux := http.NewServeMux()
 	oauthHandler.RegisterRoutes(oauthMux)
-	oauthMux.HandleFunc("GET /mcp/auth/check", extAuthServer.HandleHTTPCheck)
-	oauthMux.HandleFunc("POST /mcp/auth/check", extAuthServer.HandleHTTPCheck)
 
 	gatewayMux.HandleFunc("/.well-known/", oauthMux.ServeHTTP)
 	gatewayMux.HandleFunc("/mcp/auth/", oauthMux.ServeHTTP)
@@ -373,6 +381,7 @@ func main() {
 
 		// Mutate headers as requested by ext_authz
 		okResp := checkResp.GetOkResponse()
+		// #nosec G704 -- test harness local reverse proxy forwarding to 127.0.0.1
 		forwardReq, _ := http.NewRequestWithContext(r.Context(), r.Method, "http://127.0.0.1:8000"+r.URL.RequestURI(), r.Body)
 		for k, v := range r.Header {
 			forwardReq.Header[k] = v
@@ -388,6 +397,7 @@ func main() {
 		if r.Header.Get("Accept") == "text/event-stream" || strings.HasSuffix(r.URL.Path, "/sse") {
 			// Streaming SSE forwarder
 			client := &http.Client{}
+			// #nosec G704 -- test harness local reverse proxy forwarding to 127.0.0.1
 			resp, err := client.Do(forwardReq)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadGateway)
@@ -416,6 +426,7 @@ func main() {
 			return
 		}
 
+		// #nosec G704 -- test harness local reverse proxy forwarding to 127.0.0.1
 		resp, err := http.DefaultClient.Do(forwardReq)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
@@ -432,10 +443,12 @@ func main() {
 
 	// Route 3: Transparent Pass-through to Grafana Web UI
 	gatewayMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// #nosec G704 -- test harness local reverse proxy forwarding to 127.0.0.1
 		forwardReq, _ := http.NewRequestWithContext(r.Context(), r.Method, "http://127.0.0.1:3000"+r.URL.RequestURI(), r.Body)
 		for k, v := range r.Header {
 			forwardReq.Header[k] = v
 		}
+		// #nosec G704 -- test harness local reverse proxy forwarding to 127.0.0.1
 		resp, err := http.DefaultClient.Do(forwardReq)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
@@ -450,7 +463,10 @@ func main() {
 		_, _ = io.Copy(w, resp.Body)
 	})
 
-	gatewayServer := &http.Server{Handler: gatewayMux}
+	gatewayServer := &http.Server{
+		Handler:           gatewayMux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 	go func() { _ = gatewayServer.Serve(gatewayListener) }()
 	logger.Info("Envoy Gateway Unified Entrypoint running", "url", "http://127.0.0.1:8080")
 

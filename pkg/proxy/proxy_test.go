@@ -70,6 +70,10 @@ func (m *mockStore) GetPendingAuth(ctx context.Context, state string) (*store.Pe
 	return nil, store.ErrPendingAuthNotFound
 }
 
+func (m *mockStore) GetAndDeletePendingAuth(ctx context.Context, state string) (*store.PendingAuthRequest, error) {
+	return nil, store.ErrPendingAuthNotFound
+}
+
 func (m *mockStore) DeletePendingAuth(ctx context.Context, state string) error {
 	return nil
 }
@@ -79,6 +83,10 @@ func (m *mockStore) SaveAuthCode(ctx context.Context, code string, authCode *sto
 }
 
 func (m *mockStore) GetAuthCode(ctx context.Context, code string) (*store.AuthCodeContext, error) {
+	return nil, store.ErrAuthCodeNotFound
+}
+
+func (m *mockStore) GetAndDeleteAuthCode(ctx context.Context, code string) (*store.AuthCodeContext, error) {
 	return nil, store.ErrAuthCodeNotFound
 }
 

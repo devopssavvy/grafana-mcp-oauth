@@ -375,6 +375,18 @@ func TestE2E_FullSystemIntegration(t *testing.T) {
 		// Verify Grafana Server received the user's grafana_session cookie
 		assert.Equal(t, "valid_user_grafana_session_456", grafanaReceivedCookie)
 	})
+
+	t.Run("Scenario 4: Verification that credential oracle /mcp/auth/check is blocked", func(t *testing.T) {
+		checkReq, err := http.NewRequest(http.MethodGet, gatewayURL+"/mcp/auth/check", nil)
+		require.NoError(t, err)
+		checkReq.Header.Set("Authorization", "Bearer some_token")
+
+		checkResp, err := http.DefaultClient.Do(checkReq)
+		require.NoError(t, err)
+		defer checkResp.Body.Close()
+
+		assert.Equal(t, http.StatusNotFound, checkResp.StatusCode, "Public endpoint /mcp/auth/check must return 404 to prevent credential leakage")
+	})
 }
 
 // TestE2E_UnifiedProxyServer verifies the unified server in ModeProxy and ModeAll end-to-end.

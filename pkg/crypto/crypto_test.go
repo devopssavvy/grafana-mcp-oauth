@@ -24,6 +24,14 @@ func TestHashTokenKey(t *testing.T) {
 	assert.Equal(t, h1, h1Again, "HMAC-SHA3-512 must be deterministic")
 	assert.NotEqual(t, h1, h2, "Different tokens must produce distinct hashes")
 	assert.Len(t, h1, 128, "SHA3-512 hex string must be 128 characters long")
+
+	// Test zero-config with nil secret (uses DefaultDomainSalt)
+	hNil := crypto.HashTokenKey(token1, nil)
+	assert.Len(t, hNil, 128)
+	hNilAgain := crypto.HashTokenKey(token1, nil)
+	assert.Equal(t, hNil, hNilAgain)
+	hExplicit := crypto.HashTokenKey(token1, []byte(crypto.DefaultDomainSalt))
+	assert.Equal(t, hNil, hExplicit)
 }
 
 func TestDeriveKeyHKDF(t *testing.T) {
@@ -39,9 +47,14 @@ func TestDeriveKeyHKDF(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, key1, key2, "HKDF must produce reproducible keys for identical inputs")
 
-	// Empty salt should return error
-	_, err = crypto.DeriveKeyHKDF(token, nil, info)
-	assert.Error(t, err)
+	// Empty/nil salt should use DefaultDomainSalt and succeed
+	keyDefault, err := crypto.DeriveKeyHKDF(token, nil, info)
+	require.NoError(t, err)
+	assert.Len(t, keyDefault, 32)
+
+	keyExplicitDefault, err := crypto.DeriveKeyHKDF(token, []byte(crypto.DefaultDomainSalt), info)
+	require.NoError(t, err)
+	assert.Equal(t, keyDefault, keyExplicitDefault, "nil salt must equal DefaultDomainSalt")
 }
 
 func TestDeriveKeyArgon2id(t *testing.T) {
