@@ -54,7 +54,7 @@ jobs:
 
       - name: Run Gosec Security Scanner
         run: |
-          gosec -fmt sarif -out gosec-results.sarif -stdout -verbose=text ./... || true
+          gosec -severity high -confidence high -exclude-dir=cmd/demo-runner -fmt sarif -out gosec-results.sarif -stdout -verbose=text ./...
 
       - name: Upload Gosec SARIF report
         uses: github/codeql-action/upload-sarif@4c50b6f6fd9dc6fe03111c2d045c8be2a724cce1 # v3.28.11
@@ -78,7 +78,7 @@ jobs:
           scan-ref: '.'
           format: 'table'
           severity: 'CRITICAL,HIGH'
-          exit-code: '0'
+          exit-code: '1'
           ignore-unfixed: true
 
   # 4. Trivy Image Scan: Container vulnerability scanning on built image
@@ -110,5 +110,5 @@ jobs:
           scan-type: 'image'
           format: 'table'
           severity: 'CRITICAL,HIGH'
-          exit-code: '0'
+          exit-code: '1'
           ignore-unfixed: true
