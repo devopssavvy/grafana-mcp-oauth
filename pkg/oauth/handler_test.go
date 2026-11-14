@@ -1,0 +1,394 @@
+package oauth_test
+
+import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"grafana-mcp-oauth/pkg/oauth"
+	"grafana-mcp-oauth/pkg/store"
+)
+
+func setupOAuthTestEnv(t *testing.T) (*oauth.Handler, *store.RedisSessionStore, *httptest.Server) {
+	// Mock Grafana Server
+	mockGrafana := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/user" {
+			cookie, err := r.Cookie("grafana_session")
+			if err != nil || cookie.Value != "valid_grafana_session_123" {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"message":"Unauthorized"}`))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(oauth.GrafanaUser{
+				ID:    42,
+				Email: "bob@company.com",
+				Name:  "Bob Developer",
+				Login: "bob",
+				OrgID: 1,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st, err := store.NewRedisSessionStore(rdb, []byte("super-secret-master-salt-1234567890"))
+	require.NoError(t, err)
+
+	cfg := oauth.Config{
+		BaseURL:          "http://localhost:8080",
+		GrafanaURL:       mockGrafana.URL,
+		GrafanaPublicURL: mockGrafana.URL,
+		CallbackBaseURL:  "http://localhost:8080/mcp/auth/callback",
+		SessionTTL:       1 * time.Hour,
+		RefreshTTL:       24 * time.Hour,
+		HTTPClient:       mockGrafana.Client(),
+	}
+
+	h := oauth.NewHandler(cfg, st)
+	return h, st, mockGrafana
+}
+
+func generateTestPKCE() (verifier string, challenge string) {
+	verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+	hSha := sha256.Sum256([]byte(verifier))
+	challenge = base64.RawURLEncoding.EncodeToString(hSha[:])
+	return
+}
+
+func TestHandler_RFC9728_ProtectedResourceMetadata(t *testing.T) {
+	h, _, mockGrafana := setupOAuthTestEnv(t)
+	defer mockGrafana.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/oauth-protected-resource", nil)
+	w := httptest.NewRecorder()
+
+	h.HandleProtectedResourceMetadata(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var meta map[string]interface{}
+	err := json.NewDecoder(w.Body).Decode(&meta)
+	require.NoError(t, err)
+
+	assert.Equal(t, "http://localhost:8080/mcp", meta["resource"])
+	authServers, ok := meta["authorization_servers"].([]interface{})
+	require.True(t, ok)
+	assert.Contains(t, authServers, "http://localhost:8080")
+}
+
+func TestHandler_RFC8414_AuthorizationServerMetadata(t *testing.T) {
+	h, _, mockGrafana := setupOAuthTestEnv(t)
+	defer mockGrafana.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/oauth-authorization-server", nil)
+	w := httptest.NewRecorder()
+
+	h.HandleAuthorizationServerMetadata(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var meta map[string]interface{}
+	err := json.NewDecoder(w.Body).Decode(&meta)
+	require.NoError(t, err)
+
+	assert.Equal(t, "http://localhost:8080", meta["issuer"])
+	assert.Equal(t, "http://localhost:8080/mcp/auth/login", meta["authorization_endpoint"])
+	assert.Equal(t, "http://localhost:8080/mcp/auth/token", meta["token_endpoint"])
+	assert.Equal(t, []interface{}{"S256"}, meta["code_challenge_methods_supported"])
+}
+
+func TestHandler_LoginRedirect_OpenRedirectProtection_And_PKCE(t *testing.T) {
+	h, _, mockGrafana := setupOAuthTestEnv(t)
+	defer mockGrafana.Close()
+
+	_, challenge := generateTestPKCE()
+
+	// 1. Missing PKCE challenge must be rejected with 400 Bad Request
+	reqNoPKCE := httptest.NewRequest(http.MethodGet, "/mcp/auth/login?redirect_uri=http://localhost:54321/callback", nil)
+	wNoPKCE := httptest.NewRecorder()
+	h.HandleLogin(wNoPKCE, reqNoPKCE)
+	assert.Equal(t, http.StatusBadRequest, wNoPKCE.Code)
+	assert.Contains(t, wNoPKCE.Body.String(), "code_challenge is required")
+
+	// 2. Plain PKCE method must be rejected with 400 Bad Request (OAuth 2.1 BCP)
+	reqPlainPKCE := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/mcp/auth/login?redirect_uri=http://localhost:54321/callback&code_challenge=%s&code_challenge_method=plain", challenge), nil)
+	wPlainPKCE := httptest.NewRecorder()
+	h.HandleLogin(wPlainPKCE, reqPlainPKCE)
+	assert.Equal(t, http.StatusBadRequest, wPlainPKCE.Code)
+	assert.Contains(t, wPlainPKCE.Body.String(), "code_challenge_method must be S256")
+
+	// 3. Malicious external redirect_uri must be rejected with 400 Bad Request
+	reqMalicious := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/mcp/auth/login?redirect_uri=https://evil.attacker.com/steal&code_challenge=%s&code_challenge_method=S256", challenge), nil)
+	wMalicious := httptest.NewRecorder()
+	h.HandleLogin(wMalicious, reqMalicious)
+	assert.Equal(t, http.StatusBadRequest, wMalicious.Code)
+
+	// 4. Valid loopback redirect_uri with S256 PKCE must succeed with 302 to Grafana and set mcp_auth_state cookie
+	reqValid := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/mcp/auth/login?redirect_uri=http://localhost:54321/callback&state=client_state_xyz&code_challenge=%s&code_challenge_method=S256", challenge), nil)
+	wValid := httptest.NewRecorder()
+	h.HandleLogin(wValid, reqValid)
+
+	assert.Equal(t, http.StatusFound, wValid.Code)
+	location := wValid.Header().Get("Location")
+	assert.True(t, strings.HasPrefix(location, mockGrafana.URL+"/login/generic_oauth?redirect="))
+	assert.True(t, strings.Contains(location, "mcp_state"))
+
+	// Verify state cookie is set
+	cookies := wValid.Result().Cookies()
+	var stateCookie *http.Cookie
+	for _, c := range cookies {
+		if c.Name == "mcp_auth_state" {
+			stateCookie = c
+			break
+		}
+	}
+	require.NotNil(t, stateCookie)
+	assert.NotEmpty(t, stateCookie.Value)
+	assert.True(t, stateCookie.HttpOnly)
+}
+
+func TestHandler_Callback_CSRFProtection_And_SessionValidation(t *testing.T) {
+	h, _, mockGrafana := setupOAuthTestEnv(t)
+	defer mockGrafana.Close()
+
+	_, challenge := generateTestPKCE()
+
+	// 1. Initiate login
+	loginReq := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/mcp/auth/login?redirect_uri=http://localhost:54321/callback&state=s1&code_challenge=%s&code_challenge_method=S256", challenge), nil)
+	loginRec := httptest.NewRecorder()
+	h.HandleLogin(loginRec, loginReq)
+
+	loc := loginRec.Header().Get("Location")
+	u, _ := url.Parse(loc)
+	cbURL, _ := url.Parse(u.Query().Get("redirect"))
+	mcpState := cbURL.Query().Get("mcp_state")
+
+	var stateCookie *http.Cookie
+	for _, c := range loginRec.Result().Cookies() {
+		if c.Name == "mcp_auth_state" {
+			stateCookie = c
+			break
+		}
+	}
+	require.NotNil(t, stateCookie)
+
+	// 2. Callback without state cookie (CSRF attack attempt) -> Rejected with 400
+	cbReqNoCookie := httptest.NewRequest(http.MethodGet, "/mcp/auth/callback?mcp_state="+mcpState, nil)
+	cbReqNoCookie.AddCookie(&http.Cookie{Name: "grafana_session", Value: "valid_grafana_session_123"})
+	cbRecNoCookie := httptest.NewRecorder()
+	h.HandleCallback(cbRecNoCookie, cbReqNoCookie)
+	assert.Equal(t, http.StatusBadRequest, cbRecNoCookie.Code)
+	assert.Contains(t, cbRecNoCookie.Body.String(), "CSRF detected")
+
+	// 3. Callback with state cookie but fake/expired Grafana session -> Rejected with 401
+	cbReqFakeSession := httptest.NewRequest(http.MethodGet, "/mcp/auth/callback?mcp_state="+mcpState, nil)
+	cbReqFakeSession.AddCookie(stateCookie)
+	cbReqFakeSession.AddCookie(&http.Cookie{Name: "grafana_session", Value: "forged_or_expired_cookie_token"})
+	cbRecFakeSession := httptest.NewRecorder()
+	h.HandleCallback(cbRecFakeSession, cbReqFakeSession)
+	assert.Equal(t, http.StatusUnauthorized, cbRecFakeSession.Code)
+}
+
+func TestHandler_FullPKCE_AuthorizationCodeGrant(t *testing.T) {
+	h, st, mockGrafana := setupOAuthTestEnv(t)
+	defer mockGrafana.Close()
+
+	// 1. Client prepares PKCE: verifier and S256 challenge
+	verifier, challenge := generateTestPKCE()
+
+	loginURL := fmt.Sprintf("/mcp/auth/login?response_type=code&client_id=cursor&redirect_uri=http://127.0.0.1:45678/callback&code_challenge=%s&code_challenge_method=S256&state=state_abc", challenge)
+	loginReq := httptest.NewRequest(http.MethodGet, loginURL, nil)
+	loginRec := httptest.NewRecorder()
+	h.HandleLogin(loginRec, loginReq)
+
+	loc := loginRec.Header().Get("Location")
+	u, _ := url.Parse(loc)
+	cbURL, _ := url.Parse(u.Query().Get("redirect"))
+	mcpState := cbURL.Query().Get("mcp_state")
+
+	var stateCookie *http.Cookie
+	for _, c := range loginRec.Result().Cookies() {
+		if c.Name == "mcp_auth_state" {
+			stateCookie = c
+			break
+		}
+	}
+	require.NotNil(t, stateCookie)
+
+	// 2. Callback from Grafana with valid session and CSRF state cookie
+	cbReq := httptest.NewRequest(http.MethodGet, "/mcp/auth/callback?mcp_state="+mcpState, nil)
+	cbReq.AddCookie(stateCookie)
+	cbReq.AddCookie(&http.Cookie{
+		Name:  "grafana_session",
+		Value: "valid_grafana_session_123",
+	})
+	cbRec := httptest.NewRecorder()
+	h.HandleCallback(cbRec, cbReq)
+
+	assert.Equal(t, http.StatusFound, cbRec.Code)
+	agentTarget, err := url.Parse(cbRec.Header().Get("Location"))
+	require.NoError(t, err)
+
+	authCode := agentTarget.Query().Get("code")
+	require.NotEmpty(t, authCode)
+	assert.Equal(t, "state_abc", agentTarget.Query().Get("state"))
+
+	// 3a. Token exchange with mismatched redirect_uri -> Rejected with 400
+	formBadURI := url.Values{}
+	formBadURI.Set("grant_type", "authorization_code")
+	formBadURI.Set("code", authCode)
+	formBadURI.Set("code_verifier", verifier)
+	formBadURI.Set("redirect_uri", "http://127.0.0.1:9999/callback") // mismatch!
+
+	tokenReqBad := httptest.NewRequest(http.MethodPost, "/mcp/auth/token", strings.NewReader(formBadURI.Encode()))
+	tokenReqBad.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	tokenRecBad := httptest.NewRecorder()
+	h.HandleToken(tokenRecBad, tokenReqBad)
+	assert.Equal(t, http.StatusBadRequest, tokenRecBad.Code)
+	assert.Contains(t, tokenRecBad.Body.String(), "redirect_uri mismatch")
+
+	// 3b. Redo callback to get a new one-time auth code (since old one was consumed)
+	// (Re-initiate login to get fresh state)
+	loginRec2 := httptest.NewRecorder()
+	h.HandleLogin(loginRec2, loginReq)
+	u2, _ := url.Parse(loginRec2.Header().Get("Location"))
+	cbURL2, _ := url.Parse(u2.Query().Get("redirect"))
+	mcpState2 := cbURL2.Query().Get("mcp_state")
+
+	var stateCookie2 *http.Cookie
+	for _, c := range loginRec2.Result().Cookies() {
+		if c.Name == "mcp_auth_state" {
+			stateCookie2 = c
+			break
+		}
+	}
+	cbReq2 := httptest.NewRequest(http.MethodGet, "/mcp/auth/callback?mcp_state="+mcpState2, nil)
+	cbReq2.AddCookie(stateCookie2)
+	cbReq2.AddCookie(&http.Cookie{Name: "grafana_session", Value: "valid_grafana_session_123"})
+	cbRec2 := httptest.NewRecorder()
+	h.HandleCallback(cbRec2, cbReq2)
+	agentTarget2, _ := url.Parse(cbRec2.Header().Get("Location"))
+	authCode2 := agentTarget2.Query().Get("code")
+
+	// 3c. Valid token exchange via POST /mcp/auth/token
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("code", authCode2)
+	form.Set("code_verifier", verifier)
+	form.Set("redirect_uri", "http://127.0.0.1:45678/callback")
+
+	tokenReq := httptest.NewRequest(http.MethodPost, "/mcp/auth/token", strings.NewReader(form.Encode()))
+	tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	tokenRec := httptest.NewRecorder()
+	h.HandleToken(tokenRec, tokenReq)
+
+	assert.Equal(t, http.StatusOK, tokenRec.Code)
+	assert.Equal(t, "no-store", tokenRec.Header().Get("Cache-Control"))
+	assert.Equal(t, "no-cache", tokenRec.Header().Get("Pragma"))
+
+	var tokResp oauth.TokenResponse
+	err = json.NewDecoder(tokenRec.Body).Decode(&tokResp)
+	require.NoError(t, err)
+
+	assert.NotEmpty(t, tokResp.AccessToken)
+	assert.NotEmpty(t, tokResp.RefreshToken)
+	assert.Equal(t, "Bearer", tokResp.TokenType)
+
+	// 4. Verify session exists in store with grafana_session
+	sess, err := st.GetSession(tokenReq.Context(), tokResp.AccessToken)
+	require.NoError(t, err)
+	assert.Equal(t, "bob", sess.Username)
+	assert.Equal(t, "valid_grafana_session_123", sess.GrafanaSession)
+}
+
+func TestHandler_RefreshTokenGrant(t *testing.T) {
+	h, st, mockGrafana := setupOAuthTestEnv(t)
+	defer mockGrafana.Close()
+
+	ctx := t.Context()
+	oldAccessToken := "mcp_at_old_token_111"
+	oldRefreshToken := "mcp_rt_old_refresh_222"
+
+	sess := &store.SessionData{
+		UserID:         "42",
+		Username:       "bob",
+		GrafanaSession: "valid_grafana_session_123",
+		RefreshToken:   oldRefreshToken,
+		ExpiresAt:      time.Now().Add(1 * time.Hour),
+	}
+	err := st.SaveSession(ctx, oldAccessToken, sess, 1*time.Hour)
+	require.NoError(t, err)
+	err = st.SaveRefreshTokenSession(ctx, oldRefreshToken, sess, 24*time.Hour)
+	require.NoError(t, err)
+
+	// Case 1: Valid refresh token exchange
+	form := url.Values{}
+	form.Set("grant_type", "refresh_token")
+	form.Set("refresh_token", oldRefreshToken)
+
+	tokenReq := httptest.NewRequest(http.MethodPost, "/mcp/auth/token", strings.NewReader(form.Encode()))
+	tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	tokenRec := httptest.NewRecorder()
+
+	h.HandleToken(tokenRec, tokenReq)
+
+	assert.Equal(t, http.StatusOK, tokenRec.Code)
+	assert.Equal(t, "no-store", tokenRec.Header().Get("Cache-Control"))
+
+	var resp oauth.TokenResponse
+	err = json.NewDecoder(tokenRec.Body).Decode(&resp)
+	require.NoError(t, err)
+
+	assert.NotEmpty(t, resp.AccessToken)
+	assert.NotEqual(t, oldAccessToken, resp.AccessToken)
+	assert.NotEmpty(t, resp.RefreshToken)
+	assert.NotEqual(t, oldRefreshToken, resp.RefreshToken)
+
+	// Verify old refresh token was consumed (atomic single-use rotation)
+	_, err = st.GetAndDeleteRefreshSession(ctx, oldRefreshToken)
+	assert.ErrorIs(t, err, store.ErrInvalidRefreshToken)
+
+	// Verify new access token is active
+	newSess, err := st.GetSession(ctx, resp.AccessToken)
+	require.NoError(t, err)
+	assert.Equal(t, "bob", newSess.Username)
+	assert.Equal(t, "valid_grafana_session_123", newSess.GrafanaSession)
+
+	// Case 2: Grafana session expired -> Refresh must be rejected with 401
+	expiredAccessToken := "mcp_at_expired_grafana"
+	expiredRefreshToken := "mcp_rt_expired_grafana"
+	expiredSess := &store.SessionData{
+		UserID:         "42",
+		Username:       "bob",
+		GrafanaSession: "expired_or_revoked_session",
+		RefreshToken:   expiredRefreshToken,
+		ExpiresAt:      time.Now().Add(1 * time.Hour),
+	}
+	_ = st.SaveSession(ctx, expiredAccessToken, expiredSess, 1*time.Hour)
+	_ = st.SaveRefreshTokenSession(ctx, expiredRefreshToken, expiredSess, 24*time.Hour)
+
+	formExpired := url.Values{}
+	formExpired.Set("grant_type", "refresh_token")
+	formExpired.Set("refresh_token", expiredRefreshToken)
+
+	tokenReqExpired := httptest.NewRequest(http.MethodPost, "/mcp/auth/token", strings.NewReader(formExpired.Encode()))
+	tokenReqExpired.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	tokenRecExpired := httptest.NewRecorder()
+
+	h.HandleToken(tokenRecExpired, tokenReqExpired)
+	assert.Equal(t, http.StatusUnauthorized, tokenRecExpired.Code)
+	assert.Contains(t, tokenRecExpired.Body.String(), "associated Grafana session has expired or was revoked")
+}

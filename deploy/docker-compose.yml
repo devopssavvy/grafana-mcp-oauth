@@ -1,0 +1,83 @@
+version: '3.8'
+
+services:
+  envoy:
+    image: envoyproxy/envoy:v1.31-latest
+    container_name: mcp-envoy-gateway
+    restart: unless-stopped
+    ports:
+      - "8080:8080" # Unified entrypoint for both Web and MCP
+      - "127.0.0.1:9901:9901" # Envoy Admin (loopback only)
+    volumes:
+      - ./envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+    depends_on:
+      - mcp-auth-helper
+      - mcp-grafana
+      - grafana
+    networks:
+      - mcp-network
+
+  mcp-auth-helper:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: mcp-auth-helper
+    restart: unless-stopped
+    # Ports internal to docker network; exposed via Envoy Gateway
+    environment:
+      - BASE_URL=http://localhost:8080
+      - HTTP_PORT=8081
+      - GRPC_PORT=9001
+      - GRAFANA_URL=http://grafana:3000
+      - GRAFANA_PUBLIC_URL=http://localhost:8080
+      - CALLBACK_BASE_URL=http://localhost:8080/mcp/auth/callback
+      - REDIS_ADDR=redis:6379
+      - MCP_MASTER_SECRET=change-me-to-a-very-secure-32-byte-master-secret-key!
+      - SESSION_TTL_HOURS=2
+      - REFRESH_TTL_DAYS=30
+      - LOG_LEVEL=info
+    depends_on:
+      - redis
+      - grafana
+    networks:
+      - mcp-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: mcp-redis-store
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    networks:
+      - mcp-network
+
+  mcp-grafana:
+    image: grafana/mcp-grafana:latest
+    container_name: upstream-mcp-grafana
+    restart: unless-stopped
+    command: ["--base-path", "/mcp"]
+    environment:
+      - GRAFANA_URL=http://grafana:3000
+      # Enable dynamic forwarding of Cookie header to Grafana API
+      - GRAFANA_FORWARD_HEADERS=Cookie
+      - PORT=8000
+    depends_on:
+      - grafana
+    networks:
+      - mcp-network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana-server
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SERVER_ROOT_URL=http://localhost:8080/
+      - GF_AUTH_GENERIC_OAUTH_ENABLED=true
+      - GF_AUTH_GENERIC_OAUTH_NAME=Enterprise SSO
+      - GF_USERS_ALLOW_SIGN_UP=true
+    networks:
+      - mcp-network
+
+networks:
+  mcp-network:
+    driver: bridge

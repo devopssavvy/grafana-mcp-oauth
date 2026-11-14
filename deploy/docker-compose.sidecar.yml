@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  # 1. Direct Go OAuth Wrapper (Front-door for agents)
+  mcp-wrapper:
+    build:
+      context: ..
+      dockerfile: Dockerfile.wrapper
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - BASE_URL=http://localhost:8080
+      - GRAFANA_URL=http://grafana:3000
+      - GRAFANA_PUBLIC_URL=http://localhost:3000
+      - TARGET_MCP_URL=http://mcp-grafana:8000
+      - REDIS_ADDR=redis:6379
+      - MCP_MASTER_SECRET=production-grade-master-secret-at-least-32-bytes!
+    depends_on:
+      - redis
+      - mcp-grafana
+
+  # 2. Stock Upstream mcp-grafana (100% Zero-Fork)
+  mcp-grafana:
+    image: grafana/mcp-grafana:latest
+    command: ["--base-path", "/mcp"]
+    environment:
+      - GRAFANA_URL=http://grafana:3000
+      - GRAFANA_FORWARD_HEADERS=Cookie
+    expose:
+      - "8000"
+
+  # 3. Redis for Zero-Knowledge encrypted session mapping
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    expose:
+      - "6379"

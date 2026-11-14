@@ -1,0 +1,636 @@
+package oauth
+
+import (
+	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"html"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"grafana-mcp-oauth/pkg/crypto"
+	"grafana-mcp-oauth/pkg/store"
+)
+
+// Config holds configuration parameters for the OAuth handler.
+type Config struct {
+	BaseURL          string // e.g. "http://localhost:8080" (Gateway Public Base URL)
+	GrafanaURL       string // e.g. "http://grafana:3000" (Internal backend API URL)
+	GrafanaPublicURL string // e.g. "http://localhost:8080" (Public URL for browser redirects, defaults to BaseURL)
+	CallbackBaseURL  string // e.g. "http://localhost:8080/mcp/auth/callback" or relative "/mcp/auth/callback"
+	IdPTokenURL      string
+	ClientID         string
+	ClientSecret     string
+	SessionTTL       time.Duration
+	RefreshTTL       time.Duration
+	HTTPClient       *http.Client
+	Logger           *slog.Logger
+}
+
+// Handler manages browser SSO login, MCP client discovery (RFC 9728, RFC 8414), PKCE, and token lifecycle.
+type Handler struct {
+	cfg   Config
+	store store.SessionStore
+}
+
+// GrafanaUser is an alias to store.GrafanaUser for API compatibility.
+type GrafanaUser = store.GrafanaUser
+
+// TokenResponse represents the OAuth 2.1 token endpoint response.
+type TokenResponse struct {
+	AccessToken  string `json:"access_token"`
+	TokenType    string `json:"token_type"`
+	ExpiresIn    int64  `json:"expires_in"`
+	RefreshToken string `json:"refresh_token,omitempty"`
+	Scope        string `json:"scope,omitempty"`
+}
+
+// NewHandler creates a new OAuth handler.
+func NewHandler(cfg Config, s store.SessionStore) *Handler {
+	if cfg.BaseURL == "" {
+		cfg.BaseURL = "http://localhost:8080"
+	}
+	cfg.BaseURL = strings.TrimRight(cfg.BaseURL, "/")
+	if cfg.GrafanaPublicURL == "" {
+		if cfg.GrafanaURL != "" {
+			cfg.GrafanaPublicURL = cfg.GrafanaURL
+		} else {
+			cfg.GrafanaPublicURL = cfg.BaseURL
+		}
+	}
+	cfg.GrafanaPublicURL = strings.TrimRight(cfg.GrafanaPublicURL, "/")
+
+	if cfg.CallbackBaseURL == "" {
+		cfg.CallbackBaseURL = cfg.BaseURL + "/mcp/auth/callback"
+	}
+	if cfg.SessionTTL <= 0 {
+		cfg.SessionTTL = 2 * time.Hour
+	}
+	if cfg.RefreshTTL <= 0 {
+		cfg.RefreshTTL = 30 * 24 * time.Hour
+	}
+	if cfg.HTTPClient == nil {
+		cfg.HTTPClient = &http.Client{Timeout: 10 * time.Second}
+	}
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+
+	return &Handler{
+		cfg:   cfg,
+		store: s,
+	}
+}
+
+// RegisterRoutes registers OAuth and discovery endpoints on the provided ServeMux.
+func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
+	wrap := func(fn http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			w.Header().Set("X-Frame-Options", "DENY")
+			w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+			fn(w, r)
+		}
+	}
+
+	// RFC 9728 Protected Resource Metadata (MCP Discovery)
+	mux.HandleFunc("GET /.well-known/oauth-protected-resource", wrap(h.HandleProtectedResourceMetadata))
+	mux.HandleFunc("GET /.well-known/oauth-protected-resource/mcp", wrap(h.HandleProtectedResourceMetadata))
+
+	// RFC 8414 Authorization Server Metadata
+	mux.HandleFunc("GET /.well-known/oauth-authorization-server", wrap(h.HandleAuthorizationServerMetadata))
+
+	// OAuth Endpoints
+	mux.HandleFunc("GET /mcp/auth/login", wrap(h.HandleLogin))
+	mux.HandleFunc("GET /mcp/auth/callback", wrap(h.HandleCallback))
+	mux.HandleFunc("POST /mcp/auth/token", wrap(h.HandleToken))
+	mux.HandleFunc("GET /mcp/auth/health", wrap(h.HandleHealth))
+}
+
+// HandleProtectedResourceMetadata serves RFC 9728 OAuth 2.0 Protected Resource Metadata for MCP clients.
+func (h *Handler) HandleProtectedResourceMetadata(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"resource": fmt.Sprintf("%s/mcp", h.cfg.BaseURL),
+		"authorization_servers": []string{
+			h.cfg.BaseURL,
+		},
+		"scopes_supported":         []string{"mcp"},
+		"bearer_methods_supported": []string{"header"},
+	})
+}
+
+// HandleAuthorizationServerMetadata serves RFC 8414 OAuth 2.0 Authorization Server Metadata.
+func (h *Handler) HandleAuthorizationServerMetadata(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"issuer":                                h.cfg.BaseURL,
+		"authorization_endpoint":                fmt.Sprintf("%s/mcp/auth/login", h.cfg.BaseURL),
+		"token_endpoint":                        fmt.Sprintf("%s/mcp/auth/token", h.cfg.BaseURL),
+		"response_types_supported":              []string{"code"},
+		"grant_types_supported":                 []string{"authorization_code", "refresh_token"},
+		"code_challenge_methods_supported":      []string{"S256"},
+		"token_endpoint_auth_methods_supported": []string{"none", "client_secret_post"},
+		"scopes_supported":                      []string{"mcp"},
+	})
+}
+
+// HandleLogin initiates browser SSO by redirecting to Grafana generic OAuth.
+func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	redirectURI := q.Get("redirect_uri")
+	clientState := q.Get("state")
+	clientID := q.Get("client_id")
+	codeChallenge := q.Get("code_challenge")
+	codeChallengeMethod := q.Get("code_challenge_method")
+
+	// OAuth 2.1 BCP (RFC 9700): PKCE S256 is mandatory for all public clients
+	if codeChallenge == "" {
+		http.Error(w, "invalid_request: code_challenge is required for OAuth 2.1 PKCE", http.StatusBadRequest)
+		return
+	}
+	if codeChallengeMethod != "S256" {
+		http.Error(w, "invalid_request: code_challenge_method must be S256", http.StatusBadRequest)
+		return
+	}
+
+	// Validate redirect_uri: required for authorization code flow & must be loopback (RFC 8252 Section 7.3)
+	if redirectURI == "" {
+		http.Error(w, "invalid_request: redirect_uri is required for authorization code flow", http.StatusBadRequest)
+		return
+	}
+	if !isAllowedRedirectURI(redirectURI) {
+		h.cfg.Logger.Warn("Rejected login request with untrusted redirect_uri", "redirect_uri", redirectURI)
+		http.Error(w, "Invalid redirect_uri: only local loopback URLs (http://localhost or http://127.0.0.1) without fragments are permitted", http.StatusBadRequest)
+		return
+	}
+
+	// Generate internal state to track this flow
+	internalState, err := crypto.GenerateRandomToken("mcp_st_", 16)
+	if err != nil {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Save pending request to distributed Redis store with 15-minute TTL
+	pendingReq := &store.PendingAuthRequest{
+		ClientID:            clientID,
+		RedirectURI:         redirectURI,
+		ClientState:         clientState,
+		CodeChallenge:       codeChallenge,
+		CodeChallengeMethod: codeChallengeMethod,
+		CreatedAt:           time.Now(),
+	}
+	if err := h.store.SavePendingAuth(r.Context(), internalState, pendingReq, 15*time.Minute); err != nil {
+		h.cfg.Logger.Error("Failed to save pending auth request to store", "error", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Set browser state cookie to protect against OAuth Login CSRF / Session Fixation
+	http.SetCookie(w, &http.Cookie{
+		Name:     "mcp_auth_state",
+		Value:    internalState,
+		Path:     "/mcp/auth",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   strings.HasPrefix(h.cfg.BaseURL, "https://"),
+		MaxAge:   900, // 15 minutes
+	})
+
+	// Construct callback URL with internal state
+	callbackURL := fmt.Sprintf("%s?mcp_state=%s", h.cfg.CallbackBaseURL, internalState)
+
+	// Redirect browser to Grafana generic OAuth via public URL
+	grafanaLoginURL := fmt.Sprintf("%s/login/generic_oauth?redirect=%s",
+		strings.TrimRight(h.cfg.GrafanaPublicURL, "/"),
+		url.QueryEscape(callbackURL),
+	)
+
+	h.cfg.Logger.Info("Redirecting user to Grafana SSO login",
+		"internal_state", internalState,
+		"client_redirect_uri", redirectURI,
+		"grafana_login_url", grafanaLoginURL,
+	)
+
+	http.Redirect(w, r, grafanaLoginURL, http.StatusFound)
+}
+
+// HandleCallback receives the browser redirect from Grafana, extracts grafana_session, and issues an authorization code.
+func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
+	internalState := r.URL.Query().Get("mcp_state")
+	if internalState == "" {
+		http.Error(w, "Bad Request: missing mcp_state", http.StatusBadRequest)
+		return
+	}
+
+	// Verify browser state cookie using constant-time comparison to prevent OAuth Login CSRF (A07)
+	stateCookie, err := r.Cookie("mcp_auth_state")
+	if err != nil || stateCookie.Value == "" || subtle.ConstantTimeCompare([]byte(stateCookie.Value), []byte(internalState)) != 1 {
+		h.cfg.Logger.Warn("Callback state cookie missing or mismatched (possible OAuth Login CSRF)",
+			"mcp_state", internalState,
+		)
+		http.Error(w, "Authentication failed: state cookie verification failed or CSRF detected.", http.StatusBadRequest)
+		return
+	}
+
+	// Clear the state cookie
+	http.SetCookie(w, &http.Cookie{
+		Name:     "mcp_auth_state",
+		Value:    "",
+		Path:     "/mcp/auth",
+		HttpOnly: true,
+		MaxAge:   -1,
+	})
+
+	// Retrieve pending auth from distributed store
+	req, err := h.store.GetPendingAuth(r.Context(), internalState)
+	if err != nil {
+		h.cfg.Logger.Warn("Callback with unknown or expired mcp_state", "mcp_state", internalState)
+		http.Error(w, "Authentication request expired or invalid. Please try again.", http.StatusBadRequest)
+		return
+	}
+	// Consume one-time state immediately
+	_ = h.store.DeletePendingAuth(r.Context(), internalState)
+
+	// Extract grafana_session cookie
+	var grafanaSession string
+	for _, c := range r.Cookies() {
+		if c.Name == "grafana_session" {
+			grafanaSession = c.Value
+			break
+		}
+	}
+
+	if grafanaSession == "" {
+		h.cfg.Logger.Warn("Callback missing grafana_session cookie", "remote_addr", r.RemoteAddr)
+		http.Error(w, "Authentication failed: missing grafana_session cookie from Grafana SSO.", http.StatusUnauthorized)
+		return
+	}
+
+	// Strictly verify user details from Grafana using the harvested session cookie
+	userInfo, err := h.fetchGrafanaUser(r.Context(), grafanaSession)
+	if err != nil {
+		h.cfg.Logger.Error("Session verification failed against Grafana API; rejecting unauthenticated session", "error", err)
+		http.Error(w, "Authentication failed: invalid or expired Grafana session", http.StatusUnauthorized)
+		return
+	}
+
+	// If this was an OAuth 2.1 Authorization Code Flow from an MCP Client
+	if req.RedirectURI != "" {
+		// Generate one-time Authorization Code
+		authCode, err := crypto.GenerateRandomToken("mcp_code_", 32)
+		if err != nil {
+			http.Error(w, "failed to generate authorization code", http.StatusInternalServerError)
+			return
+		}
+
+		authCtx := &store.AuthCodeContext{
+			GrafanaSession:      grafanaSession,
+			UserInfo:            userInfo,
+			ClientID:            req.ClientID,
+			RedirectURI:         req.RedirectURI,
+			CodeChallenge:       req.CodeChallenge,
+			CodeChallengeMethod: req.CodeChallengeMethod,
+			ExpiresAt:           time.Now().Add(5 * time.Minute),
+		}
+
+		// Persist authorization code in distributed store with 5-minute TTL
+		if err := h.store.SaveAuthCode(r.Context(), authCode, authCtx, 5*time.Minute); err != nil {
+			h.cfg.Logger.Error("Failed to store authorization code in Redis", "error", err)
+			http.Error(w, "failed to save authorization code", http.StatusInternalServerError)
+			return
+		}
+
+		redirectTarget, err := url.Parse(req.RedirectURI)
+		if err != nil {
+			http.Error(w, "invalid redirect target", http.StatusBadRequest)
+			return
+		}
+
+		q := redirectTarget.Query()
+		q.Set("code", authCode)
+		if req.ClientState != "" {
+			q.Set("state", req.ClientState)
+		}
+		redirectTarget.RawQuery = q.Encode()
+
+		h.cfg.Logger.Info("Redirecting browser back to MCP client with authorization code",
+			"redirect_uri", req.RedirectURI,
+			"username", userInfo.Login,
+		)
+
+		http.Redirect(w, r, redirectTarget.String(), http.StatusFound)
+		return
+	}
+
+	// Direct browser confirmation fallback (XSS sanitized & anti-cache)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store, private")
+	w.WriteHeader(http.StatusOK)
+	escapedUser := html.EscapeString(userInfo.Login)
+	escapedURL := html.EscapeString(h.cfg.BaseURL)
+	fmt.Fprintf(w, `<!DOCTYPE html>
+<html>
+<head><title>Grafana MCP Login</title></head>
+<body style="font-family:sans-serif;background:#111;color:#eee;padding:40px;">
+    <h2>✓ Authentication Succeeded</h2>
+    <p>User <strong>%s</strong> is authenticated. Your coding agent is now authorized at <code>%s/mcp</code>.</p>
+</body>
+</html>`, escapedUser, escapedURL)
+}
+
+// HandleToken handles OAuth 2.1 token exchange (authorization_code with PKCE) and refresh.
+func (h *Handler) HandleToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if err := r.ParseForm(); err != nil {
+		sendTokenError(w, http.StatusBadRequest, "invalid_request", "invalid form data")
+		return
+	}
+
+	grantType := r.FormValue("grant_type")
+	switch grantType {
+	case "authorization_code":
+		h.handleAuthorizationCodeGrant(w, r)
+	case "refresh_token":
+		h.handleRefreshTokenGrant(w, r)
+	default:
+		sendTokenError(w, http.StatusBadRequest, "unsupported_grant_type", "supported grant types: authorization_code, refresh_token")
+	}
+}
+
+// handleAuthorizationCodeGrant exchanges an authorization code and PKCE verifier for MCP tokens.
+func (h *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Request) {
+	code := r.FormValue("code")
+	codeVerifier := r.FormValue("code_verifier")
+	redirectURI := r.FormValue("redirect_uri")
+
+	if code == "" {
+		sendTokenError(w, http.StatusBadRequest, "invalid_request", "missing code parameter")
+		return
+	}
+
+	// Retrieve authorization code from distributed store and consume immediately
+	authCtx, err := h.store.GetAuthCode(r.Context(), code)
+	if err != nil {
+		sendTokenError(w, http.StatusBadRequest, "invalid_grant", "authorization code is invalid or expired")
+		return
+	}
+	_ = h.store.DeleteAuthCode(r.Context(), code)
+
+	if time.Now().After(authCtx.ExpiresAt) {
+		sendTokenError(w, http.StatusBadRequest, "invalid_grant", "authorization code has expired")
+		return
+	}
+
+	// Strictly verify redirect_uri match per RFC 6749 Section 4.1.3:
+	// If redirect_uri was present in authorization request, it MUST be present and match exactly here.
+	if authCtx.RedirectURI != "" {
+		if redirectURI == "" || authCtx.RedirectURI != redirectURI {
+			h.cfg.Logger.Warn("Token exchange rejected due to redirect_uri mismatch",
+				"expected", authCtx.RedirectURI,
+				"received", redirectURI,
+			)
+			sendTokenError(w, http.StatusBadRequest, "invalid_grant", "redirect_uri mismatch or missing")
+			return
+		}
+	}
+
+	// Verify PKCE with constant-time comparison
+	if codeVerifier == "" || !verifyPKCE(codeVerifier, authCtx.CodeChallenge, authCtx.CodeChallengeMethod) {
+		h.cfg.Logger.Warn("PKCE verification failed", "username", authCtx.UserInfo.Login)
+		sendTokenError(w, http.StatusBadRequest, "invalid_grant", "PKCE code_verifier verification failed")
+		return
+	}
+
+	// Generate access token & refresh token
+	accessToken, err := crypto.GenerateRandomToken("mcp_at_", 32)
+	if err != nil {
+		sendTokenError(w, http.StatusInternalServerError, "server_error", "failed to generate access token")
+		return
+	}
+	refreshToken, err := crypto.GenerateRandomToken("mcp_rt_", 32)
+	if err != nil {
+		sendTokenError(w, http.StatusInternalServerError, "server_error", "failed to generate refresh token")
+		return
+	}
+
+	expiresAt := time.Now().Add(h.cfg.SessionTTL)
+	sessionData := &store.SessionData{
+		UserID:         fmt.Sprintf("%d", authCtx.UserInfo.ID),
+		Username:       authCtx.UserInfo.Login,
+		Email:          authCtx.UserInfo.Email,
+		GrafanaSession: authCtx.GrafanaSession,
+		RefreshToken:   refreshToken,
+		UserClaims: map[string]interface{}{
+			"org_id": authCtx.UserInfo.OrgID,
+			"name":   authCtx.UserInfo.Name,
+		},
+		CreatedAt: time.Now(),
+		ExpiresAt: expiresAt,
+	}
+
+	// Encrypt and persist session under access token (SessionTTL e.g. 2 hours)
+	if err := h.store.SaveSession(r.Context(), accessToken, sessionData, h.cfg.SessionTTL); err != nil {
+		h.cfg.Logger.Error("failed to save session to store", "error", err)
+		sendTokenError(w, http.StatusInternalServerError, "server_error", "store error")
+		return
+	}
+
+	// Encrypt and persist session under refresh token (RefreshTTL e.g. 30 days) to decouple refresh from access token expiry
+	if err := h.store.SaveRefreshTokenSession(r.Context(), refreshToken, sessionData, h.cfg.RefreshTTL); err != nil {
+		h.cfg.Logger.Error("failed to save refresh token session to store", "error", err)
+	}
+
+	h.cfg.Logger.Info("Issued MCP access token via Authorization Code Grant with PKCE",
+		"username", authCtx.UserInfo.Login,
+		"token_prefix", accessToken[:10]+"...",
+	)
+
+	// Set required RFC 6749 Section 5.1 anti-caching headers
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(TokenResponse{
+		AccessToken:  accessToken,
+		TokenType:    "Bearer",
+		ExpiresIn:    int64(h.cfg.SessionTTL.Seconds()),
+		RefreshToken: refreshToken,
+		Scope:        "mcp",
+	})
+}
+
+// handleRefreshTokenGrant issues a new access token using an existing refresh token with atomic single-use rotation and active Grafana session verification.
+func (h *Handler) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request) {
+	refreshToken := r.FormValue("refresh_token")
+	if refreshToken == "" {
+		sendTokenError(w, http.StatusBadRequest, "invalid_request", "missing refresh_token parameter")
+		return
+	}
+
+	// Atomically retrieve and delete the refresh session using Lua script (eliminates race condition & enforces single-use)
+	session, err := h.store.GetAndDeleteRefreshSession(r.Context(), refreshToken)
+	if err != nil {
+		sendTokenError(w, http.StatusUnauthorized, "invalid_grant", "refresh token is invalid, expired, or already used")
+		return
+	}
+
+	// Active upstream session verification: Verify that the Grafana session is still alive in Grafana
+	_, err = h.fetchGrafanaUser(r.Context(), session.GrafanaSession)
+	if err != nil {
+		h.cfg.Logger.Warn("Refresh token rejected: upstream Grafana session expired or revoked", "error", err)
+		sendTokenError(w, http.StatusUnauthorized, "invalid_grant", "associated Grafana session has expired or was revoked")
+		return
+	}
+
+	newAccessToken, err := crypto.GenerateRandomToken("mcp_at_", 32)
+	if err != nil {
+		sendTokenError(w, http.StatusInternalServerError, "server_error", "failed to generate access token")
+		return
+	}
+
+	newRefreshToken, err := crypto.GenerateRandomToken("mcp_rt_", 32)
+	if err != nil {
+		sendTokenError(w, http.StatusInternalServerError, "server_error", "failed to generate refresh token")
+		return
+	}
+
+	session.ExpiresAt = time.Now().Add(h.cfg.SessionTTL)
+	session.RefreshToken = newRefreshToken
+
+	// Save new access token session (SessionTTL)
+	if err := h.store.SaveSession(r.Context(), newAccessToken, session, h.cfg.SessionTTL); err != nil {
+		sendTokenError(w, http.StatusInternalServerError, "server_error", "store error")
+		return
+	}
+
+	// Save new refresh token session (RefreshTTL)
+	if err := h.store.SaveRefreshTokenSession(r.Context(), newRefreshToken, session, h.cfg.RefreshTTL); err != nil {
+		h.cfg.Logger.Error("failed to save rotated refresh token session", "error", err)
+	}
+
+	// RFC 6749 Section 5.1 anti-caching headers
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(TokenResponse{
+		AccessToken:  newAccessToken,
+		TokenType:    "Bearer",
+		ExpiresIn:    int64(h.cfg.SessionTTL.Seconds()),
+		RefreshToken: newRefreshToken,
+		Scope:        "mcp",
+	})
+}
+
+// HandleHealth returns 200 OK.
+func (h *Handler) HandleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "healthy"})
+}
+
+// fetchGrafanaUser calls Grafana /api/user with the harvested session cookie, bounded to 1MB body.
+func (h *Handler) fetchGrafanaUser(ctx context.Context, grafanaSession string) (*store.GrafanaUser, error) {
+	reqURL := fmt.Sprintf("%s/api/user", strings.TrimRight(h.cfg.GrafanaURL, "/"))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Cookie", fmt.Sprintf("grafana_session=%s", grafanaSession))
+
+	resp, err := h.cfg.HTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("http request to grafana failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Bound response reader to 1MB to prevent memory exhaustion
+	boundedBody := io.LimitReader(resp.Body, 1<<20)
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(boundedBody)
+		return nil, fmt.Errorf("grafana returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var user store.GrafanaUser
+	if err := json.NewDecoder(boundedBody).Decode(&user); err != nil {
+		return nil, fmt.Errorf("failed to decode grafana user response: %w", err)
+	}
+
+	return &user, nil
+}
+
+// verifyPKCE verifies code_verifier against code_challenge using SHA256 and constant-time comparison per RFC 7636.
+func verifyPKCE(verifier, challenge, method string) bool {
+	if challenge == "" || verifier == "" {
+		return false
+	}
+	// RFC 7636 Section 4.1: verifier must be between 43 and 128 characters
+	if len(verifier) < 43 || len(verifier) > 128 {
+		return false
+	}
+	if method != "S256" {
+		return false
+	}
+	h := sha256.Sum256([]byte(verifier))
+	computed := base64.RawURLEncoding.EncodeToString(h[:])
+	return subtle.ConstantTimeCompare([]byte(computed), []byte(challenge)) == 1
+}
+
+// isAllowedRedirectURI restricts redirect_uri to loopback HTTP/HTTPS interfaces per RFC 8252 and RFC 6749.
+func isAllowedRedirectURI(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+
+	// Scheme must be http or https
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+
+	// URI Fragments are strictly forbidden per RFC 6749 Section 3.1.2
+	if u.Fragment != "" {
+		return false
+	}
+
+	hostname := u.Hostname()
+	if hostname == "localhost" || hostname == "127.0.0.1" || hostname == "::1" {
+		return true
+	}
+
+	// Check if hostname is an explicit loopback IP
+	ip := net.ParseIP(hostname)
+	if ip != nil && ip.IsLoopback() {
+		return true
+	}
+
+	return false
+}
+
+func sendTokenError(w http.ResponseWriter, status int, errCode, errDesc string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"error":             errCode,
+		"error_description": errDesc,
+	})
+}
