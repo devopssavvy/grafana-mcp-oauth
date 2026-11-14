@@ -5,6 +5,9 @@ on:
     branches:
       - main
     types: [opened, synchronize, reopened]
+  push:
+    branches:
+      - main
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -30,3 +33,16 @@ jobs:
       - name: Run Unit & Integration Tests
         run: |
           go test -v -count=1 -race ./...
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Validate Container Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: grafana-mcp-oauth:test
+          cache-from: type=gha,scope=buildx-ci
+          cache-to: type=gha,mode=max,scope=buildx-ci

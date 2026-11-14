@@ -116,6 +116,8 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
 
       - name: Create and push multi-arch manifest list
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           cd ${{ runner.temp }}/digests
           echo "Available digest files:"
@@ -130,20 +132,29 @@ jobs:
             SOURCES+=("${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:${hash}")
           done
 
+          if [ "${#SOURCES[@]}" -ne 2 ]; then
+            echo "ERROR: Expected exactly 2 platform digests (amd64, arm64), but found ${#SOURCES[@]}" >&2
+            exit 1
+          fi
+
           TAG_ARGS=()
           while IFS= read -r tag; do
             [ -n "$tag" ] && TAG_ARGS+=(-t "$tag")
-          done <<< "${{ steps.meta.outputs.tags }}"
+          done <<< "$TAGS"
 
           echo "Creating manifest list with tags: ${TAG_ARGS[*]}"
           echo "Sources: ${SOURCES[*]}"
 
           docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --annotation "index:org.opencontainers.image.description=Zero-Fork OAuth 2.1 & RFC 9728 authentication layer for upstream Grafana MCP server" \
             "${TAG_ARGS[@]}" \
             "${SOURCES[@]}"
 
       - name: Verify published multi-arch manifest
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
         run: |
-          FIRST_TAG=$(head -n 1 <<< "${{ steps.meta.outputs.tags }}")
+          FIRST_TAG=$(head -n 1 <<< "$TAGS")
           echo "Inspecting multi-arch manifest for: $FIRST_TAG"
           docker buildx imagetools inspect "$FIRST_TAG"
