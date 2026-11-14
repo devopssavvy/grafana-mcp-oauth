@@ -34,6 +34,14 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Upload Gitleaks SARIF report
+        uses: github/codeql-action/upload-sarif@4c50b6f6fd9dc6fe03111c2d045c8be2a724cce1 # v3.28.11
+        if: always()
+        continue-on-error: true
+        with:
+          sarif_file: results.sarif
+          category: gitleaks
+
   # 2. SAST for Go: Static Application Security Testing via Gosec
   sast:
     name: Go SAST (Gosec)
@@ -62,6 +70,7 @@ jobs:
         continue-on-error: true
         with:
           sarif_file: gosec-results.sarif
+          category: gosec
 
   # 3. Trivy SCA: Software Composition Analysis for dependencies (go.mod)
   trivy-sca:
@@ -76,10 +85,20 @@ jobs:
         with:
           scan-type: 'fs'
           scan-ref: '.'
-          format: 'table'
+          format: 'sarif'
+          output: 'trivy-sca-results.sarif'
           severity: 'CRITICAL,HIGH'
+          limit-severities-for-sarif: true
           exit-code: '1'
           ignore-unfixed: true
+
+      - name: Upload Trivy SCA SARIF report
+        uses: github/codeql-action/upload-sarif@4c50b6f6fd9dc6fe03111c2d045c8be2a724cce1 # v3.28.11
+        if: always()
+        continue-on-error: true
+        with:
+          sarif_file: trivy-sca-results.sarif
+          category: trivy-sca
 
   # 4. Trivy Image Scan: Container vulnerability scanning on built image
   trivy-image:
@@ -108,7 +127,17 @@ jobs:
         with:
           image-ref: 'grafana-mcp-oauth:scan'
           scan-type: 'image'
-          format: 'table'
+          format: 'sarif'
+          output: 'trivy-image-results.sarif'
           severity: 'CRITICAL,HIGH'
+          limit-severities-for-sarif: true
           exit-code: '1'
           ignore-unfixed: true
+
+      - name: Upload Trivy Container Image SARIF report
+        uses: github/codeql-action/upload-sarif@4c50b6f6fd9dc6fe03111c2d045c8be2a724cce1 # v3.28.11
+        if: always()
+        continue-on-error: true
+        with:
+          sarif_file: trivy-image-results.sarif
+          category: trivy-image
