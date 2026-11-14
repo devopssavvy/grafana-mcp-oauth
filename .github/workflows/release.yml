@@ -1,0 +1,160 @@
+name: Release Multi-Arch Image
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Override image tag (e.g. v1.0.0 or test-1)'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: devopssavvy/grafana-mcp-oauth
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true
+          cache-from: type=gha,scope=buildx-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=buildx-${{ matrix.arch }}
+
+      - name: Export digest
+        run: |
+          mkdir -p ${{ runner.temp }}/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${{ matrix.arch }}-${digest#sha256:}"
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge Manifests & Publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all platform digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=tag
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
+            type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
+            type=raw,value=manual-${{ github.sha }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.tag == '' }}
+          labels: |
+            org.opencontainers.image.title=grafana-mcp-oauth
+            org.opencontainers.image.description=Zero-Fork OAuth 2.1 & RFC 9728 authentication layer for upstream Grafana MCP server
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Create and push multi-arch manifest list
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          cd ${{ runner.temp }}/digests
+          echo "Available digest files:"
+          ls -la
+          
+          SOURCES=()
+          for f in *; do
+            [ -f "$f" ] || continue
+            arch="${f%%-*}"
+            hash="${f#*-}"
+            echo "Found platform $arch with digest $hash"
+            SOURCES+=("${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:${hash}")
+          done
+
+          if [ "${#SOURCES[@]}" -ne 2 ]; then
+            echo "ERROR: Expected exactly 2 platform digests (amd64, arm64), but found ${#SOURCES[@]}" >&2
+            exit 1
+          fi
+
+          TAG_ARGS=()
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && TAG_ARGS+=(-t "$tag")
+          done <<< "$TAGS"
+
+          echo "Creating manifest list with tags: ${TAG_ARGS[*]}"
+          echo "Sources: ${SOURCES[*]}"
+
+          docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --annotation "index:org.opencontainers.image.description=Zero-Fork OAuth 2.1 & RFC 9728 authentication layer for upstream Grafana MCP server" \
+            "${TAG_ARGS[@]}" \
+            "${SOURCES[@]}"
+
+      - name: Verify published multi-arch manifest
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          FIRST_TAG=$(head -n 1 <<< "$TAGS")
+          echo "Inspecting multi-arch manifest for: $FIRST_TAG"
+          docker buildx imagetools inspect "$FIRST_TAG"

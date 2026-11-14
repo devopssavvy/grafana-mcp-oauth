@@ -1,0 +1,117 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana-mcp
+  labels:
+    app: grafana-mcp
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: grafana-mcp
+  template:
+    metadata:
+      labels:
+        app: grafana-mcp
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        # Container 1: Lightweight Go OAuth Proxy (Sidecar / Front Gateway)
+        - name: mcp-oauth-proxy
+          image: ghcr.io/devopssavvy/grafana-mcp-oauth:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: MODE
+              value: "proxy"
+            - name: PORT
+              value: "8080"
+            - name: BASE_URL
+              value: "https://mcp.company.com"
+            - name: GRAFANA_URL
+              value: "http://grafana.monitoring.svc:3000"
+            - name: GRAFANA_PUBLIC_URL
+              value: "https://grafana.company.com"
+            - name: TARGET_MCP_URL
+              value: "http://127.0.0.1:8000" # Localhost in same pod
+            - name: REDIS_ADDR
+              value: "redis.monitoring.svc:6379"
+            - name: MCP_MASTER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: mcp-secrets
+                  key: master-secret
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+
+        # Container 2: Stock Upstream mcp-grafana (100% Zero-Fork)
+        - name: stock-mcp-grafana
+          image: grafana/mcp-grafana:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          args:
+            - "--base-path"
+            - "/mcp"
+          env:
+            - name: GRAFANA_URL
+              value: "http://grafana.monitoring.svc:3000"
+            - name: GRAFANA_FORWARD_HEADERS
+              value: "Cookie"
+          ports:
+            - name: mcp-internal
+              containerPort: 8000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana-mcp
+  labels:
+    app: grafana-mcp
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+  selector:
+    app: grafana-mcp
+---
+# Example Ingress pointing directly to grafana-mcp Service
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana-mcp-ingress
+  annotations:
+    kubernetes.io/ingress.class: "nginx" # Or traefik, alb, kong
+spec:
+  rules:
+    - host: mcp.company.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: grafana-mcp
+                port:
+                  number: 80
