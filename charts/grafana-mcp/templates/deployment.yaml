@@ -1,0 +1,251 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "grafana-mcp.fullname" . }}
+  namespace: {{ include "grafana-mcp.namespace" . }}
+  labels:
+    {{- include "grafana-mcp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mcp-server
+    {{- with .Values.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if not .Values.hpa.enabled }}
+  replicas: {{ .Values.replicas }}
+  {{- end }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit | default 10 }}
+  selector:
+    matchLabels:
+      {{- include "grafana-mcp.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: mcp-server
+  {{- with .Values.deploymentStrategy }}
+  strategy:
+    {{- toYaml . | trim | nindent 4 }}
+  {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- include "grafana-mcp.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: mcp-server
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "grafana-mcp.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      {{- with .Values.hostAliases }}
+      hostAliases:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext | default .Values.securityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.terminationGracePeriodSeconds }}
+      terminationGracePeriodSeconds: {{ . }}
+      {{- end }}
+      containers:
+        # Container 1: Go OAuth 2.1 & RFC 9728 Discovery Proxy (Front Entrypoint)
+        - name: mcp-oauth-proxy
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: mcp-http
+              containerPort: 8080
+              protocol: TCP
+            {{- if and .Values.metrics.enabled .Values.metrics.port }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+            {{- end }}
+          env:
+            - name: MODE
+              value: "proxy"
+            - name: PORT
+              value: "8080"
+            - name: BASE_URL
+              value: {{ .Values.oauthProxy.baseUrl | default (printf "http://%s:%d" (include "grafana-mcp.fullname" .) (.Values.service.port | int)) | quote }}
+            - name: GRAFANA_URL
+              value: {{ .Values.grafana.url | quote }}
+            - name: GRAFANA_PUBLIC_URL
+              value: {{ .Values.oauthProxy.grafanaPublicUrl | default .Values.grafana.url | quote }}
+            - name: TARGET_MCP_URL
+              value: "http://127.0.0.1:8000"
+            - name: REDIS_ADDR
+              value: {{ include "grafana-mcp.redisAddr" . | quote }}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "grafana-mcp.redisSecretName" . }}
+                  key: {{ .Values.redis.passwordKey | default "password" }}
+            - name: REDIS_DB
+              value: {{ .Values.redis.db | default 0 | quote }}
+            - name: REDIS_TLS_ENABLED
+              value: {{ .Values.redis.tls.enabled | quote }}
+            {{- if .Values.redis.tls.enabled }}
+            - name: REDIS_CA_PATH
+              value: {{ .Values.redis.tls.caPath | default "/etc/redis/tls/ca.crt" | quote }}
+            - name: REDIS_CERT_PATH
+              value: {{ .Values.redis.tls.certPath | default "/etc/redis/tls/client.crt" | quote }}
+            - name: REDIS_KEY_PATH
+              value: {{ .Values.redis.tls.keyPath | default "/etc/redis/tls/client.key" | quote }}
+            {{- end }}
+            {{- if or .Values.oauthProxy.masterSecret .Values.oauthProxy.masterSecretSecret.name }}
+            - name: MCP_MASTER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  {{- if .Values.oauthProxy.masterSecretSecret.name }}
+                  name: {{ .Values.oauthProxy.masterSecretSecret.name }}
+                  key: {{ .Values.oauthProxy.masterSecretSecret.key | default "master-secret" }}
+                  {{- else }}
+                  name: {{ include "grafana-mcp.fullname" . }}-master-secret
+                  key: master-secret
+                  {{- end }}
+            {{- end }}
+            {{- with .Values.oauthProxy.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 5
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            {{- if .Values.redis.tls.enabled }}
+            - name: redis-tls
+              mountPath: /etc/redis/tls
+              readOnly: true
+            {{- end }}
+            {{- with .Values.volumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+        # Container 2: Stock Upstream mcp-grafana (Zero-Fork)
+        - name: mcp-grafana
+          image: "{{ .Values.mcpGrafana.image.repository }}:{{ .Values.mcpGrafana.image.tag }}"
+          imagePullPolicy: {{ .Values.mcpGrafana.image.pullPolicy | default .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.mcpGrafana.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: mcp-internal
+              containerPort: 8000
+              protocol: TCP
+          args:
+            - "--base-path"
+            - "/mcp"
+            {{- if .Values.debug }}
+            - "--debug"
+            {{- end }}
+            {{- if .Values.mcpGrafana.disableWrite }}
+            - "--disable-write"
+            {{- end }}
+            {{- range .Values.mcpGrafana.disabledCategories }}
+            - --disable-{{ . }}
+            {{- end }}
+            {{- with .Values.mcpGrafana.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: GRAFANA_URL
+              value: {{ .Values.grafana.url | quote }}
+            - name: GRAFANA_FORWARD_HEADERS
+              value: "Cookie"
+            {{- if or .Values.grafana.apiKey .Values.grafana.apiKeySecret.name }}
+            - name: GRAFANA_SERVICE_ACCOUNT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  {{- if .Values.grafana.apiKey }}
+                  name: {{ include "grafana-mcp.fullname" . }}-api-key
+                  key: api-key
+                  {{- else }}
+                  name: {{ .Values.grafana.apiKeySecret.name }}
+                  key: {{ .Values.grafana.apiKeySecret.key | default "api-key" }}
+                  {{- end }}
+            {{- end }}
+            {{- with .Values.mcpGrafana.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          readinessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 5
+          livenessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 5
+          {{- with .Values.mcpGrafana.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.mcpGrafana.volumeMounts }}
+          volumeMounts:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+
+      {{- with .Values.extraContainers }}
+      {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        {{- if .Values.redis.tls.enabled }}
+        - name: redis-tls
+          secret:
+            secretName: {{ include "grafana-mcp.tlsSecretName" . }}
+            defaultMode: 0444
+        {{- end }}
+        {{- with .Values.volumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
