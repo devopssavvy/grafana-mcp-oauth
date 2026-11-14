@@ -153,7 +153,8 @@ ingress:
 | `valkey.enabled` | Enable official bundled Valkey subchart (zero Bitnami) | `true` |
 | `valkey.topology` | Valkey deployment topology (`standalone`, `replication`, `sentinel`) | `standalone` |
 | `valkey.auth.enabled` | Enable Valkey password authentication | `true` |
-| `valkey.tls.enabled` | Enable in-transit TLS encryption for Valkey | `true` |
+| `valkey.tls.enabled` | Enable in-transit TLS / mTLS encryption for Valkey | `true` |
+| `redis.tls.existingSecret` | Secret with mTLS certs (`ca.crt`, `client.crt`, `client.key`). Auto-generated if omitted | `""` |
 | `networkPolicy.enabled` | Restrict Valkey ingress strictly to proxy pods | `true` |
 | `service.type` | Kubernetes Service type | `ClusterIP` |
 | `service.port` | External service port mapping to proxy `:8080` | `80` |
