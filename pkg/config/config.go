@@ -12,28 +12,34 @@ import (
 
 // AppConfig contains runtime settings loaded from environment variables.
 type AppConfig struct {
-	Mode             string
-	BaseURL          string
-	HTTPHost         string
-	HTTPPort         string
-	GRPCHost         string
-	GRPCPort         string
-	CookieSecure     bool
-	TargetMCPURL     string
-	GrafanaURL       string
-	GrafanaPublicURL string
-	CallbackBaseURL  string
-	RedisAddr        string
-	RedisPassword    string
-	RedisDB          int
-	MasterSecret      []byte
-	SessionTTL        time.Duration
-	RefreshTTL        time.Duration
-	PendingAuthTTL    time.Duration
-	AuthCodeTTL       time.Duration
-	RateLimitLoginRPM int
-	RateLimitTokenRPM int
-	LogLevel          slog.Level
+	Mode                       string
+	BaseURL                    string
+	HTTPHost                   string
+	HTTPPort                   string
+	GRPCHost                   string
+	GRPCPort                   string
+	CookieSecure               bool
+	TargetMCPURL               string
+	GrafanaURL                 string
+	GrafanaPublicURL           string
+	CallbackBaseURL            string
+	RedisAddr                  string
+	RedisPassword              string
+	RedisDB                    int
+	RedisTLSEnabled            bool
+	RedisCAPath                string
+	RedisCertPath              string
+	RedisKeyPath               string
+	RedisTLSInsecureSkipVerify bool
+	RedisTLSServerName         string
+	MasterSecret               []byte
+	SessionTTL                 time.Duration
+	RefreshTTL                 time.Duration
+	PendingAuthTTL             time.Duration
+	AuthCodeTTL                time.Duration
+	RateLimitLoginRPM          int
+	RateLimitTokenRPM          int
+	LogLevel                   slog.Level
 }
 
 // LoadFromEnv loads configuration from environment variables with safe defaults.
@@ -73,6 +79,28 @@ func LoadFromEnv() *AppConfig {
 	if dbStr := os.Getenv("REDIS_DB"); dbStr != "" {
 		if db, err := strconv.Atoi(dbStr); err == nil {
 			redisDB = db
+		}
+	}
+
+	redisTLSEnabled := false
+	redisCAPath := os.Getenv("REDIS_CA_PATH")
+	redisCertPath := os.Getenv("REDIS_CERT_PATH")
+	redisKeyPath := os.Getenv("REDIS_KEY_PATH")
+	redisTLSServerName := os.Getenv("REDIS_TLS_SERVER_NAME")
+
+	if tlsStr := os.Getenv("REDIS_TLS_ENABLED"); tlsStr != "" {
+		if b, err := strconv.ParseBool(tlsStr); err == nil {
+			redisTLSEnabled = b
+		}
+	} else if redisCAPath != "" || redisCertPath != "" || redisKeyPath != "" || redisTLSServerName != "" {
+		// Auto-enable TLS if cert/key/CA/SNI paths are configured and REDIS_TLS_ENABLED was not explicitly set
+		redisTLSEnabled = true
+	}
+
+	redisTLSInsecureSkipVerify := false
+	if isvStr := os.Getenv("REDIS_TLS_INSECURE_SKIP_VERIFY"); isvStr != "" {
+		if b, err := strconv.ParseBool(isvStr); err == nil {
+			redisTLSInsecureSkipVerify = b
 		}
 	}
 
@@ -145,28 +173,34 @@ func LoadFromEnv() *AppConfig {
 	}
 
 	return &AppConfig{
-		Mode:             mode,
-		BaseURL:          baseURL,
-		HTTPHost:         httpHost,
-		HTTPPort:         httpPort,
-		GRPCHost:         grpcHost,
-		GRPCPort:         grpcPort,
-		CookieSecure:     cookieSecure,
-		TargetMCPURL:     targetMCPURL,
-		GrafanaURL:       grafanaURL,
-		GrafanaPublicURL: grafanaPublicURL,
-		CallbackBaseURL:  callbackBaseURL,
-		RedisAddr:        redisAddr,
-		RedisPassword:    redisPassword,
-		RedisDB:          redisDB,
-		MasterSecret:      masterSecret,
-		SessionTTL:        time.Duration(sessionHours) * time.Hour,
-		RefreshTTL:        time.Duration(refreshDays) * 24 * time.Hour,
-		PendingAuthTTL:    time.Duration(pendingAuthMinutes) * time.Minute,
-		AuthCodeTTL:       time.Duration(authCodeSeconds) * time.Second,
-		RateLimitLoginRPM: rateLimitLoginRPM,
-		RateLimitTokenRPM: rateLimitTokenRPM,
-		LogLevel:          logLevel,
+		Mode:                       mode,
+		BaseURL:                    baseURL,
+		HTTPHost:                   httpHost,
+		HTTPPort:                   httpPort,
+		GRPCHost:                   grpcHost,
+		GRPCPort:                   grpcPort,
+		CookieSecure:               cookieSecure,
+		TargetMCPURL:               targetMCPURL,
+		GrafanaURL:                 grafanaURL,
+		GrafanaPublicURL:           grafanaPublicURL,
+		CallbackBaseURL:            callbackBaseURL,
+		RedisAddr:                  redisAddr,
+		RedisPassword:              redisPassword,
+		RedisDB:                    redisDB,
+		RedisTLSEnabled:            redisTLSEnabled,
+		RedisCAPath:                redisCAPath,
+		RedisCertPath:              redisCertPath,
+		RedisKeyPath:               redisKeyPath,
+		RedisTLSInsecureSkipVerify: redisTLSInsecureSkipVerify,
+		RedisTLSServerName:         redisTLSServerName,
+		MasterSecret:               masterSecret,
+		SessionTTL:                 time.Duration(sessionHours) * time.Hour,
+		RefreshTTL:                 time.Duration(refreshDays) * 24 * time.Hour,
+		PendingAuthTTL:             time.Duration(pendingAuthMinutes) * time.Minute,
+		AuthCodeTTL:                time.Duration(authCodeSeconds) * time.Second,
+		RateLimitLoginRPM:          rateLimitLoginRPM,
+		RateLimitTokenRPM:          rateLimitTokenRPM,
+		LogLevel:                   logLevel,
 	}
 }
 

@@ -28,6 +28,12 @@ func TestLoadFromEnv_Defaults(t *testing.T) {
 	assert.Equal(t, 60*time.Second, cfg.AuthCodeTTL)
 	assert.Nil(t, cfg.MasterSecret, "MasterSecret should be nil in zero-config mode")
 	assert.Equal(t, "zero-config (client-derived)", cfg.MasterSecretFingerprint())
+	assert.False(t, cfg.RedisTLSEnabled)
+	assert.Empty(t, cfg.RedisCAPath)
+	assert.Empty(t, cfg.RedisCertPath)
+	assert.Empty(t, cfg.RedisKeyPath)
+	assert.False(t, cfg.RedisTLSInsecureSkipVerify)
+	assert.Empty(t, cfg.RedisTLSServerName)
 }
 
 func TestLoadFromEnv_ProductionWithoutMasterSecret(t *testing.T) {
@@ -80,4 +86,50 @@ func TestLoadFromEnv_CustomOverrides(t *testing.T) {
 	assert.Equal(t, "http://mcp:8080", cfg.TargetMCPURL)
 	assert.Equal(t, 3*time.Minute, cfg.PendingAuthTTL)
 	assert.Equal(t, 30*time.Second, cfg.AuthCodeTTL)
+}
+
+func TestLoadFromEnv_RedisTLS(t *testing.T) {
+	t.Run("explicit TLS enabled", func(t *testing.T) {
+		t.Setenv("REDIS_TLS_ENABLED", "true")
+		t.Setenv("REDIS_CA_PATH", "/etc/ssl/ca.crt")
+		t.Setenv("REDIS_CERT_PATH", "/etc/ssl/client.crt")
+		t.Setenv("REDIS_KEY_PATH", "/etc/ssl/client.key")
+		t.Setenv("REDIS_TLS_INSECURE_SKIP_VERIFY", "true")
+		t.Setenv("REDIS_TLS_SERVER_NAME", "redis.custom.domain")
+
+		cfg := config.LoadFromEnv()
+		assert.True(t, cfg.RedisTLSEnabled)
+		assert.Equal(t, "/etc/ssl/ca.crt", cfg.RedisCAPath)
+		assert.Equal(t, "/etc/ssl/client.crt", cfg.RedisCertPath)
+		assert.Equal(t, "/etc/ssl/client.key", cfg.RedisKeyPath)
+		assert.True(t, cfg.RedisTLSInsecureSkipVerify)
+		assert.Equal(t, "redis.custom.domain", cfg.RedisTLSServerName)
+	})
+
+	t.Run("auto-enable TLS if cert path is provided", func(t *testing.T) {
+		os.Unsetenv("REDIS_TLS_ENABLED")
+		t.Setenv("REDIS_CERT_PATH", "/certs/client.crt")
+
+		cfg := config.LoadFromEnv()
+		assert.True(t, cfg.RedisTLSEnabled)
+		assert.Equal(t, "/certs/client.crt", cfg.RedisCertPath)
+	})
+
+	t.Run("auto-enable TLS if CA path is provided", func(t *testing.T) {
+		os.Unsetenv("REDIS_TLS_ENABLED")
+		t.Setenv("REDIS_CA_PATH", "/certs/ca.crt")
+
+		cfg := config.LoadFromEnv()
+		assert.True(t, cfg.RedisTLSEnabled)
+		assert.Equal(t, "/certs/ca.crt", cfg.RedisCAPath)
+	})
+
+	t.Run("explicit TLS false overrides cert path presence", func(t *testing.T) {
+		t.Setenv("REDIS_TLS_ENABLED", "false")
+		t.Setenv("REDIS_CERT_PATH", "/certs/client.crt")
+
+		cfg := config.LoadFromEnv()
+		assert.False(t, cfg.RedisTLSEnabled)
+		assert.Equal(t, "/certs/client.crt", cfg.RedisCertPath)
+	})
 }

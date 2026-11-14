@@ -224,6 +224,12 @@ The system establishes multi-layered session security to ensure end-to-end prote
 * **Zero-Knowledge**: Only clients possessing a valid token can derive the key required to decrypt the session payload. The Redis server stores no decryption keys.
 * **Distributed State**: All pending login states (`mcp:pending_auth:`) and authorization codes (`mcp:auth_code:`) are stored centrally in Redis with automatic TTLs, fully supporting horizontal autoscaling (Multi-replica / HPA).
 
+### 4.3. Transport Encryption & Dynamic Mutual TLS (mTLS)
+* **Transport Encryption**: Supports TLS 1.2+ for in-transit encryption against Redis servers (`REDIS_TLS_ENABLED`), with support for custom CA certificate bundles (`REDIS_CA_PATH`) or automatic fallback to host system root CAs.
+* **Mutual TLS (mTLS)**: Supports client authentication via client certificate (`REDIS_CERT_PATH`) and private key (`REDIS_KEY_PATH`).
+* **Zero-Downtime Dynamic Auto-Reload**: Implements Go's `crypto/tls.Config.GetClientCertificate` callback with thread-safe `KeyPairReloader`. File modification timestamps (`os.Stat`) are checked during TLS handshakes. When certificates or keys are rotated on disk (e.g. by cert-manager or Kubernetes projected volume updates), new connections automatically adopt the updated credentials without requiring a process restart. Disk reads and key parsing occur outside exclusive locks to eliminate contention during handshakes.
+* **Fail-Safe Operation**: If a file read or parse error occurs during cert rotation (e.g., transient half-write or lock), the gateway logs a warning and retains the currently active valid certificate, preventing service degradation.
+
 ---
 
 ## 5. Unified Runtime & Operating Modes
@@ -262,7 +268,9 @@ The gateway is built as a single, multi-architecture static binary (`grafana-mcp
 │   │   └── config_test.go          # Config unit tests
 │   ├── server
 │   │   ├── server.go               # Unified Server managing HTTP Mux, gRPC, and Proxy
-│   │   └── server_test.go          # Unit tests verifying proxy, extauthz, and all modes
+│   │   ├── server_test.go          # Unit tests verifying proxy, extauthz, and all modes
+│   │   ├── tls.go                  # Redis TLS/mTLS config and thread-safe dynamic keypair reloader
+│   │   └── tls_test.go             # Unit tests for TLS, custom CA, mTLS, and dynamic cert rotation
 │   ├── crypto
 │   │   ├── crypto.go               # HMAC-SHA3-512, HKDF, Argon2id, XChaCha20-Poly1305
 │   │   └── crypto_test.go          # Unit tests for encryption, hashing, and tamper resistance
