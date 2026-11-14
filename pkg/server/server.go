@@ -113,13 +113,18 @@ func New(opts Options) (*Server, error) {
 
 	// 3. OAuth 2.1 & RFC 9728 Discovery Handler
 	oauthHandler := oauth.NewHandler(oauth.Config{
-		BaseURL:          cfg.BaseURL,
-		GrafanaURL:       cfg.GrafanaURL,
-		GrafanaPublicURL: cfg.GrafanaPublicURL,
-		CallbackBaseURL:  cfg.CallbackBaseURL,
-		SessionTTL:       cfg.SessionTTL,
-		RefreshTTL:       cfg.RefreshTTL,
-		Logger:           logger,
+		BaseURL:           cfg.BaseURL,
+		GrafanaURL:        cfg.GrafanaURL,
+		GrafanaPublicURL:  cfg.GrafanaPublicURL,
+		CallbackBaseURL:   cfg.CallbackBaseURL,
+		CookieSecure:      cfg.CookieSecure,
+		SessionTTL:        cfg.SessionTTL,
+		RefreshTTL:        cfg.RefreshTTL,
+		PendingAuthTTL:    cfg.PendingAuthTTL,
+		AuthCodeTTL:       cfg.AuthCodeTTL,
+		RateLimitLoginRPM: cfg.RateLimitLoginRPM,
+		RateLimitTokenRPM: cfg.RateLimitTokenRPM,
+		Logger:            logger,
 	}, sessionStore)
 
 	s := &Server{
@@ -140,9 +145,9 @@ func New(opts Options) (*Server, error) {
 	if mode == ModeExtAuthz || mode == ModeAll {
 		extAuthServer := extauthz.NewServer(sessionStore, cfg.BaseURL, logger)
 
-		// HTTP Check endpoints (method-agnostic: supports GET, POST, PUT, DELETE, OPTIONS for Envoy/NGINX/Traefik)
+		// HTTP Check endpoint for internal ingress/reverse proxies (NGINX auth_request, Traefik ForwardAuth)
+		// Note: Not exposed under public /mcp/auth/ to prevent external credential oracle attacks
 		mux.HandleFunc("/extauthz/check", extAuthServer.HandleHTTPCheck)
-		mux.HandleFunc("/mcp/auth/check", extAuthServer.HandleHTTPCheck)
 
 		// gRPC Server setup
 		grpcServer := grpc.NewServer()
@@ -208,9 +213,10 @@ func (s *Server) Start() (<-chan error, error) {
 
 	// 1. Bind HTTP Listener upfront before launching any background goroutines
 	if s.httpListener == nil {
-		ln, err := net.Listen("tcp", ":"+s.cfg.HTTPPort) // #nosec G102 -- Server intentionally binds to all interfaces in container environment
+		httpAddr := net.JoinHostPort(s.cfg.HTTPHost, s.cfg.HTTPPort)
+		ln, err := net.Listen("tcp", httpAddr)
 		if err != nil {
-			return nil, fmt.Errorf("failed to listen on HTTP port %s: %w", s.cfg.HTTPPort, err)
+			return nil, fmt.Errorf("failed to listen on HTTP %s: %w", httpAddr, err)
 		}
 		s.httpListener = ln
 	}
@@ -219,11 +225,12 @@ func (s *Server) Start() (<-chan error, error) {
 	// 2. Bind gRPC Listener upfront if in extauthz or all mode
 	if s.grpcServer != nil {
 		if s.grpcListener == nil {
-			ln, err := net.Listen("tcp", ":"+s.cfg.GRPCPort) // #nosec G102 -- gRPC Server intentionally binds to all interfaces in container environment
+			grpcAddr := net.JoinHostPort(s.cfg.GRPCHost, s.cfg.GRPCPort)
+			ln, err := net.Listen("tcp", grpcAddr)
 			if err != nil {
 				_ = s.httpListener.Close()
 				s.httpListener = nil
-				return nil, fmt.Errorf("failed to listen on gRPC port %s: %w", s.cfg.GRPCPort, err)
+				return nil, fmt.Errorf("failed to listen on gRPC %s: %w", grpcAddr, err)
 			}
 			s.grpcListener = ln
 		}
@@ -316,6 +323,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 
 	wg.Wait()
+
+	if s.oauthHandler != nil {
+		s.oauthHandler.Close()
+	}
 
 	if s.rdb != nil {
 		_ = s.rdb.Close()

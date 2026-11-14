@@ -130,7 +130,6 @@ func (s *Server) HandleHTTPCheck(w http.ResponseWriter, r *http.Request) {
 	// For Envoy HTTP ext_authz, NGINX auth_request & Kong forward-auth:
 	cookieVal := buildCookieHeader(r.Header.Get("Cookie"), session.GrafanaSession)
 	w.Header().Set("Cookie", cookieVal)
-	w.Header().Set("X-Grafana-Session", session.GrafanaSession)
 	w.Header().Set("X-Forwarded-User", session.Username)
 	w.Header().Set("x-envoy-auth-headers-to-remove", "authorization")
 	w.WriteHeader(http.StatusOK)

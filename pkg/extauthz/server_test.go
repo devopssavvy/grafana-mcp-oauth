@@ -167,6 +167,7 @@ func TestExtAuthz_HTTPCheck(t *testing.T) {
 	assert.Equal(t, "grafana_session=grafana_sess_dave_67890", w.Header().Get("Cookie"))
 	assert.Equal(t, "dave", w.Header().Get("X-Forwarded-User"))
 	assert.Equal(t, "authorization", w.Header().Get("x-envoy-auth-headers-to-remove"))
+	assert.Empty(t, w.Header().Get("X-Grafana-Session"), "X-Grafana-Session must not be exposed in HTTP check response")
 
 	// Unauthorized HTTP request
 	reqUnauth := httptest.NewRequest(http.MethodGet, "/extauthz/check", nil)
