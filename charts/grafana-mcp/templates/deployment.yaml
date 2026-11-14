@@ -182,18 +182,6 @@ spec:
               value: {{ .Values.grafana.url | quote }}
             - name: GRAFANA_FORWARD_HEADERS
               value: "Cookie"
-            {{- if or .Values.grafana.apiKey .Values.grafana.apiKeySecret.name }}
-            - name: GRAFANA_SERVICE_ACCOUNT_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  {{- if .Values.grafana.apiKey }}
-                  name: {{ include "grafana-mcp.fullname" . }}-api-key
-                  key: api-key
-                  {{- else }}
-                  name: {{ .Values.grafana.apiKeySecret.name }}
-                  key: {{ .Values.grafana.apiKeySecret.key | default "api-key" }}
-                  {{- end }}
-            {{- end }}
             {{- with .Values.mcpGrafana.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

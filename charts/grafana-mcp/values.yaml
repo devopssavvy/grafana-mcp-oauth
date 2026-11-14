@@ -119,14 +119,9 @@ mcpGrafana:
 grafana:
   # -- Internal Grafana URL reachable by the pod
   url: "http://grafana:3000"
-
-  # -- Optional static Grafana API key / Service Account Token (if not using secret)
-  apiKey: ""
-
-  # -- Secret containing the Grafana API key
-  apiKeySecret:
-    name: ""
-    key: ""
+  # Note: Caller authentication is handled dynamically per agent/user via OAuth 2.1
+  # with PKCE and session cookie injection. No static Grafana API key or Service Account
+  # token is required or used.
 
 # ==============================================================================
 # Session Store Configuration (Valkey / Redis)
@@ -151,12 +146,18 @@ redis:
   # -- Whether to create a standalone auth secret when not using subchart
   createSecret: false
 
-  # -- TLS configuration for the connection between proxy and Valkey/Redis
+  # -- TLS / mTLS configuration for the connection between proxy and Valkey/Redis
   tls:
-    # -- Enable TLS for session store connections
+    # -- Enable TLS / mTLS for session store connections
     enabled: true
-    # -- Existing secret containing TLS certs (ca.crt, client.crt, client.key)
+
+    # -- Existing secret containing TLS/mTLS certs (ca.crt, client.crt, client.key, server.crt, server.key).
+    # NOTE: If this key is omitted or left empty (""), the chart automatically generates
+    # in-cluster mTLS certificates (a dedicated CA, Valkey server cert & key, and Proxy client cert & key)
+    # and populates a Kubernetes Secret (matching valkey.tls.existingSecret, or "<release>-valkey-tls").
+    # Certificate persistence across helm upgrades is guaranteed via Kubernetes secret lookup.
     existingSecret: ""
+
     # -- Path to CA certificate in the proxy container
     caPath: "/etc/redis/tls/ca.crt"
     # -- Path to client certificate in the proxy container
@@ -187,6 +188,9 @@ valkey:
   # -- Valkey TLS configuration
   tls:
     enabled: true
+    # -- Existing secret containing Valkey TLS certificates.
+    # When redis.tls.existingSecret is omitted/empty, the chart automatically provisions this secret
+    # ("valkey-tls") with the generated CA and server certificates for the subchart to mount.
     existingSecret: "valkey-tls"
 
   # -- Disable subchart networkPolicy in favor of chart's fine-grained NetworkPolicy

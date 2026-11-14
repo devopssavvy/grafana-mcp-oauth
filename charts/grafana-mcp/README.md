@@ -81,7 +81,7 @@ helm install grafana-mcp charts/grafana-mcp \
 
 ```bash
 helm install grafana-mcp oci://ghcr.io/devopssavvy/charts/grafana-mcp \
-  --version 0.1.0 \
+  --version 0.1.2 \
   --set oauthProxy.baseUrl="https://mcp.company.com" \
   --set grafana.url="http://grafana.monitoring.svc:3000"
 ```
@@ -153,7 +153,8 @@ ingress:
 | `valkey.enabled` | Enable official bundled Valkey subchart (zero Bitnami) | `true` |
 | `valkey.topology` | Valkey deployment topology (`standalone`, `replication`, `sentinel`) | `standalone` |
 | `valkey.auth.enabled` | Enable Valkey password authentication | `true` |
-| `valkey.tls.enabled` | Enable in-transit TLS encryption for Valkey | `true` |
+| `valkey.tls.enabled` | Enable in-transit TLS / mTLS encryption for Valkey | `true` |
+| `redis.tls.existingSecret` | Secret with mTLS certs (`ca.crt`, `client.crt`, `client.key`). Auto-generated if omitted | `""` |
 | `networkPolicy.enabled` | Restrict Valkey ingress strictly to proxy pods | `true` |
 | `service.type` | Kubernetes Service type | `ClusterIP` |
 | `service.port` | External service port mapping to proxy `:8080` | `80` |
@@ -161,3 +162,15 @@ ingress:
 | `serviceAccount.create` | Create dedicated ServiceAccount | `true` |
 | `hpa.enabled` | Enable HorizontalPodAutoscaler | `false` |
 | `serviceMonitor.enabled` | Enable Prometheus Operator ServiceMonitor | `false` |
+
+---
+
+## 6. Release & Versioning Lifecycle
+
+This chart follows a decoupled release model separating application containers from Helm packaging:
+
+- **Application Releases (`v*` tags):** Pushing a tag like `v0.2.0` triggers `.github/workflows/release.yml` to build and publish the multi-arch Docker image `ghcr.io/devopssavvy/grafana-mcp-oauth:v0.2.0`.
+- **Chart Releases (Automated on Merge):**
+  1. Bump `version` (and optionally update `appVersion`) in `charts/grafana-mcp/Chart.yaml`.
+  2. When merged into `main`, `.github/workflows/helm-release.yml` checks if the version is new, packages the chart, pushes it to `oci://ghcr.io/devopssavvy/charts/grafana-mcp:<version>`, and automatically tags the commit as `chart-v<version>`.
+  3. If `version` in `Chart.yaml` was not changed, publishing is skipped, preventing registry collisions or chart downgrades.
