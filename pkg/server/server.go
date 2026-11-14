@@ -214,7 +214,6 @@ func (s *Server) Start() (<-chan error, error) {
 	// 1. Bind HTTP Listener upfront before launching any background goroutines
 	if s.httpListener == nil {
 		httpAddr := net.JoinHostPort(s.cfg.HTTPHost, s.cfg.HTTPPort)
-		// #nosec G102 -- configurable bind interface via HTTP_HOST / BIND_HOST environment variable and CLI flag
 		ln, err := net.Listen("tcp", httpAddr)
 		if err != nil {
 			return nil, fmt.Errorf("failed to listen on HTTP %s: %w", httpAddr, err)
@@ -227,7 +226,6 @@ func (s *Server) Start() (<-chan error, error) {
 	if s.grpcServer != nil {
 		if s.grpcListener == nil {
 			grpcAddr := net.JoinHostPort(s.cfg.GRPCHost, s.cfg.GRPCPort)
-			// #nosec G102 -- configurable bind interface via GRPC_HOST / BIND_HOST environment variable and CLI flag
 			ln, err := net.Listen("tcp", grpcAddr)
 			if err != nil {
 				_ = s.httpListener.Close()

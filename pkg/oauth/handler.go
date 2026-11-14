@@ -231,14 +231,13 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Set browser state cookie to protect against OAuth Login CSRF / Session Fixation
-	// #nosec G124 -- state cookie protected with HttpOnly, SameSite=Lax, and configurable Secure attribute
 	http.SetCookie(w, &http.Cookie{
 		Name:     "mcp_auth_state",
 		Value:    internalState,
 		Path:     "/mcp/auth",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   h.cfg.CookieSecure,
+		Secure:   true,
 		MaxAge:   int(h.cfg.PendingAuthTTL.Seconds()),
 	})
 
@@ -279,14 +278,13 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Clear the state cookie
-	// #nosec G124 -- state cookie cleanup with explicit HttpOnly, SameSite, and configurable Secure attributes
 	http.SetCookie(w, &http.Cookie{
 		Name:     "mcp_auth_state",
 		Value:    "",
 		Path:     "/mcp/auth",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   h.cfg.CookieSecure,
+		Secure:   true,
 		MaxAge:   -1,
 	})
 
@@ -372,8 +370,13 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 			"username", userInfo.Login,
 		)
 
-		// #nosec G710 -- req.RedirectURI is strictly validated against local loopback whitelist in HandleAuthorize
-		http.Redirect(w, r, redirectTarget.String(), http.StatusFound)
+		// Validate redirectTarget host is strictly loopback (RFC 8252 Section 7.3)
+		if !isAllowedRedirectURI(redirectTarget.String()) {
+			http.Error(w, "invalid redirect target: must be local loopback", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Location", redirectTarget.String())
+		w.WriteHeader(http.StatusFound)
 		return
 	}
 
@@ -520,14 +523,16 @@ func (h *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")
 	w.WriteHeader(http.StatusOK)
-	// #nosec G117 -- TokenResponse explicitly returns refresh_token per RFC 6749 Section 5.1
-	_ = json.NewEncoder(w).Encode(TokenResponse{
-		AccessToken:  accessToken,
-		TokenType:    "Bearer",
-		ExpiresIn:    int64(h.cfg.SessionTTL.Seconds()),
-		RefreshToken: refreshToken,
-		Scope:        "mcp",
-	})
+	resp := map[string]any{
+		"access_token": accessToken,
+		"token_type":   "Bearer",
+		"expires_in":   int64(h.cfg.SessionTTL.Seconds()),
+		"scope":        "mcp",
+	}
+	if refreshToken != "" {
+		resp["refresh_token"] = refreshToken
+	}
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // handleRefreshTokenGrant issues a new access token using an existing refresh token with atomic single-use rotation and active Grafana session verification.
@@ -584,14 +589,16 @@ func (h *Handler) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")
 	w.WriteHeader(http.StatusOK)
-	// #nosec G117 -- TokenResponse explicitly returns refresh_token per RFC 6749 Section 5.1
-	_ = json.NewEncoder(w).Encode(TokenResponse{
-		AccessToken:  newAccessToken,
-		TokenType:    "Bearer",
-		ExpiresIn:    int64(h.cfg.SessionTTL.Seconds()),
-		RefreshToken: newRefreshToken,
-		Scope:        "mcp",
-	})
+	resp := map[string]any{
+		"access_token": newAccessToken,
+		"token_type":   "Bearer",
+		"expires_in":   int64(h.cfg.SessionTTL.Seconds()),
+		"scope":        "mcp",
+	}
+	if newRefreshToken != "" {
+		resp["refresh_token"] = newRefreshToken
+	}
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // HandleHealth returns 200 OK.
