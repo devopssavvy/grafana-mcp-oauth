@@ -48,17 +48,17 @@ flowchart TD
     end
 
     subgraph AuthTier["Auth & Session Tier"]
-        Gateway["grafana-mcp-oauth (:8081 HTTP / :9001 gRPC)\n- RFC 9728 & RFC 8414 Discovery\n- PKCE OAuth 2.1 Handshake\n- gRPC Check() Server"]
-        Redis[("Zero-Knowledge Redis Store\n- HMAC-SHA3-512 Key Lookup\n- XChaCha20-Poly1305 AEAD")]
+        Gateway["grafana-mcp-oauth (:8081 HTTP / :9001 gRPC)<br/>- RFC 9728 & RFC 8414 Discovery<br/>- PKCE OAuth 2.1 Handshake<br/>- gRPC Check() Server"]
+        Redis[("Zero-Knowledge Redis Store<br/>- HMAC-SHA3-512 Key Lookup<br/>- XChaCha20-Poly1305 AEAD")]
     end
 
     subgraph MCPTier["MCP Processing Tier"]
-        StockMCP["stock grafana/mcp-grafana:latest\n(GRAFANA_FORWARD_HEADERS=Cookie)"]
+        StockMCP["stock grafana/mcp-grafana:latest<br/>(GRAFANA_FORWARD_HEADERS=Cookie)"]
     end
 
     subgraph GrafanaTier["Grafana & Data Tier"]
-        Grafana["Grafana Server (:3000)\n- Resolves grafana_session\n- Extracts OAuth token from user_auth\n- Applies oauth_pass_thru=true"]
-        DataSources[("Datasources\n(Prometheus / Loki / Tempo)")]
+        Grafana["Grafana Server (:3000)<br/>- Resolves grafana_session<br/>- Extracts OAuth token from user_auth<br/>- Applies oauth_pass_thru=true"]
+        DataSources[("Datasources<br/>(Prometheus / Loki / Tempo)")]
     end
 
     WebUser -->|"Browser Traffic"| RouteWeb
@@ -68,7 +68,7 @@ flowchart TD
     Agent -->|"Bearer MCP_Token"| RouteMCP
     RouteMCP -->|"1. gRPC Check()"| Gateway
     Gateway <-->|"2. Decrypt Session"| Redis
-    Gateway -->>|"3. CheckResponse OK + Mutate Header"| RouteMCP
+    Gateway -->|"3. CheckResponse OK + Mutate Header"| RouteMCP
     RouteMCP -->|"4. Forward with Cookie: grafana_session"| StockMCP
     Gateway <-->|"Session Harvesting (/api/user)"| Grafana
     StockMCP -->|"Forward with Cookie: grafana_session"| Grafana
@@ -86,17 +86,17 @@ flowchart TD
     end
 
     subgraph ProxyTier["Direct Sidecar Proxy Tier (:8080)"]
-        Gateway["grafana-mcp-oauth (MODE=proxy)\n- Built-in Authenticated Reverse Proxy\n- RFC 9728 Discovery & PKCE Handshake\n- Bearer Token to Cookie Translator"]
-        Redis[("Zero-Knowledge Redis Store\n- HMAC-SHA3-512 Key Lookup\n- XChaCha20-Poly1305 AEAD")]
+        Gateway["grafana-mcp-oauth (MODE=proxy)<br/>- Built-in Authenticated Reverse Proxy<br/>- RFC 9728 Discovery & PKCE Handshake<br/>- Bearer Token to Cookie Translator"]
+        Redis[("Zero-Knowledge Redis Store<br/>- HMAC-SHA3-512 Key Lookup<br/>- XChaCha20-Poly1305 AEAD")]
     end
 
     subgraph MCPTier["MCP Processing Tier"]
-        StockMCP["stock grafana/mcp-grafana (:8000)\n(TARGET_MCP_URL, GRAFANA_FORWARD_HEADERS=Cookie)"]
+        StockMCP["stock grafana/mcp-grafana (:8000)<br/>(TARGET_MCP_URL, GRAFANA_FORWARD_HEADERS=Cookie)"]
     end
 
     subgraph GrafanaTier["Grafana & Data Tier"]
-        Grafana["Grafana Server (:3000)\n- Resolves grafana_session\n- Extracts OAuth token from user_auth\n- Applies oauth_pass_thru=true"]
-        DataSources[("Datasources\n(Prometheus / Loki / Tempo)")]
+        Grafana["Grafana Server (:3000)<br/>- Resolves grafana_session<br/>- Extracts OAuth token from user_auth<br/>- Applies oauth_pass_thru=true"]
+        DataSources[("Datasources<br/>(Prometheus / Loki / Tempo)")]
     end
 
     Agent -->|"1. OAuth Discovery & PKCE Login"| Gateway
