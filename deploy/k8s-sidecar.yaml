@@ -19,9 +19,9 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       containers:
-        # Container 1: Lightweight Go OAuth Wrapper (Sidecar / Front Proxy)
-        - name: mcp-oauth-wrapper
-          image: ghcr.io/your-org/grafana-mcp-oauth-wrapper:latest
+        # Container 1: Lightweight Go OAuth Proxy (Sidecar / Front Gateway)
+        - name: mcp-oauth-proxy
+          image: ghcr.io/devopssavvy/grafana-mcp-oauth:latest
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false
@@ -30,6 +30,8 @@ spec:
               drop:
                 - ALL
           env:
+            - name: MODE
+              value: "proxy"
             - name: PORT
               value: "8080"
             - name: BASE_URL

@@ -1,0 +1,5 @@
+bin/
+.git/
+.github/
+*.log
+deploy/envoy/logs/

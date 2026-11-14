@@ -40,8 +40,18 @@ This project implements an **Envoy Gateway + `mcp-auth-helper`** architecture **
 
 ## 2. Core Components
 
-### 2.1. `mcp-auth-helper` (Go 1.27.3)
-Central service responsible for:
+### 2.1. Unified Gateway Binary & Image: `grafana-mcp-oauth` (Go 1.27.3)
+Central service packaged into a **single, minimal Distroless image** (`gcr.io/distroless/static-debian12:nonroot`, <10MB) supporting **multi-architecture builds (`linux/amd64` and `linux/arm64`)** via Docker Buildx.
+
+It operates in 3 distinct modes, configurable via CLI flag `--mode` or environment variable `MODE`:
+
+| Mode | HTTP Port | gRPC Port (9001) | Reverse Proxy `/mcp/*` | ext_authz (gRPC + HTTP Check) | Use Case |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| **`proxy`** *(Default)* | 8080 | Disabled | Enabled (`TARGET_MCP_URL`) | Disabled | Standalone or Kubernetes Sidecar without Envoy |
+| **`extauthz`** | 8081 | Enabled | Disabled | Enabled | Deployment behind Envoy Gateway or Ingress |
+| **`all`** | 8080 | Enabled | Enabled (`TARGET_MCP_URL`) | Enabled | Hybrid / all-in-one local dev & versatile setups |
+
+Key capabilities:
 1. **MCP Dynamic OAuth Discovery (RFC 9728 & RFC 8414)**:
    - `GET /.well-known/oauth-protected-resource`: Provides protected resource metadata per RFC 9728 so MCP clients automatically discover the Authorization Server.
    - `GET /.well-known/oauth-authorization-server`: Provides `authorization_endpoint`, `token_endpoint`, and supports PKCE `S256`.
@@ -49,6 +59,8 @@ Central service responsible for:
    - `GET /mcp/auth/login`: Triggers browser authentication via Grafana Generic OAuth (`/login/generic_oauth?redirect=/mcp/auth/callback`). Enforces PKCE `S256` per RFC 9700. Prevents Open Redirect by strictly validating `redirect_uri` to loopback local interfaces only (`http://localhost`, `http://127.0.0.1`, `http://[::1]`) and prohibiting URI fragments. Sets browser cookie `mcp_auth_state` (SameSite=Lax, HttpOnly) to completely eliminate OAuth Login CSRF.
    - `GET /mcp/auth/callback`: Validates the `mcp_auth_state` cookie, captures the `grafana_session` cookie from Grafana's response, verifies identity via `/api/user` (strictly rejecting forged sessions), issues a single-use authorization code `mcp_code_...` encrypted and stored in Redis with a 5-minute TTL, then redirects back to the client loopback.
    - `POST /mcp/auth/token`: Validates authorization code and `code_verifier` using constant-time comparison (`subtle.ConstantTimeCompare`), strictly verifies exact `redirect_uri` match per RFC 6749 Section 4.1.3, and issues JSON `mcp_access_token` and `mcp_refresh_token` pairs with a `Cache-Control: no-store` header. Supports `grant_type=refresh_token` flow with atomic token rotation and proactive Grafana session liveness checks.
+
+> **Note**: Legacy binary entrypoints `cmd/grafana-mcp-wrapper` (proxy mode) and `cmd/mcp-auth-helper` (extauthz mode) are maintained with deprecation notices for backward compatibility. Use `grafana-mcp-oauth --mode=proxy` or `--mode=extauthz` instead.
 
 ### 2.2. Zero-Knowledge Cryptographic Storage & Distributed State in Redis
 * **Distributed State**: All pending login states (`mcp:pending_auth:`) and authorization codes (`mcp:auth_code:`) are distributed in Redis with automatic TTLs, fully supporting horizontal scaling (Horizontal Pod Autoscaling / Multi-replica).
@@ -69,11 +81,23 @@ GRAFANA_FORWARD_HEADERS=Cookie
 
 ---
 
-## 3. Deployment Guide
+## 3. Deployment & Build Guide
 
-### Running with Docker Compose
+### 3.1. Building the Unified Image (Distroless & Multi-Arch)
 
-The `deploy/docker-compose.yml` directory contains a complete, production-hardened configuration template (only exposing Envoy Ingress port `8080` externally, while internal services remain isolated in the container network):
+```bash
+# Build local image
+make docker-build
+# or: docker build --network=host -t grafana-mcp-oauth:latest .
+
+# Build multi-architecture image (AMD64 + ARM64)
+make docker-build-multiarch
+# or: docker buildx build --network=host --platform linux/amd64,linux/arm64 -t grafana-mcp-oauth:latest .
+```
+
+### 3.2. Running Architecture A: Envoy Gateway (`MODE=extauthz`)
+
+In this architecture, Envoy handles edge routing, Grafana web traffic bypasses auth, and MCP calls are protected via Envoy gRPC `ext_authz`:
 
 ```bash
 cd deploy
@@ -83,6 +107,18 @@ docker compose up -d
 Service Ports:
 * **`:8080`**: Unified Envoy Gateway Ingress port (serving both Grafana Web and MCP).
 * **`127.0.0.1:9901`**: Envoy Admin (listening strictly on localhost/loopback).
+
+### 3.3. Running Architecture B: Direct Sidecar Proxy (`MODE=proxy`)
+
+In this architecture, `grafana-mcp-oauth` runs as a lightweight direct reverse proxy sidecar fronting stock `mcp-grafana` without requiring Envoy:
+
+```bash
+cd deploy
+docker compose -f docker-compose.sidecar.yml up -d
+```
+
+Service Ports:
+* **`:8080`**: Front-door Proxy port for Coding Agents.
 
 ---
 

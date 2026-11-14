@@ -14,9 +14,11 @@ import (
 
 // AppConfig contains runtime settings loaded from environment variables.
 type AppConfig struct {
+	Mode             string
 	BaseURL          string
 	HTTPPort         string
 	GRPCPort         string
+	TargetMCPURL     string
 	GrafanaURL       string
 	GrafanaPublicURL string
 	CallbackBaseURL  string
@@ -31,9 +33,22 @@ type AppConfig struct {
 
 // LoadFromEnv loads configuration from environment variables with safe defaults.
 func LoadFromEnv() *AppConfig {
+	mode := strings.ToLower(strings.TrimSpace(getEnv("MODE", getEnv("GATEWAY_MODE", "proxy"))))
+	if mode == "" {
+		mode = "proxy"
+	}
+
 	baseURL := strings.TrimRight(getEnv("BASE_URL", "http://localhost:8080"), "/")
-	httpPort := getEnv("HTTP_PORT", "8081")
+
+	// Default HTTP port depends on mode: 8081 for extauthz, 8080 for proxy/all
+	defaultHTTPPort := "8080"
+	if mode == "extauthz" {
+		defaultHTTPPort = "8081"
+	}
+	httpPort := getEnv("PORT", getEnv("HTTP_PORT", defaultHTTPPort))
+
 	grpcPort := getEnv("GRPC_PORT", "9001")
+	targetMCPURL := getEnv("TARGET_MCP_URL", "http://127.0.0.1:8000")
 	grafanaURL := getEnv("GRAFANA_URL", "http://grafana:3000")
 	grafanaPublicURL := strings.TrimRight(getEnv("GRAFANA_PUBLIC_URL", baseURL), "/")
 	callbackBaseURL := getEnv("CALLBACK_BASE_URL", baseURL+"/mcp/auth/callback")
@@ -75,19 +90,21 @@ func LoadFromEnv() *AppConfig {
 	}
 
 	logLevel := slog.LevelInfo
-	switch os.Getenv("LOG_LEVEL") {
-	case "debug", "DEBUG":
+	switch strings.ToLower(os.Getenv("LOG_LEVEL")) {
+	case "debug":
 		logLevel = slog.LevelDebug
-	case "warn", "WARN":
+	case "warn":
 		logLevel = slog.LevelWarn
-	case "error", "ERROR":
+	case "error":
 		logLevel = slog.LevelError
 	}
 
 	return &AppConfig{
+		Mode:             mode,
 		BaseURL:          baseURL,
 		HTTPPort:         httpPort,
 		GRPCPort:         grpcPort,
+		TargetMCPURL:     targetMCPURL,
 		GrafanaURL:       grafanaURL,
 		GrafanaPublicURL: grafanaPublicURL,
 		CallbackBaseURL:  callbackBaseURL,

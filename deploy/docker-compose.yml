@@ -18,6 +18,7 @@ services:
       - mcp-network
 
   mcp-auth-helper:
+    image: grafana-mcp-oauth:latest
     build:
       context: ..
       dockerfile: Dockerfile
@@ -25,6 +26,7 @@ services:
     restart: unless-stopped
     # Ports internal to docker network; exposed via Envoy Gateway
     environment:
+      - MODE=extauthz
       - BASE_URL=http://localhost:8080
       - HTTP_PORT=8081
       - GRPC_PORT=9001

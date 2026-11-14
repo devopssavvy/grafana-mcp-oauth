@@ -152,16 +152,45 @@ The system establishes multi-layered session security to ensure end-to-end prote
 
 ---
 
-## 5. Project File Layout
+## 5. Unified Runtime & Operating Modes
+
+The gateway is built as a single, multi-architecture static binary (`grafana-mcp-oauth`) packaged into a minimal Distroless runtime (`gcr.io/distroless/static-debian12:nonroot`). It supports three distinct modes:
+
+1. **`proxy` Mode (`--mode=proxy`, default)**:
+   - Starts an authenticated reverse proxy directly fronting stock `mcp-grafana` (`TARGET_MCP_URL`).
+   - Serves OAuth 2.1 RFC 9728 discovery and PKCE endpoints on HTTP (`PORT`, default `8080`).
+   - Validates incoming `Authorization: Bearer <token>`, decrypts user's `grafana_session` cookie via Zero-Knowledge session store, injects `Cookie: grafana_session=...`, strips `Authorization`, and proxies to upstream MCP.
+   - Ideal for Kubernetes sidecar containers or standalone lightweight deployments without Envoy.
+
+2. **`extauthz` Mode (`--mode=extauthz`)**:
+   - Starts the Envoy gRPC external authorization server (`GRPC_PORT`, default `9001`) and HTTP check endpoint (`HTTP_PORT`, default `8081`).
+   - Serves OAuth 2.1 discovery and PKCE endpoints.
+   - Ideal for centralized deployments behind Envoy Gateway, Traefik, or Ingress controllers.
+
+3. **`all` Mode (`--mode=all`)**:
+   - Enables both `proxy` and `extauthz` services concurrently in the same process.
+   - Ideal for unified deployments, multi-tenant gateways, or local development environments.
+
+---
+
+## 6. Project File Layout
 
 ```
 .
 ├── cmd
+│   ├── grafana-mcp-oauth
+│   │   └── main.go                 # Unified Gateway entrypoint (proxy, extauthz, all modes)
+│   ├── grafana-mcp-wrapper
+│   │   └── main.go                 # Legacy wrapper alias (deprecated, forwards to ModeProxy)
 │   └── mcp-auth-helper
-│       └── main.go                 # Go entrypoint: HTTP OAuth + Envoy gRPC ext_authz Server
+│       └── main.go                 # Legacy helper alias (deprecated, forwards to ModeExtAuthz)
 ├── pkg
 │   ├── config
-│   │   └── config.go               # Configuration loader from environment variables
+│   │   ├── config.go               # Configuration loader supporting MODE and port overrides
+│   │   └── config_test.go          # Config unit tests
+│   ├── server
+│   │   ├── server.go               # Unified Server managing HTTP Mux, gRPC, and Proxy
+│   │   └── server_test.go          # Unit tests verifying proxy, extauthz, and all modes
 │   ├── crypto
 │   │   ├── crypto.go               # HMAC-SHA3-512, HKDF, Argon2id, XChaCha20-Poly1305
 │   │   └── crypto_test.go          # Unit tests for encryption, hashing, and tamper resistance
@@ -171,18 +200,24 @@ The system establishes multi-layered session security to ensure end-to-end prote
 │   ├── oauth
 │   │   ├── handler.go              # OAuth SSO login, callback, session harvesting, token refresh
 │   │   └── handler_test.go         # Unit tests for OAuth flow and auto-refresh
+│   ├── proxy
+│   │   ├── proxy.go                # Authenticated HTTP reverse proxy to stock mcp-grafana
+│   │   └── proxy_test.go           # Reverse proxy tests
 │   └── store
 │       ├── store.go                # Redis Session Store interface and Zero-Knowledge encryption
 │       └── store_test.go           # Miniredis unit tests validating security at storage layer
 ├── deploy
-│   ├── docker-compose.yml          # Example compose environment: Envoy + mcp-auth-helper + Redis + mcp-grafana
-│   ├── envoy
-│   │   ├── envoy.yaml              # Envoy Proxy configuration with routing and ext_authz filter
-│   │   └── gateway-api.yaml        # Kubernetes Gateway API manifests (Envoy Gateway)
+│   ├── docker-compose.yml          # Mode extauthz: Envoy Gateway + grafana-mcp-oauth + Redis + Grafana
+│   ├── docker-compose.sidecar.yml  # Mode proxy: Direct Sidecar Proxy + Redis + mcp-grafana
+│   ├── k8s-sidecar.yaml            # Kubernetes sidecar pod deployment template
+│   └── envoy
+│       ├── envoy.yaml              # Envoy Proxy configuration with routing and ext_authz filter
+│       └── gateway-api.yaml        # Kubernetes Gateway API manifests (Envoy Gateway)
 ├── test
-│   └── e2e_test.go                 # Comprehensive End-to-End integration test suite
-├── Dockerfile                      # Multi-stage Dockerfile for mcp-auth-helper
-├── Makefile                        # Build and test automation
+│   ├── e2e_test.go                 # Comprehensive End-to-End integration test suite (both architectures)
+│   └── real_agent_flow.py          # Python simulation of coding agent PKCE loopback handshake
+├── Dockerfile                      # Single multi-arch (amd64/arm64) Distroless Dockerfile
+├── Makefile                        # Multi-arch build and test automation
 ├── ARCHITECTURE.md                 # Detailed architecture specification (this document)
 └── README.md                       # Overview and quick-start deployment guide
 ```

@@ -1,11 +1,13 @@
 package test_test
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -20,8 +22,10 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 
+	"grafana-mcp-oauth/pkg/config"
 	"grafana-mcp-oauth/pkg/extauthz"
 	"grafana-mcp-oauth/pkg/oauth"
+	"grafana-mcp-oauth/pkg/server"
 	"grafana-mcp-oauth/pkg/store"
 )
 
@@ -371,4 +375,193 @@ func TestE2E_FullSystemIntegration(t *testing.T) {
 		// Verify Grafana Server received the user's grafana_session cookie
 		assert.Equal(t, "valid_user_grafana_session_456", grafanaReceivedCookie)
 	})
+}
+
+// TestE2E_UnifiedProxyServer verifies the unified server in ModeProxy and ModeAll end-to-end.
+func TestE2E_UnifiedProxyServer(t *testing.T) {
+	// 1. Mock Grafana Server
+	mockGrafana := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/login/generic_oauth":
+			w.WriteHeader(http.StatusOK)
+		case "/api/user":
+			cookie, _ := r.Cookie("grafana_session")
+			if cookie == nil || cookie.Value != "session_alice_999" {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(oauth.GrafanaUser{
+				ID:    202,
+				Email: "alice@company.com",
+				Name:  "Alice",
+				Login: "alice",
+				OrgID: 1,
+			})
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer mockGrafana.Close()
+
+	// 2. Mock Upstream Stock MCP Server
+	var receivedUpstreamCookie string
+	mockMCP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cookie, _ := r.Cookie("grafana_session")
+		if cookie != nil {
+			receivedUpstreamCookie = cookie.Value
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"result":{"tools":[{"name":"list_dashboards"}]}}`))
+	}))
+	defer mockMCP.Close()
+
+	// 3. Miniredis
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	defer mr.Close()
+
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer rdb.Close()
+
+	// 4. Start Unified Server in ModeProxy
+	cfg := &config.AppConfig{
+		Mode:             server.ModeProxy,
+		HTTPPort:         "0",
+		BaseURL:          "http://127.0.0.1",
+		GrafanaURL:       mockGrafana.URL,
+		GrafanaPublicURL: mockGrafana.URL,
+		TargetMCPURL:     mockMCP.URL,
+		MasterSecret:     []byte("test-32-byte-master-secret-key!"),
+		SessionTTL:       time.Hour,
+		RefreshTTL:       time.Hour * 24,
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	gatewayURL := "http://" + ln.Addr().String()
+	cfg.BaseURL = gatewayURL
+	cfg.CallbackBaseURL = gatewayURL + "/mcp/auth/callback"
+
+	srv, err := server.New(server.Options{
+		Config:       cfg,
+		HTTPListener: ln,
+		RedisClient:  rdb,
+	})
+	require.NoError(t, err)
+
+	errChan, err := srv.Start()
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}()
+
+	client := &http.Client{
+		Transport: &http.Transport{DisableKeepAlives: true},
+		Timeout:   5 * time.Second,
+	}
+
+	// 5. Test unauthenticated request to /mcp/tools
+	unauthReq, _ := http.NewRequest(http.MethodGet, gatewayURL+"/mcp/tools", nil)
+	unauthResp, err := client.Do(unauthReq)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusUnauthorized, unauthResp.StatusCode)
+	assert.Contains(t, unauthResp.Header.Get("WWW-Authenticate"), "resource_metadata")
+	_ = unauthResp.Body.Close()
+
+	// 6. Test PKCE authorization flow
+	codeVerifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+	sha := sha256.Sum256([]byte(codeVerifier))
+	codeChallenge := base64.RawURLEncoding.EncodeToString(sha[:])
+
+	var localReceivedCode string
+	localAgent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		localReceivedCode = r.URL.Query().Get("code")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer localAgent.Close()
+
+	// Initiate login
+	loginURL := fmt.Sprintf("%s/mcp/auth/login?client_id=agent&redirect_uri=%s&code_challenge=%s&code_challenge_method=S256&state=random123",
+		gatewayURL, url.QueryEscape(localAgent.URL), codeChallenge)
+
+	noFollowClient := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Transport: &http.Transport{DisableKeepAlives: true},
+	}
+
+	loginResp, err := noFollowClient.Get(loginURL)
+	require.NoError(t, err)
+	defer loginResp.Body.Close()
+	assert.Equal(t, http.StatusFound, loginResp.StatusCode)
+
+	// Simulate user completing Grafana login and callback
+	var stateCookie *http.Cookie
+	for _, c := range loginResp.Cookies() {
+		if c.Name == "mcp_auth_state" {
+			stateCookie = c
+			break
+		}
+	}
+	require.NotNil(t, stateCookie)
+
+	callbackURL := fmt.Sprintf("%s/mcp/auth/callback?mcp_state=%s", gatewayURL, stateCookie.Value)
+	cbReq, err := http.NewRequest(http.MethodGet, callbackURL, nil)
+	require.NoError(t, err)
+	cbReq.AddCookie(stateCookie)
+	cbReq.AddCookie(&http.Cookie{
+		Name:  "grafana_session",
+		Value: "session_alice_999",
+	})
+
+	cbResp, err := client.Do(cbReq)
+	require.NoError(t, err)
+	defer cbResp.Body.Close()
+
+	require.NotEmpty(t, localReceivedCode)
+
+	// Exchange code for token
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("code", localReceivedCode)
+	form.Set("code_verifier", codeVerifier)
+	form.Set("redirect_uri", localAgent.URL)
+
+	tokenReq, err := http.NewRequest(http.MethodPost, gatewayURL+"/mcp/auth/token", strings.NewReader(form.Encode()))
+	require.NoError(t, err)
+	tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	tokenResp, err := client.Do(tokenReq)
+	require.NoError(t, err)
+	defer tokenResp.Body.Close()
+
+	var tokens oauth.TokenResponse
+	err = json.NewDecoder(tokenResp.Body).Decode(&tokens)
+	require.NoError(t, err)
+	require.NotEmpty(t, tokens.AccessToken)
+
+	// Call MCP tool through proxy
+	toolReq, err := http.NewRequest(http.MethodGet, gatewayURL+"/mcp/tools", nil)
+	require.NoError(t, err)
+	toolReq.Header.Set("Authorization", "Bearer "+tokens.AccessToken)
+
+	toolResp, err := client.Do(toolReq)
+	require.NoError(t, err)
+	defer toolResp.Body.Close()
+
+	assert.Equal(t, http.StatusOK, toolResp.StatusCode)
+	body, _ := io.ReadAll(toolResp.Body)
+	assert.Contains(t, string(body), "list_dashboards")
+	assert.Equal(t, "session_alice_999", receivedUpstreamCookie)
+
+	select {
+	case srvErr := <-errChan:
+		t.Fatalf("Unexpected server error: %v", srvErr)
+	default:
+	}
 }
