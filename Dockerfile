@@ -17,18 +17,12 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
     go build -ldflags="-w -s" -o /app/grafana-mcp-oauth ./cmd/grafana-mcp-oauth
 
-# Create backward-compatible symlinks for legacy container commands
-RUN ln -s /app/grafana-mcp-oauth /app/mcp-auth-helper && \
-    ln -s /app/grafana-mcp-oauth /app/grafana-mcp-wrapper
-
 # Production stage: minimal Distroless static runtime
 FROM gcr.io/distroless/static-debian12:nonroot
 
 WORKDIR /app
 
 COPY --from=builder /app/grafana-mcp-oauth /app/grafana-mcp-oauth
-COPY --from=builder /app/mcp-auth-helper /app/mcp-auth-helper
-COPY --from=builder /app/grafana-mcp-wrapper /app/grafana-mcp-wrapper
 
 # Standard exposed ports:
 # 8080: HTTP Gateway (proxy & all mode default)

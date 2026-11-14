@@ -26,7 +26,7 @@ In Grafana Server:
 
 ---
 
-## 2. Architecture Solution: Envoy Gateway + `mcp-auth-helper`
+## 2. Architecture Solution: Envoy Gateway + `grafana-mcp-oauth`
 
 The solution adopts a layered architecture:
 
@@ -50,7 +50,7 @@ The solution adopts a layered architecture:
            |                                     |                           |
            |                                     v                           v
            |                        +-----------------------+   +------------------------+
-           |                        |    mcp-auth-helper    |   | gRPC Check()           |
+           |                        |   grafana-mcp-oauth   |   | gRPC Check()           |
            |                        |   - /mcp/auth/login   |<--| - Validates Token      |
            |                        |   - /mcp/auth/callback|   | - Injects Cookie       |
            |                        |   - /mcp/auth/token   |   | - Strips Authorization |
@@ -96,7 +96,7 @@ sequenceDiagram
     autonumber
     actor Dev as Developer / Coding Agent
     participant Envoy as Envoy Gateway (:8080)
-    participant Helper as mcp-auth-helper (:8081 / :9001)
+    participant Gateway as grafana-mcp-oauth (:8081 / :9001)
     participant Redis as Redis (Zero-Knowledge Store)
     participant Grafana as Grafana Server (:3000)
     participant MCP as Upstream mcp-grafana (:8000)
@@ -104,24 +104,24 @@ sequenceDiagram
 
     Note over Dev,Grafana: Phase 1: User Login & Session Harvesting
     Dev->>Envoy: 1. Access /mcp/auth/login?redirect_uri=...
-    Envoy->>Helper: 2. Proxy to mcp-auth-helper
-    Helper-->>Dev: 3. HTTP 302 Redirect to /login/generic_oauth?redirect=/mcp/auth/callback
+    Envoy->>Gateway: 2. Proxy to grafana-mcp-oauth
+    Gateway-->>Dev: 3. HTTP 302 Redirect to /login/generic_oauth?redirect=/mcp/auth/callback
     Dev->>Grafana: 4. Open Grafana SSO login page (IdP authentication)
     Grafana->>Grafana: 5. Exchange OAuth code with IdP -> store tokens in user_auth -> issue grafana_session
     Grafana-->>Dev: 6. Set-Cookie: grafana_session=... and 302 Redirect to /mcp/auth/callback
     Dev->>Envoy: 7. Send /mcp/auth/callback request with grafana_session Cookie
-    Envoy->>Helper: 8. Proxy callback to mcp-auth-helper
-    Helper->>Grafana: 9. GET /api/user (verify session & fetch user profile)
-    Grafana-->>Helper: 10. User profile (ID, username, email)
-    Helper->>Helper: 11. Generate MCP Access Token & Refresh Token
-    Helper->>Redis: 12. Encrypt session (XChaCha20-Poly1305) & store under HMAC-SHA3-512 Key
-    Helper-->>Dev: 13. Redirect to Coding Agent with mcp_access_token & mcp_refresh_token
+    Envoy->>Gateway: 8. Proxy callback to grafana-mcp-oauth
+    Gateway->>Grafana: 9. GET /api/user (verify session & fetch user profile)
+    Grafana-->>Gateway: 10. User profile (ID, username, email)
+    Gateway->>Gateway: 11. Generate MCP Access Token & Refresh Token
+    Gateway->>Redis: 12. Encrypt session (XChaCha20-Poly1305) & store under HMAC-SHA3-512 Key
+    Gateway-->>Dev: 13. Redirect to Coding Agent with mcp_access_token & mcp_refresh_token
 
     Note over Dev,DS: Phase 2: Coding Agent MCP Tool Execution
     Dev->>Envoy: 14. Call MCP Tool (POST /mcp/query, Header: "Authorization: Bearer mcp_at_...")
-    Envoy->>Helper: 15. gRPC ext_authz Check()
-    Helper->>Redis: 16. Lookup HMAC-SHA3-512(mcp_token) Key & Decrypt payload
-    Helper-->>Envoy: 17. CheckResponse OK + Mutate Header:<br/>- Add: "Cookie: grafana_session=..."<br/>- Remove: "Authorization"
+    Envoy->>Gateway: 15. gRPC ext_authz Check()
+    Gateway->>Redis: 16. Lookup HMAC-SHA3-512(mcp_token) Key & Decrypt payload
+    Gateway-->>Envoy: 17. CheckResponse OK + Mutate Header:<br/>- Add: "Cookie: grafana_session=..."<br/>- Remove: "Authorization"
     Envoy->>MCP: 18. Forward request to mcp-grafana (carrying user's Cookie)
     MCP->>Grafana: 19. Call Grafana API with grafana_session Cookie
     Grafana->>Grafana: 20. Lookup user's OAuth token from user_auth table
@@ -178,12 +178,10 @@ The gateway is built as a single, multi-architecture static binary (`grafana-mcp
 ```
 .
 ├── cmd
-│   ├── grafana-mcp-oauth
-│   │   └── main.go                 # Unified Gateway entrypoint (proxy, extauthz, all modes)
-│   ├── grafana-mcp-wrapper
-│   │   └── main.go                 # Legacy wrapper alias (deprecated, forwards to ModeProxy)
-│   └── mcp-auth-helper
-│       └── main.go                 # Legacy helper alias (deprecated, forwards to ModeExtAuthz)
+│   ├── demo-runner
+│   │   └── main.go                 # Local demo simulation runner
+│   └── grafana-mcp-oauth
+│       └── main.go                 # Unified Gateway entrypoint (proxy, extauthz, all modes)
 ├── pkg
 │   ├── config
 │   │   ├── config.go               # Configuration loader supporting MODE and port overrides
