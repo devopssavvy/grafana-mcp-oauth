@@ -1,5 +1,7 @@
 # Grafana MCP OAuth & Centralized Remote Gateway
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/devopssavvy/grafana-mcp-oauth)
+
 Centralized security and authentication layer for **Grafana Model Context Protocol (MCP) Server** combining **Envoy Gateway** and a **Zero-Knowledge Session Store**, enabling Coding Agents (such as Cursor, Claude Desktop, Antigravity) to connect remotely and fully automatically via **MCP Dynamic OAuth Discovery (RFC 9728 & RFC 8414)** while preserving Grafana's **Datasource OAuth Passthru** mechanism.
 
 > **Zero-Manual-Input Experience**: The user **only needs to enter the MCP Server URL** into the coding agent. The client and browser automatically perform the OAuth 2.1 PKCE handshake to grant authorization without requiring manual copying or pasting of any tokens!
