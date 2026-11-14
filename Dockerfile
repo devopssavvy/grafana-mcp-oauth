@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1
 
 # Build stage: supports multi-arch cross-compilation via Docker Buildx
-FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS builder
+# Pinned to immutable cryptographic digest for supply chain integrity
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine@sha256:eb61c3873c97416fff0116553fff65d67a3549f72e11d9758849a689cdd8b523 AS builder
 
 ARG TARGETOS
 ARG TARGETARCH
@@ -18,7 +19,8 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
     go build -ldflags="-w -s" -o /app/grafana-mcp-oauth ./cmd/grafana-mcp-oauth
 
 # Production stage: minimal Distroless static runtime
-FROM gcr.io/distroless/static-debian12:nonroot
+# Pinned to immutable cryptographic digest for zero-vulnerability static base
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 
 WORKDIR /app
 
