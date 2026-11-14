@@ -88,19 +88,33 @@ func New(opts Options) (*Server, error) {
 	}
 
 	// 1. Initialize Redis Client
+	tlsConfig, err := BuildRedisTLSConfig(cfg, logger)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize Redis TLS configuration: %w", err)
+	}
+
 	rdb := opts.RedisClient
 	if rdb == nil {
 		rdb = redis.NewClient(&redis.Options{
-			Addr:     cfg.RedisAddr,
-			Password: cfg.RedisPassword,
-			DB:       cfg.RedisDB,
+			Addr:      cfg.RedisAddr,
+			Password:  cfg.RedisPassword,
+			DB:        cfg.RedisDB,
+			TLSConfig: tlsConfig,
 		})
 
 		ctxPing, cancelPing := context.WithTimeout(context.Background(), 5*time.Second)
 		if err := rdb.Ping(ctxPing).Err(); err != nil {
 			logger.Warn("Could not connect to Redis at startup; will retry on operations", "error", err)
 		} else {
-			logger.Info("Successfully connected to Redis", "addr", cfg.RedisAddr)
+			tlsMode := "disabled"
+			if tlsConfig != nil {
+				if tlsConfig.GetClientCertificate != nil {
+					tlsMode = "mTLS (dynamic auto-reload)"
+				} else {
+					tlsMode = "TLS (one-way)"
+				}
+			}
+			logger.Info("Successfully connected to Redis", "addr", cfg.RedisAddr, "tls", tlsMode)
 		}
 		cancelPing()
 	}

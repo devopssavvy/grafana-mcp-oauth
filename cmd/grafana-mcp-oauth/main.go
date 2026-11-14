@@ -51,6 +51,12 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  GRAFANA_URL          Internal Grafana URL (e.g. http://grafana:3000)\n")
 		fmt.Fprintf(os.Stderr, "  TARGET_MCP_URL       Upstream stock MCP URL (default http://127.0.0.1:8000)\n")
 		fmt.Fprintf(os.Stderr, "  REDIS_ADDR           Redis address (default localhost:6379)\n")
+		fmt.Fprintf(os.Stderr, "  REDIS_TLS_ENABLED    Enable Redis TLS encryption (default false)\n")
+		fmt.Fprintf(os.Stderr, "  REDIS_CA_PATH        Path to custom CA certificate PEM bundle\n")
+		fmt.Fprintf(os.Stderr, "  REDIS_CERT_PATH      Path to client certificate PEM for mTLS\n")
+		fmt.Fprintf(os.Stderr, "  REDIS_KEY_PATH       Path to client private key PEM for mTLS\n")
+		fmt.Fprintf(os.Stderr, "  REDIS_TLS_SERVER_NAME Override Server Name Indication (SNI)\n")
+		fmt.Fprintf(os.Stderr, "  REDIS_TLS_INSECURE_SKIP_VERIFY Skip Redis server cert verification (dev only)\n")
 		fmt.Fprintf(os.Stderr, "  MCP_MASTER_SECRET    32-byte encryption key for zero-knowledge session store\n")
 	}
 
@@ -110,8 +116,14 @@ func main() {
 		"base_url", cfg.BaseURL,
 		"grafana_url", cfg.GrafanaURL,
 		"redis_addr", cfg.RedisAddr,
+		"redis_tls_enabled", cfg.RedisTLSEnabled,
+		"redis_mtls_enabled", (cfg.RedisCertPath != "" && cfg.RedisKeyPath != ""),
 		"master_secret_fingerprint", cfg.MasterSecretFingerprint(),
 	)
+
+	if cfg.RedisTLSInsecureSkipVerify {
+		logger.Warn("CRITICAL SECURITY WARNING: REDIS_TLS_INSECURE_SKIP_VERIFY is enabled! Redis server certificate verification is disabled.")
+	}
 
 	// Create and start unified server
 	srv, err := server.New(server.Options{

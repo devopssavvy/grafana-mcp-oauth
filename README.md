@@ -126,7 +126,21 @@ Key capabilities:
 * **Key Derivation (KDF)**: A 256-bit encryption key is independently derived per session directly from the client token via **HKDF-SHA3-512** for sub-0.1ms performance.
 * *Zero-Knowledge Guarantee: No one (including database administrators or attackers with full Redis dumps) can inspect the `grafana_session` or user identity without the raw bearer token possessed only by the client.*
 
-### 2.3. Upstream `grafana/mcp-grafana` (Zero-Fork)
+### 2.3. Redis TLS & Dynamic Mutual TLS (mTLS)
+In enterprise environments and secure cloud infrastructures (e.g. AWS ElastiCache, Redis Enterprise, Upstash, or internal Kubernetes service meshes), Redis connections can be encrypted in-transit via TLS or authenticated via mutual TLS (mTLS):
+
+| Environment Variable | Type | Default | Description |
+| :--- | :---: | :---: | :--- |
+| **`REDIS_TLS_ENABLED`** | bool | `false` | Enables TLS transport encryption (MinVersion: TLS 1.2). Auto-enabled if cert paths or SNI are provided. |
+| **`REDIS_CA_PATH`** | string | `""` | Path to custom CA PEM bundle. If unset and TLS is enabled, system root CAs are used. |
+| **`REDIS_CERT_PATH`** | string | `""` | Path to client certificate PEM for mTLS client authentication. |
+| **`REDIS_KEY_PATH`** | string | `""` | Path to client private key PEM for mTLS client authentication. |
+| **`REDIS_TLS_SERVER_NAME`** | string | `""` | Optional Server Name Indication (SNI) override. |
+| **`REDIS_TLS_INSECURE_SKIP_VERIFY`** | bool | `false` | Disables server certificate verification (for local development or testing). |
+
+* **Zero-Downtime Dynamic Auto-Reload**: The client certificate and key are managed by a thread-safe `GetClientCertificate` reloader that checks file modification timestamps (`os.Stat`) on TLS handshakes. When certificates are rotated on disk (e.g., via cert-manager or Kubernetes Secret/ConfigMap projected volume updates), new connections automatically adopt the updated certificate without requiring a gateway restart. If a file is temporarily malformed during rotation, the gateway safely retains the existing active certificate.
+
+### 2.4. Upstream `grafana/mcp-grafana` (Zero-Fork)
 Uses the official 100% stock Grafana Labs container image (`grafana/mcp-grafana:latest`). Leverages built-in capabilities in `mcp-grafana`'s Go codebase:
 ```bash
 GRAFANA_URL=http://grafana:3000
