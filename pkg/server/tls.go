@@ -195,6 +195,7 @@ func BuildRedisTLSConfig(cfg *config.AppConfig, logger *slog.Logger) (*tls.Confi
 	// 4. Insecure Skip Verify (for local dev / testing)
 	if cfg.RedisTLSInsecureSkipVerify {
 		logger.Warn("CRITICAL SECURITY WARNING: REDIS_TLS_INSECURE_SKIP_VERIFY is enabled! Redis server certificate verification is disabled. Do NOT use this in production.")
+		// #nosec G402 -- Configurable opt-in for development and test environments
 		tlsConfig.InsecureSkipVerify = true
 	}
 
