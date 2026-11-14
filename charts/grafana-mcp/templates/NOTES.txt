@@ -1,0 +1,48 @@
+{{- $fullName := include "grafana-mcp.fullname" . -}}
+{{- $svcPort := .Values.service.port -}}
+========================================================================
+Grafana MCP Server with OAuth 2.1 Sidecar Proxy is deployed!
+========================================================================
+
+1. Accessing the MCP OAuth Proxy:
+
+{{- if .Values.ingress.enabled }}
+{{- range .Values.ingress.hosts }}
+  The Grafana MCP endpoint is available at:
+    {{ if $.Values.ingress.tls }}https://{{ else }}http://{{ end }}{{ .host }}/mcp
+
+  OAuth Discovery:
+    {{ if $.Values.ingress.tls }}https://{{ else }}http://{{ end }}{{ .host }}/.well-known/oauth-authorization-server
+{{- end }}
+{{- else if contains "NodePort" .Values.service.type }}
+  Export the Node IP and NodePort:
+    export NODE_PORT=$(kubectl get --namespace {{ include "grafana-mcp.namespace" . }} -o jsonpath="{.spec.ports[0].nodePort}" services {{ $fullName }})
+    export NODE_IP=$(kubectl get nodes --namespace {{ include "grafana-mcp.namespace" . }} -o jsonpath="{.items[0].status.addresses[0].address}")
+    echo "MCP URL: http://$NODE_IP:$NODE_PORT/mcp"
+{{- else if contains "LoadBalancer" .Values.service.type }}
+  Wait for the external IP:
+    kubectl get svc --namespace {{ include "grafana-mcp.namespace" . }} {{ $fullName }} -w
+{{- else if contains "ClusterIP" .Values.service.type }}
+  Forward port to localhost:
+    kubectl port-forward --namespace {{ include "grafana-mcp.namespace" . }} svc/{{ $fullName }} 8080:{{ $svcPort }}
+    echo "MCP URL: http://localhost:8080/mcp"
+{{- end }}
+
+2. Zero-Manual-Input Client Setup:
+   Enter the MCP URL into your coding agent (Cursor, Claude Desktop, Antigravity).
+   The client will automatically perform RFC 9728 discovery and OAuth 2.1 PKCE login
+   with Grafana, securely passing through your user permissions to data sources.
+
+3. Session Store:
+{{- if .Values.valkey.enabled }}
+   - Valkey is enabled in-cluster (zero Bitnami, Linux Foundation chart).
+   - TLS in transit: {{ if .Values.redis.tls.enabled }}ENABLED{{ else }}DISABLED{{ end }}
+   - Authentication: ENABLED
+   - NetworkPolicy: {{ if .Values.networkPolicy.enabled }}RESTRICTED (pods only){{ else }}DISABLED{{ end }}
+{{- else }}
+   - External Redis/Valkey configured at: {{ .Values.redis.addr }}
+{{- end }}
+
+4. Zero-Knowledge Encryption Mode:
+   Running in RFC 5869 Client-Derived Key mode with zero-config multi-pod sync.
+========================================================================

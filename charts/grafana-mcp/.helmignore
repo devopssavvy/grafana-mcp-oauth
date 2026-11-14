@@ -1,0 +1,12 @@
+# Patterns to ignore when packaging a Helm chart.
+.git/
+.gitignore
+.gitattributes
+.helmignore
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.bak
+*~
+ci/

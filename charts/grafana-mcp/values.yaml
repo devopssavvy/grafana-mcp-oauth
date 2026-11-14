@@ -1,0 +1,303 @@
+# Default values for grafana-mcp.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+# -- Override the chart name
+nameOverride: ""
+
+# -- Override the full name of the resources
+fullnameOverride: ""
+
+# -- Override the namespace of the resources (defaults to the release namespace)
+namespaceOverride: ""
+
+# -- Extra labels added to all resources
+extraLabels: {}
+
+# -- Number of replicas for the MCP server. Ignored when `hpa.enabled` is true.
+replicas: 1
+
+# -- Number of old ReplicaSets to retain for rollbacks
+revisionHistoryLimit: 10
+
+# -- Deployment strategy
+deploymentStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 25%
+    maxUnavailable: 25%
+
+# -- Cluster domain name for internal DNS lookups
+clusterDomain: cluster.local
+
+# ==============================================================================
+# Front Container: Go OAuth 2.1 & RFC 9728 Discovery Proxy (grafana-mcp-oauth)
+# ==============================================================================
+image:
+  # -- OAuth Proxy container image repository
+  repository: ghcr.io/devopssavvy/grafana-mcp-oauth
+  # -- OAuth Proxy image tag (defaults to .Chart.AppVersion)
+  tag: ""
+  # -- OAuth Proxy image pull policy
+  pullPolicy: IfNotPresent
+
+# -- Image pull secrets for private registries
+imagePullSecrets: []
+
+# -- OAuth Proxy specific configuration
+oauthProxy:
+  # -- Public Base URL for the MCP server (e.g. "https://mcp.company.com").
+  # Used in RFC 9728 OAuth discovery documents.
+  baseUrl: ""
+
+  # -- Public URL for Grafana login (defaults to grafana.url if empty)
+  grafanaPublicUrl: ""
+
+  # -- Master encryption secret (minimum 16 bytes).
+  # If left empty, runs in Zero-Knowledge Client-Derived Key mode (RFC 5869),
+  # requiring zero configuration and maintaining multi-pod synchronization.
+  masterSecret: ""
+
+  # -- Existing secret containing master secret
+  masterSecretSecret:
+    name: ""
+    key: "master-secret"
+
+  # -- Additional environment variables for the proxy container
+  extraEnv: []
+
+# ==============================================================================
+# Internal Container: Stock Upstream Grafana MCP Server (grafana/mcp-grafana)
+# ==============================================================================
+mcpGrafana:
+  image:
+    # -- Stock Grafana MCP container image repository
+    repository: grafana/mcp-grafana
+    # -- Stock Grafana MCP image tag (use specific stable release tag, e.g. "2.3.0")
+    tag: "2.3.0"
+    # -- Image pull policy
+    pullPolicy: IfNotPresent
+
+  # -- Disable write operations to Grafana
+  disableWrite: false
+
+  # -- Categories to disable in mcp-grafana (e.g. oncall, incident, sift)
+  disabledCategories: []
+
+  # -- Additional CLI arguments for mcp-grafana
+  extraArgs: []
+
+  # -- Environment variables for mcp-grafana
+  env: []
+
+  # -- Resource limits and requests for mcp-grafana container
+  resources:
+    limits:
+      cpu: 500m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+  # -- Container security context for mcp-grafana
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 999
+    capabilities:
+      drop:
+        - ALL
+
+  # -- Extra volume mounts for mcp-grafana
+  volumeMounts: []
+
+# ==============================================================================
+# Grafana Server Connection Configuration
+# ==============================================================================
+grafana:
+  # -- Internal Grafana URL reachable by the pod
+  url: "http://grafana:3000"
+
+  # -- Optional static Grafana API key / Service Account Token (if not using secret)
+  apiKey: ""
+
+  # -- Secret containing the Grafana API key
+  apiKeySecret:
+    name: ""
+    key: ""
+
+# ==============================================================================
+# Session Store Configuration (Valkey / Redis)
+# ==============================================================================
+redis:
+  # -- External Redis/Valkey address (e.g. "redis.prod:6379").
+  # Automatically inferred when `valkey.enabled: true`.
+  addr: ""
+
+  # -- Redis database number (default 0)
+  db: 0
+
+  # -- Redis password (if not using valkey subchart or existingSecret)
+  password: ""
+
+  # -- Secret key containing the password in the secret
+  passwordKey: "password"
+
+  # -- Existing secret holding Redis credentials
+  existingSecret: ""
+
+  # -- Whether to create a standalone auth secret when not using subchart
+  createSecret: false
+
+  # -- TLS configuration for the connection between proxy and Valkey/Redis
+  tls:
+    # -- Enable TLS for session store connections
+    enabled: true
+    # -- Existing secret containing TLS certs (ca.crt, client.crt, client.key)
+    existingSecret: ""
+    # -- Path to CA certificate in the proxy container
+    caPath: "/etc/redis/tls/ca.crt"
+    # -- Path to client certificate in the proxy container
+    certPath: "/etc/redis/tls/client.crt"
+    # -- Path to client private key in the proxy container
+    keyPath: "/etc/redis/tls/client.key"
+
+# ==============================================================================
+# Valkey Subchart Configuration (Official valkey.io/valkey-helm)
+# Zero Bitnami dependencies. High-performance, BSD-3-Clause in-memory store.
+# ==============================================================================
+valkey:
+  # -- Enable bundled official Valkey subchart
+  enabled: true
+
+  # -- Valkey deployment topology (standalone, replication, sentinel)
+  topology: standalone
+
+  # -- Valkey authentication
+  auth:
+    enabled: true
+    usersExistingSecret: "{{ .Release.Name }}-valkey-auth"
+    aclUsers:
+      default:
+        permissions: "~* &* +@all"
+        passwordKey: "password"
+
+  # -- Valkey TLS configuration
+  tls:
+    enabled: true
+    existingSecret: "valkey-tls"
+
+  # -- Disable subchart networkPolicy in favor of chart's fine-grained NetworkPolicy
+  networkPolicy:
+    enabled: false
+
+# ==============================================================================
+# Kubernetes NetworkPolicy Configuration
+# ==============================================================================
+networkPolicy:
+  # -- Enable NetworkPolicy restricting Valkey ingress strictly to proxy pods
+  enabled: true
+
+# ==============================================================================
+# Service & Ingress Configuration
+# ==============================================================================
+service:
+  type: ClusterIP
+  port: 80
+  labels: {}
+  annotations: {}
+  extraPorts: []
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  labels: {}
+  hosts:
+    - host: mcp.company.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# ==============================================================================
+# Security & System Configuration
+# ==============================================================================
+serviceAccount:
+  create: true
+  name: ""
+  automountServiceAccountToken: false
+  labels: {}
+  annotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  capabilities:
+    drop:
+      - ALL
+
+# -- Resource limits and requests for the mcp-oauth-proxy container
+resources:
+  limits:
+    cpu: 500m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+# ==============================================================================
+# Autoscaling & High Availability
+# ==============================================================================
+hpa:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 80
+  targetMemoryUtilizationPercentage: 80
+  metrics: []
+  behavior: {}
+  labels: {}
+  annotations: {}
+
+podDisruptionBudget: {}
+
+# ==============================================================================
+# Monitoring & Metrics
+# ==============================================================================
+metrics:
+  enabled: false
+  port: 9090
+
+serviceMonitor:
+  enabled: false
+  path: /metrics
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}
+  annotations: {}
+
+# ==============================================================================
+# Scheduling Configuration
+# ==============================================================================
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+volumes: []
+volumeMounts: []
+extraContainers: []
+hostAliases: []
+priorityClassName: ""
+terminationGracePeriodSeconds: 30
+debug: false

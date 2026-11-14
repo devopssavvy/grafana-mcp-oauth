@@ -1,0 +1,201 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "Grafana MCP Helm Chart Values",
+  "type": "object",
+  "properties": {
+    "nameOverride": {
+      "type": "string"
+    },
+    "fullnameOverride": {
+      "type": "string"
+    },
+    "namespaceOverride": {
+      "type": "string"
+    },
+    "extraLabels": {
+      "type": "object"
+    },
+    "replicas": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "revisionHistoryLimit": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "deploymentStrategy": {
+      "type": "object",
+      "properties": {
+        "type": { "type": "string" },
+        "rollingUpdate": { "type": "object" }
+      }
+    },
+    "clusterDomain": {
+      "type": "string"
+    },
+    "image": {
+      "type": "object",
+      "properties": {
+        "repository": { "type": "string" },
+        "tag": { "type": "string" },
+        "pullPolicy": {
+          "type": "string",
+          "enum": ["Always", "IfNotPresent", "Never"]
+        }
+      },
+      "required": ["repository"]
+    },
+    "oauthProxy": {
+      "type": "object",
+      "properties": {
+        "baseUrl": { "type": "string" },
+        "grafanaPublicUrl": { "type": "string" },
+        "masterSecret": { "type": "string" },
+        "masterSecretSecret": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" },
+            "key": { "type": "string" }
+          }
+        },
+        "extraEnv": { "type": "array" }
+      }
+    },
+    "mcpGrafana": {
+      "type": "object",
+      "properties": {
+        "image": {
+          "type": "object",
+          "properties": {
+            "repository": { "type": "string" },
+            "tag": { "type": "string" },
+            "pullPolicy": {
+              "type": "string",
+              "enum": ["Always", "IfNotPresent", "Never"]
+            }
+          },
+          "required": ["repository", "tag"]
+        },
+        "disableWrite": { "type": "boolean" },
+        "disabledCategories": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "extraArgs": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "env": { "type": "array" },
+        "resources": { "type": "object" },
+        "containerSecurityContext": { "type": "object" },
+        "volumeMounts": { "type": "array" }
+      },
+      "required": ["image"]
+    },
+    "grafana": {
+      "type": "object",
+      "properties": {
+        "url": { "type": "string" },
+        "apiKey": { "type": "string" },
+        "apiKeySecret": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" },
+            "key": { "type": "string" }
+          }
+        }
+      },
+      "required": ["url"]
+    },
+    "redis": {
+      "type": "object",
+      "properties": {
+        "addr": { "type": "string" },
+        "db": { "type": "integer" },
+        "password": { "type": "string" },
+        "passwordKey": { "type": "string" },
+        "existingSecret": { "type": "string" },
+        "createSecret": { "type": "boolean" },
+        "tls": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "existingSecret": { "type": "string" },
+            "caPath": { "type": "string" },
+            "certPath": { "type": "string" },
+            "keyPath": { "type": "string" }
+          }
+        }
+      }
+    },
+    "valkey": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "topology": {
+          "type": "string",
+          "enum": ["standalone", "replication", "sentinel"]
+        },
+        "auth": { "type": "object" },
+        "tls": { "type": "object" },
+        "networkPolicy": { "type": "object" }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" }
+      }
+    },
+    "service": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["ClusterIP", "NodePort", "LoadBalancer", "ExternalName"]
+        },
+        "port": { "type": "integer" },
+        "labels": { "type": "object" },
+        "annotations": { "type": "object" },
+        "extraPorts": { "type": "array" }
+      },
+      "required": ["type", "port"]
+    },
+    "ingress": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "className": { "type": "string" },
+        "annotations": { "type": "object" },
+        "labels": { "type": "object" },
+        "hosts": { "type": "array" },
+        "tls": { "type": "array" }
+      }
+    },
+    "serviceAccount": {
+      "type": "object",
+      "properties": {
+        "create": { "type": "boolean" },
+        "name": { "type": "string" },
+        "automountServiceAccountToken": { "type": "boolean" }
+      }
+    },
+    "resources": { "type": "object" },
+    "podSecurityContext": { "type": "object" },
+    "containerSecurityContext": { "type": "object" },
+    "hpa": { "type": "object" },
+    "podDisruptionBudget": { "type": "object" },
+    "serviceMonitor": { "type": "object" },
+    "nodeSelector": { "type": "object" },
+    "tolerations": { "type": "array" },
+    "affinity": { "type": "object" },
+    "topologySpreadConstraints": { "type": "array" },
+    "volumes": { "type": "array" },
+    "volumeMounts": { "type": "array" },
+    "extraContainers": { "type": "array" },
+    "hostAliases": { "type": "array" },
+    "priorityClassName": { "type": "string" },
+    "terminationGracePeriodSeconds": { "type": "integer" },
+    "debug": { "type": "boolean" }
+  }
+}

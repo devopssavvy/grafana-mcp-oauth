@@ -6,3 +6,4 @@ bin/
 *.pem
 *.key
 *.crt
+charts/**/charts/*.tgz
