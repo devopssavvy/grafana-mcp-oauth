@@ -156,6 +156,12 @@ func TestServer_ExtAuthzMode(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, respCheck.StatusCode)
 	_ = respCheck.Body.Close()
 
+	// Verify /mcp/auth/check is NOT registered (must return 404 to prevent session oracle exposure)
+	respOracleCheck, err := client.Get("http://" + srv.HTTPAddr() + "/mcp/auth/check")
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusNotFound, respOracleCheck.StatusCode)
+	_ = respOracleCheck.Body.Close()
+
 	// Shutdown
 	ctxShut, cancelShut := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancelShut()

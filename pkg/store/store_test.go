@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -268,4 +269,118 @@ func TestStore_RefreshTokenSessionFlow(t *testing.T) {
 	// Second attempt must fail (single-use rotation)
 	_, err = st.GetAndDeleteRefreshSession(ctx, refreshToken)
 	assert.ErrorIs(t, err, store.ErrInvalidRefreshToken)
+}
+
+func TestStore_AtomicAuthCodeSingleUse_And_RaceProtection(t *testing.T) {
+	ctx := context.Background()
+	st, _ := setupTestStore(t)
+
+	code := "mcp_code_atomic_test_single_use"
+	authCtx := &store.AuthCodeContext{
+		GrafanaSession:      "grafana_session_secret_atomic",
+		ClientID:            "cursor-ide",
+		RedirectURI:         "http://127.0.0.1:54321/callback",
+		CodeChallenge:       "challenge_abc",
+		CodeChallengeMethod: "S256",
+		ExpiresAt:           time.Now().Add(5 * time.Minute),
+	}
+
+	err := st.SaveAuthCode(ctx, code, authCtx, 5*time.Minute)
+	require.NoError(t, err)
+
+	// Atomic retrieval: first call succeeds
+	res, err := st.GetAndDeleteAuthCode(ctx, code)
+	require.NoError(t, err)
+	assert.Equal(t, authCtx.GrafanaSession, res.GrafanaSession)
+
+	// Second call must fail immediately (ErrAuthCodeNotFound)
+	_, err = st.GetAndDeleteAuthCode(ctx, code)
+	assert.ErrorIs(t, err, store.ErrAuthCodeNotFound)
+
+	// Test concurrent race condition: save another code and execute 10 concurrent calls
+	raceCode := "mcp_code_race_test"
+	err = st.SaveAuthCode(ctx, raceCode, authCtx, 5*time.Minute)
+	require.NoError(t, err)
+
+	successCount := 0
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := st.GetAndDeleteAuthCode(ctx, raceCode)
+			if err == nil {
+				mu.Lock()
+				successCount++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+
+	assert.Equal(t, 1, successCount, "Exactly ONE concurrent request must succeed in consuming the authorization code")
+}
+
+func TestStore_GetAndDeletePendingAuth(t *testing.T) {
+	ctx := context.Background()
+	st, _ := setupTestStore(t)
+
+	state := "mcp_st_pending_atomic_test"
+	req := &store.PendingAuthRequest{
+		ClientID:    "agent-x",
+		RedirectURI: "http://127.0.0.1:9090/cb",
+		ClientState: "state123",
+	}
+
+	err := st.SavePendingAuth(ctx, state, req, 10*time.Minute)
+	require.NoError(t, err)
+
+	retrieved, err := st.GetAndDeletePendingAuth(ctx, state)
+	require.NoError(t, err)
+	assert.Equal(t, req.ClientID, retrieved.ClientID)
+
+	// Second attempt fails
+	_, err = st.GetAndDeletePendingAuth(ctx, state)
+	assert.ErrorIs(t, err, store.ErrPendingAuthNotFound)
+}
+
+func TestStore_ZeroConfig_MultiPodSync(t *testing.T) {
+	ctx := context.Background()
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+
+	// Simulate Pod 1 (no MCP_MASTER_SECRET configured)
+	pod1Store, err := store.NewRedisSessionStore(rdb, nil)
+	require.NoError(t, err)
+
+	// Simulate Pod 2 (no MCP_MASTER_SECRET configured)
+	pod2Store, err := store.NewRedisSessionStore(rdb, nil)
+	require.NoError(t, err)
+
+	token := "mcp_at_zero_config_test_token_123456"
+	sessionData := &store.SessionData{
+		UserID:         "user_sync",
+		Username:       "multipod_user",
+		GrafanaSession: "grafana_sess_synced",
+		ExpiresAt:      time.Now().Add(1 * time.Hour),
+	}
+
+	// Pod 1 saves session
+	err = pod1Store.SaveSession(ctx, token, sessionData, 1*time.Hour)
+	require.NoError(t, err)
+
+	// Pod 2 reads and decrypts session seamlessly
+	retrieved, err := pod2Store.GetSession(ctx, token)
+	require.NoError(t, err)
+	assert.Equal(t, sessionData.Username, retrieved.Username)
+	assert.Equal(t, sessionData.GrafanaSession, retrieved.GrafanaSession)
+
+	// Zero-Knowledge check in Redis
+	keys := mr.Keys()
+	require.Len(t, keys, 1)
+	rawBytes, err := mr.Get(keys[0])
+	require.NoError(t, err)
+	assert.False(t, strings.Contains(rawBytes, "grafana_sess_synced"))
 }

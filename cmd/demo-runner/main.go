@@ -330,8 +330,6 @@ func main() {
 	// Route 1: RFC 9728 Discovery & OAuth Endpoints
 	oauthMux := http.NewServeMux()
 	oauthHandler.RegisterRoutes(oauthMux)
-	oauthMux.HandleFunc("GET /mcp/auth/check", extAuthServer.HandleHTTPCheck)
-	oauthMux.HandleFunc("POST /mcp/auth/check", extAuthServer.HandleHTTPCheck)
 
 	gatewayMux.HandleFunc("/.well-known/", oauthMux.ServeHTTP)
 	gatewayMux.HandleFunc("/mcp/auth/", oauthMux.ServeHTTP)

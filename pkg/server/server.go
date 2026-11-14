@@ -113,13 +113,17 @@ func New(opts Options) (*Server, error) {
 
 	// 3. OAuth 2.1 & RFC 9728 Discovery Handler
 	oauthHandler := oauth.NewHandler(oauth.Config{
-		BaseURL:          cfg.BaseURL,
-		GrafanaURL:       cfg.GrafanaURL,
-		GrafanaPublicURL: cfg.GrafanaPublicURL,
-		CallbackBaseURL:  cfg.CallbackBaseURL,
-		SessionTTL:       cfg.SessionTTL,
-		RefreshTTL:       cfg.RefreshTTL,
-		Logger:           logger,
+		BaseURL:           cfg.BaseURL,
+		GrafanaURL:        cfg.GrafanaURL,
+		GrafanaPublicURL:  cfg.GrafanaPublicURL,
+		CallbackBaseURL:   cfg.CallbackBaseURL,
+		SessionTTL:        cfg.SessionTTL,
+		RefreshTTL:        cfg.RefreshTTL,
+		PendingAuthTTL:    cfg.PendingAuthTTL,
+		AuthCodeTTL:       cfg.AuthCodeTTL,
+		RateLimitLoginRPM: cfg.RateLimitLoginRPM,
+		RateLimitTokenRPM: cfg.RateLimitTokenRPM,
+		Logger:            logger,
 	}, sessionStore)
 
 	s := &Server{
@@ -140,9 +144,9 @@ func New(opts Options) (*Server, error) {
 	if mode == ModeExtAuthz || mode == ModeAll {
 		extAuthServer := extauthz.NewServer(sessionStore, cfg.BaseURL, logger)
 
-		// HTTP Check endpoints (method-agnostic: supports GET, POST, PUT, DELETE, OPTIONS for Envoy/NGINX/Traefik)
+		// HTTP Check endpoint for internal ingress/reverse proxies (NGINX auth_request, Traefik ForwardAuth)
+		// Note: Not exposed under public /mcp/auth/ to prevent external credential oracle attacks
 		mux.HandleFunc("/extauthz/check", extAuthServer.HandleHTTPCheck)
-		mux.HandleFunc("/mcp/auth/check", extAuthServer.HandleHTTPCheck)
 
 		// gRPC Server setup
 		grpcServer := grpc.NewServer()
@@ -316,6 +320,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 
 	wg.Wait()
+
+	if s.oauthHandler != nil {
+		s.oauthHandler.Close()
+	}
 
 	if s.rdb != nil {
 		_ = s.rdb.Close()

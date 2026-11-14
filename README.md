@@ -62,12 +62,14 @@ Key capabilities:
 
 ### 2.2. Zero-Knowledge Cryptographic Storage & Distributed State in Redis
 * **Distributed State**: All pending login states (`mcp:pending_auth:`) and authorization codes (`mcp:auth_code:`) are distributed in Redis with automatic TTLs, fully supporting horizontal scaling (Horizontal Pod Autoscaling / Multi-replica).
-* **Redis Key**: Hashed using **HMAC-SHA3-512** with the Server Master Secret:
-  $$\text{RedisKey} = \text{mcp:session:} + \text{HMAC-SHA3-512}(\text{token}, \text{MasterSecret})$$
-  *Completely prevents timing attacks and offline rainbow table lookups even in the event of a database dump.*
+* **Pure Client-Derived Key (RFC 5869 Zero-Config Mode)**:
+  - Eliminates the need for administrators to manage `MCP_MASTER_SECRET`.
+  - The Redis lookup key is computed using **HMAC-SHA3-512** over the 256-bit entropy token using a standard deterministic domain-separation salt (`grafana-mcp-oauth-v1-domain-salt`):
+    $$\text{RedisKey} = \text{mcp:session:} + \text{HMAC-SHA3-512}(\text{token}, \text{DomainSalt})$$
+  - Since tokens are generated using cryptographically secure random bytes ($2^{256}$ states), rainbow table precomputation and offline brute force are mathematically impossible.
 * **Payload Encryption**: Encrypted with **XChaCha20-Poly1305** (AEAD with 192-bit / 24-byte random nonce).
-* **Key Derivation (KDF)**: A 256-bit encryption key is independently derived per session directly from the client token via **HKDF-SHA3-512** for sub-0.1ms performance (supports Argon2id for master secret derivation).
-* *No one (including administrators with Redis access) can inspect the `grafana_session` or user information without the raw token from the client.*
+* **Key Derivation (KDF)**: A 256-bit encryption key is independently derived per session directly from the client token via **HKDF-SHA3-512** for sub-0.1ms performance.
+* *Zero-Knowledge Guarantee: No one (including database administrators or attackers with full Redis dumps) can inspect the `grafana_session` or user identity without the raw bearer token possessed only by the client.*
 
 ### 2.3. Upstream `grafana/mcp-grafana` (Zero-Fork)
 Uses the official 100% stock Grafana Labs container image (`grafana/mcp-grafana:latest`). Leverages built-in capabilities in `mcp-grafana`'s Go codebase:

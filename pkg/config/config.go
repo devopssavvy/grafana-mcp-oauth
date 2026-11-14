@@ -1,10 +1,8 @@
 package config
 
 import (
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"io"
 	"log/slog"
 	"os"
 	"strconv"
@@ -25,10 +23,14 @@ type AppConfig struct {
 	RedisAddr        string
 	RedisPassword    string
 	RedisDB          int
-	MasterSecret     []byte
-	SessionTTL       time.Duration
-	RefreshTTL       time.Duration
-	LogLevel         slog.Level
+	MasterSecret      []byte
+	SessionTTL        time.Duration
+	RefreshTTL        time.Duration
+	PendingAuthTTL    time.Duration
+	AuthCodeTTL       time.Duration
+	RateLimitLoginRPM int
+	RateLimitTokenRPM int
+	LogLevel          slog.Level
 }
 
 // LoadFromEnv loads configuration from environment variables with safe defaults.
@@ -65,14 +67,17 @@ func LoadFromEnv() *AppConfig {
 	secretStr := os.Getenv("MCP_MASTER_SECRET")
 	var masterSecret []byte
 	if secretStr != "" {
-		masterSecret = []byte(secretStr)
-	} else {
-		masterSecret = make([]byte, 32)
-		if _, err := io.ReadFull(rand.Reader, masterSecret); err != nil {
-			slog.Error("Failed to read cryptographically secure random bytes for master secret", "error", err)
+		if len(secretStr) < 16 {
+			slog.Error("MCP_MASTER_SECRET is too short; must be at least 16 bytes (recommended 32 bytes)")
 			os.Exit(1)
 		}
-		slog.Warn("MCP_MASTER_SECRET not set in environment; generated ephemeral random 32-byte secret. For production, set MCP_MASTER_SECRET.")
+		masterSecret = []byte(secretStr)
+		slog.Info("Loaded custom MCP_MASTER_SECRET from environment")
+	} else {
+		// Zero-config mode: Pure Client-Derived Key (RFC 5869) with standard domain salt.
+		// Eliminates admin burden and multi-pod desynchronization with no master secret required.
+		masterSecret = nil
+		slog.Info("MCP_MASTER_SECRET not set; running in Zero-Knowledge Client-Derived Key mode (zero-config multi-pod sync)")
 	}
 
 	sessionHours := 2
@@ -86,6 +91,34 @@ func LoadFromEnv() *AppConfig {
 	if rdStr := os.Getenv("REFRESH_TTL_DAYS"); rdStr != "" {
 		if rd, err := strconv.Atoi(rdStr); err == nil && rd > 0 {
 			refreshDays = rd
+		}
+	}
+
+	pendingAuthMinutes := 5
+	if pamStr := os.Getenv("PENDING_AUTH_TTL_MINUTES"); pamStr != "" {
+		if pam, err := strconv.Atoi(pamStr); err == nil && pam > 0 {
+			pendingAuthMinutes = pam
+		}
+	}
+
+	authCodeSeconds := 60
+	if acsStr := os.Getenv("AUTH_CODE_TTL_SECONDS"); acsStr != "" {
+		if acs, err := strconv.Atoi(acsStr); err == nil && acs > 0 {
+			authCodeSeconds = acs
+		}
+	}
+
+	rateLimitLoginRPM := 60
+	if loginRpmStr := os.Getenv("RATE_LIMIT_LOGIN_RPM"); loginRpmStr != "" {
+		if rpm, err := strconv.Atoi(loginRpmStr); err == nil && rpm > 0 {
+			rateLimitLoginRPM = rpm
+		}
+	}
+
+	rateLimitTokenRPM := 120
+	if tokenRpmStr := os.Getenv("RATE_LIMIT_TOKEN_RPM"); tokenRpmStr != "" {
+		if rpm, err := strconv.Atoi(tokenRpmStr); err == nil && rpm > 0 {
+			rateLimitTokenRPM = rpm
 		}
 	}
 
@@ -111,17 +144,21 @@ func LoadFromEnv() *AppConfig {
 		RedisAddr:        redisAddr,
 		RedisPassword:    redisPassword,
 		RedisDB:          redisDB,
-		MasterSecret:     masterSecret,
-		SessionTTL:       time.Duration(sessionHours) * time.Hour,
-		RefreshTTL:       time.Duration(refreshDays) * 24 * time.Hour,
-		LogLevel:         logLevel,
+		MasterSecret:      masterSecret,
+		SessionTTL:        time.Duration(sessionHours) * time.Hour,
+		RefreshTTL:        time.Duration(refreshDays) * 24 * time.Hour,
+		PendingAuthTTL:    time.Duration(pendingAuthMinutes) * time.Minute,
+		AuthCodeTTL:       time.Duration(authCodeSeconds) * time.Second,
+		RateLimitLoginRPM: rateLimitLoginRPM,
+		RateLimitTokenRPM: rateLimitTokenRPM,
+		LogLevel:          logLevel,
 	}
 }
 
 // MasterSecretFingerprint returns a cryptographic SHA-256 fingerprint for safe logging without leaking plaintext characters.
 func (c *AppConfig) MasterSecretFingerprint() string {
 	if len(c.MasterSecret) == 0 {
-		return ""
+		return "zero-config (client-derived)"
 	}
 	h := sha256.Sum256(c.MasterSecret)
 	return hex.EncodeToString(h[:4]) + "..."

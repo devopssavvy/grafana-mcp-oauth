@@ -1,6 +1,7 @@
 package oauth_test
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -391,4 +392,68 @@ func TestHandler_RefreshTokenGrant(t *testing.T) {
 	h.HandleToken(tokenRecExpired, tokenReqExpired)
 	assert.Equal(t, http.StatusUnauthorized, tokenRecExpired.Code)
 	assert.Contains(t, tokenRecExpired.Body.String(), "associated Grafana session has expired or was revoked")
+}
+
+func TestHandler_BodySizeLimit_OnTokenEndpoint(t *testing.T) {
+	h, _, _ := setupOAuthTestEnv(t)
+	defer h.Close()
+
+	// Send an oversized body (> 64KB)
+	hugeData := strings.Repeat("a", 70*1024)
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("huge", hugeData)
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp/auth/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+
+	h.HandleToken(rec, req)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "body exceeds size limit")
+}
+
+func TestHandler_InvalidGrafanaSessionFormat(t *testing.T) {
+	h, st, _ := setupOAuthTestEnv(t)
+	defer h.Close()
+
+	ctx := context.Background()
+	state := "mcp_st_session_format_test"
+	reqAuth := &store.PendingAuthRequest{
+		ClientID:            "client-1",
+		RedirectURI:         "http://127.0.0.1:4000/cb",
+		CodeChallenge:       "challenge_val",
+		CodeChallengeMethod: "S256",
+		CreatedAt:           time.Now(),
+	}
+	err := st.SavePendingAuth(ctx, state, reqAuth, 10*time.Minute)
+	require.NoError(t, err)
+
+	// Callback with malicious/malformed cookie containing injection characters
+	req := httptest.NewRequest(http.MethodGet, "/mcp/auth/callback?mcp_state="+state, nil)
+	req.AddCookie(&http.Cookie{Name: "mcp_auth_state", Value: state})
+	req.AddCookie(&http.Cookie{Name: "grafana_session", Value: "session; injected_attr=1\r\n"})
+	rec := httptest.NewRecorder()
+
+	h.HandleCallback(rec, req)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "invalid session token format")
+}
+
+func TestHandler_RateLimiting(t *testing.T) {
+	h, _, _ := setupOAuthTestEnv(t)
+	defer h.Close()
+
+	// Exhaust rate limit on /mcp/auth/login (limit 60 reqs/min)
+	clientIP := "198.51.100.5"
+	var lastCode int
+	for i := 0; i < 65; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/mcp/auth/login?redirect_uri=http://localhost:54321/cb&code_challenge=xyz&code_challenge_method=S256", nil)
+		req.RemoteAddr = clientIP + ":12345"
+		rec := httptest.NewRecorder()
+		h.HandleLogin(rec, req)
+		lastCode = rec.Code
+	}
+
+	assert.Equal(t, http.StatusTooManyRequests, lastCode, "Request exceeding rate limit must receive 429 Too Many Requests")
 }
