@@ -161,3 +161,15 @@ ingress:
 | `serviceAccount.create` | Create dedicated ServiceAccount | `true` |
 | `hpa.enabled` | Enable HorizontalPodAutoscaler | `false` |
 | `serviceMonitor.enabled` | Enable Prometheus Operator ServiceMonitor | `false` |
+
+---
+
+## 6. Release & Versioning Lifecycle
+
+This chart follows a decoupled release model separating application containers from Helm packaging:
+
+- **Application Releases (`v*` tags):** Pushing a tag like `v0.2.0` triggers `.github/workflows/release.yml` to build and publish the multi-arch Docker image `ghcr.io/devopssavvy/grafana-mcp-oauth:v0.2.0`.
+- **Chart Releases (Automated on Merge):**
+  1. Bump `version` (and optionally update `appVersion`) in `charts/grafana-mcp/Chart.yaml`.
+  2. When merged into `main`, `.github/workflows/helm-release.yml` checks if the version is new, packages the chart, pushes it to `oci://ghcr.io/devopssavvy/charts/grafana-mcp:<version>`, and automatically tags the commit as `chart-v<version>`.
+  3. If `version` in `Chart.yaml` was not changed, publishing is skipped, preventing registry collisions or chart downgrades.
