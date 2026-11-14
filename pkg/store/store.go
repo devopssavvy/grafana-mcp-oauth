@@ -129,6 +129,7 @@ func (s *RedisSessionStore) SaveSession(ctx context.Context, token string, sessi
 		return fmt.Errorf("failed to derive encryption key: %w", err)
 	}
 
+	// #nosec G117 -- session payload is encrypted with AES-256-GCM before storage
 	payload, err := json.Marshal(session)
 	if err != nil {
 		return fmt.Errorf("failed to marshal session: %w", err)
@@ -212,6 +213,7 @@ func (s *RedisSessionStore) SaveRefreshTokenSession(ctx context.Context, refresh
 		return fmt.Errorf("failed to derive refresh encryption key: %w", err)
 	}
 
+	// #nosec G117 -- session payload is encrypted with AES-256-GCM before storage
 	payload, err := json.Marshal(session)
 	if err != nil {
 		return fmt.Errorf("failed to marshal refresh session: %w", err)
