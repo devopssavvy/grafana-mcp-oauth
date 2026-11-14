@@ -26,70 +26,94 @@ In Grafana Server:
 
 ---
 
-## 2. Architecture Solution: Envoy Gateway + `grafana-mcp-oauth`
+## 2. Architecture Solutions: Envoy Gateway & Direct Sidecar Proxy
 
-The solution adopts a layered architecture:
+The solution adopts a layered architecture supporting two primary deployment models without requiring any forks or modifications to the upstream source code of `grafana/mcp-grafana`:
 
+### 2.1. Architecture A: Centralized Envoy Gateway (`MODE=extauthz`)
+
+Envoy Gateway acts as the central ingress. Regular Grafana web traffic bypasses external authorization, while MCP traffic is intercepted by Envoy's `ext_authz` filter. `grafana-mcp-oauth` validates the Bearer token against Redis, injects the user's `grafana_session` cookie, and strips the Authorization header before forwarding to stock `mcp-grafana`:
+
+```mermaid
+flowchart TD
+    subgraph ClientTier["Client Tier"]
+        WebUser["Web Browser User"]
+        Agent["Coding Agent / MCP Client (Cursor, Claude Desktop, Antigravity)"]
+    end
+
+    subgraph EnvoyTier["Envoy Gateway Tier (:8080)"]
+        RouteWeb["Route: /dashboards, /explore, / (Bypass ext_authz)"]
+        RouteAuth["Route: /.well-known/*, /mcp/auth/* (Bypass ext_authz)"]
+        RouteMCP["Route: /mcp/* (Enforces ext_authz Filter)"]
+    end
+
+    subgraph AuthTier["Auth & Session Tier"]
+        Gateway["grafana-mcp-oauth (:8081 HTTP / :9001 gRPC)\n- RFC 9728 & RFC 8414 Discovery\n- PKCE OAuth 2.1 Handshake\n- gRPC Check() Server"]
+        Redis[("Zero-Knowledge Redis Store\n- HMAC-SHA3-512 Key Lookup\n- XChaCha20-Poly1305 AEAD")]
+    end
+
+    subgraph MCPTier["MCP Processing Tier"]
+        StockMCP["stock grafana/mcp-grafana:latest\n(GRAFANA_FORWARD_HEADERS=Cookie)"]
+    end
+
+    subgraph GrafanaTier["Grafana & Data Tier"]
+        Grafana["Grafana Server (:3000)\n- Resolves grafana_session\n- Extracts OAuth token from user_auth\n- Applies oauth_pass_thru=true"]
+        DataSources[("Datasources\n(Prometheus / Loki / Tempo)")]
+    end
+
+    WebUser -->|"Browser Traffic"| RouteWeb
+    RouteWeb -->|"Direct Pass-through"| Grafana
+    Agent -->|"OAuth Handshake /mcp/auth/*"| RouteAuth
+    RouteAuth --> Gateway
+    Agent -->|"Bearer MCP_Token"| RouteMCP
+    RouteMCP -->|"1. gRPC Check()"| Gateway
+    Gateway <-->|"2. Decrypt Session"| Redis
+    Gateway -->>|"3. CheckResponse OK + Mutate Header"| RouteMCP
+    RouteMCP -->|"4. Forward with Cookie: grafana_session"| StockMCP
+    Gateway <-->|"Session Harvesting (/api/user)"| Grafana
+    StockMCP -->|"Forward with Cookie: grafana_session"| Grafana
+    Grafana -->|"Bearer user_oauth_token"| DataSources
 ```
-+-----------------------------------------------------------------------------------------+
-|                                    CLIENT TIER                                          |
-|                                                                                         |
-|        [Web Browser User]                             [Coding Agent / MCP Client]       |
-|                 |                                                  |                    |
-+-----------------|--------------------------------------------------|--------------------+
-                  |                                                  |
-                  |                                                  | Bearer MCP_Token
-                  v                                                  v
-+-----------------------------------------------------------------------------------------+
-|                                  ENVOY GATEWAY TIER                                     |
-|                                                                                         |
-|   /dashboards, /explore, /                /mcp/auth/*                /mcp/*             |
-|   (Bypass ext_authz)                      (Bypass ext_authz)         (Enforces ext_authz)
-|          |                                     |                           |            |
-+----------|-------------------------------------|---------------------------|------------+
-           |                                     |                           |
-           |                                     v                           v
-           |                        +-----------------------+   +------------------------+
-           |                        |   grafana-mcp-oauth   |   | gRPC Check()           |
-           |                        |   - /mcp/auth/login   |<--| - Validates Token      |
-           |                        |   - /mcp/auth/callback|   | - Injects Cookie       |
-           |                        |   - /mcp/auth/token   |   | - Strips Authorization |
-           |                        +-----------------------+   +------------------------+
-           |                                     |                           |
-           |                                     v                           |
-           |                        +-----------------------+                |
-           |                        |   Zero-Knowledge      |                |
-           |                        |   Redis Session Store |<---------------+
-           |                        +-----------------------+                |
-           |                                                                 v (with Cookie)
-+----------|------------------------------------------------------------------------------+
-|          |                         MCP PROCESSING TIER                                  |
-|          |                                                                              |
-|          |                                +-----------------------------------+         |
-|          |                                | stock grafana/mcp-grafana:latest  |         |
-|          |                                | GRAFANA_FORWARD_HEADERS=Cookie    |         |
-|          |                                +-----------------------------------+         |
-|          |                                                  |                           |
-+----------|--------------------------------------------------|---------------------------+
-           |                                                  | Cookie: grafana_session
-           v                                                  v
-+-----------------------------------------------------------------------------------------+
-|                                   GRAFANA & DATA TIER                                   |
-|                                                                                         |
-|                                  [Grafana Server]                                       |
-|                                  - Resolves grafana_session                             |
-|                                  - Extracts OAuth token from user_auth                  |
-|                                  - Applies oauth_pass_thru = true                       |
-|                                         |                                               |
-|                                         v Bearer <user_oauth_token>                     |
-|                                  [Data Sources]                                         |
-|                                  (Prometheus / Loki / Tempo)                            |
-+-----------------------------------------------------------------------------------------+
+
+### 2.2. Architecture B: Direct Sidecar Proxy (`MODE=proxy`)
+
+`grafana-mcp-oauth` runs as a standalone gateway or pod sidecar directly fronting stock `mcp-grafana` (`TARGET_MCP_URL`) without requiring Envoy. It terminates OAuth handshakes, validates Bearer tokens, injects `grafana_session` cookies, and reverse-proxies directly to upstream MCP:
+
+```mermaid
+flowchart TD
+    subgraph ClientTier["Client Tier"]
+        Agent["Coding Agent / MCP Client (Cursor, Claude Desktop, Antigravity)"]
+    end
+
+    subgraph ProxyTier["Direct Sidecar Proxy Tier (:8080)"]
+        Gateway["grafana-mcp-oauth (MODE=proxy)\n- Built-in Authenticated Reverse Proxy\n- RFC 9728 Discovery & PKCE Handshake\n- Bearer Token to Cookie Translator"]
+        Redis[("Zero-Knowledge Redis Store\n- HMAC-SHA3-512 Key Lookup\n- XChaCha20-Poly1305 AEAD")]
+    end
+
+    subgraph MCPTier["MCP Processing Tier"]
+        StockMCP["stock grafana/mcp-grafana (:8000)\n(TARGET_MCP_URL, GRAFANA_FORWARD_HEADERS=Cookie)"]
+    end
+
+    subgraph GrafanaTier["Grafana & Data Tier"]
+        Grafana["Grafana Server (:3000)\n- Resolves grafana_session\n- Extracts OAuth token from user_auth\n- Applies oauth_pass_thru=true"]
+        DataSources[("Datasources\n(Prometheus / Loki / Tempo)")]
+    end
+
+    Agent -->|"1. OAuth Discovery & PKCE Login"| Gateway
+    Gateway <-->|"Session Harvesting (/api/user)"| Grafana
+    Gateway <-->|"Store Encrypted Session"| Redis
+    Agent -->|"2. MCP Calls (Bearer MCP_Token)"| Gateway
+    Gateway <-->|"3. Lookup & Decrypt Session"| Redis
+    Gateway -->|"4. Reverse Proxy (Strips Auth, Injects Cookie)"| StockMCP
+    StockMCP -->|"5. Forward with Cookie: grafana_session"| Grafana
+    Grafana -->|"6. Forward with Bearer user_oauth_token"| DataSources
 ```
 
 ---
 
 ## 3. Authentication & Query Sequence (End-to-End Sequence)
+
+### 3.1. Architecture A: Envoy Gateway Mode (`MODE=extauthz`) Sequence
 
 ```mermaid
 sequenceDiagram
@@ -103,7 +127,7 @@ sequenceDiagram
     participant DS as Datasource (OAuth Passthru)
 
     Note over Dev,Grafana: Phase 1: User Login & Session Harvesting
-    Dev->>Envoy: 1. Access /mcp/auth/login?redirect_uri=...
+    Dev->>Envoy: 1. Access /mcp/auth/login?redirect_uri=... (PKCE S256)
     Envoy->>Gateway: 2. Proxy to grafana-mcp-oauth
     Gateway-->>Dev: 3. HTTP 302 Redirect to /login/generic_oauth?redirect=/mcp/auth/callback
     Dev->>Grafana: 4. Open Grafana SSO login page (IdP authentication)
@@ -113,23 +137,73 @@ sequenceDiagram
     Envoy->>Gateway: 8. Proxy callback to grafana-mcp-oauth
     Gateway->>Grafana: 9. GET /api/user (verify session & fetch user profile)
     Grafana-->>Gateway: 10. User profile (ID, username, email)
-    Gateway->>Gateway: 11. Generate MCP Access Token & Refresh Token
-    Gateway->>Redis: 12. Encrypt session (XChaCha20-Poly1305) & store under HMAC-SHA3-512 Key
-    Gateway-->>Dev: 13. Redirect to Coding Agent with mcp_access_token & mcp_refresh_token
+    Gateway->>Gateway: 11. Generate single-use authorization code (5-min TTL)
+    Gateway->>Redis: 12. Store auth code linked to grafana_session
+    Gateway-->>Dev: 13. Redirect to Coding Agent loopback with authorization code
+    Dev->>Envoy: 14. POST /mcp/auth/token (code + code_verifier)
+    Envoy->>Gateway: 15. Proxy token request to grafana-mcp-oauth
+    Gateway->>Gateway: 16. Verify PKCE S256 and issue mcp_access_token & mcp_refresh_token
+    Gateway->>Redis: 17. Encrypt session (XChaCha20-Poly1305) & store under HMAC-SHA3-512 Key
+    Gateway-->>Dev: 18. Return tokens JSON (mcp_access_token & mcp_refresh_token)
 
     Note over Dev,DS: Phase 2: Coding Agent MCP Tool Execution
-    Dev->>Envoy: 14. Call MCP Tool (POST /mcp/query, Header: "Authorization: Bearer mcp_at_...")
-    Envoy->>Gateway: 15. gRPC ext_authz Check()
-    Gateway->>Redis: 16. Lookup HMAC-SHA3-512(mcp_token) Key & Decrypt payload
-    Gateway-->>Envoy: 17. CheckResponse OK + Mutate Header:<br/>- Add: "Cookie: grafana_session=..."<br/>- Remove: "Authorization"
-    Envoy->>MCP: 18. Forward request to mcp-grafana (carrying user's Cookie)
-    MCP->>Grafana: 19. Call Grafana API with grafana_session Cookie
-    Grafana->>Grafana: 20. Lookup user's OAuth token from user_auth table
-    Grafana->>DS: 21. Forward query with header "Authorization: Bearer <user_oauth_token>"
-    DS-->>Grafana: 22. Data RBAC-filtered accurately by OAuth claims
-    Grafana-->>MCP: 23. Query result
-    MCP-->>Envoy: 24. MCP Response
-    Envoy-->>Dev: 25. Return result to Coding Agent
+    Dev->>Envoy: 19. Call MCP Tool (POST /mcp/query, Header: "Authorization: Bearer mcp_at_...")
+    Envoy->>Gateway: 20. gRPC ext_authz Check()
+    Gateway->>Redis: 21. Lookup HMAC-SHA3-512(mcp_token) Key & Decrypt payload
+    Gateway-->>Envoy: 22. CheckResponse OK + Mutate Header (Add Cookie: grafana_session, Strip Authorization)
+    Envoy->>MCP: 23. Forward request to mcp-grafana (carrying user's Cookie)
+    MCP->>Grafana: 24. Call Grafana API with grafana_session Cookie
+    Grafana->>Grafana: 25. Lookup user's OAuth token from user_auth table
+    Grafana->>DS: 26. Forward query with header "Authorization: Bearer user_oauth_token"
+    DS-->>Grafana: 27. Data RBAC-filtered accurately by OAuth claims
+    Grafana-->>MCP: 28. Query result
+    MCP-->>Envoy: 29. MCP Response
+    Envoy-->>Dev: 30. Return result to Coding Agent
+```
+
+### 3.2. Architecture B: Direct Sidecar Proxy Mode (`MODE=proxy`) Sequence
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Dev as Developer / Coding Agent
+    participant Gateway as grafana-mcp-oauth (:8080 Proxy)
+    participant Redis as Redis (Zero-Knowledge Store)
+    participant Grafana as Grafana Server (:3000)
+    participant MCP as Upstream mcp-grafana (:8000)
+    participant DS as Datasource (OAuth Passthru)
+
+    Note over Dev,Grafana: Phase 1: User Login & Session Harvesting
+    Dev->>Gateway: 1. Access /mcp/auth/login?redirect_uri=... (PKCE S256)
+    Gateway->>Redis: 2. Store pending auth state with PKCE code_challenge
+    Gateway-->>Dev: 3. HTTP 302 Redirect to /login/generic_oauth?redirect=/mcp/auth/callback
+    Dev->>Grafana: 4. Open Grafana SSO login page (IdP authentication)
+    Grafana->>Grafana: 5. Exchange OAuth code with IdP, store tokens in user_auth, issue grafana_session
+    Grafana-->>Dev: 6. Set-Cookie: grafana_session=... and 302 Redirect to /mcp/auth/callback
+    Dev->>Gateway: 7. Send /mcp/auth/callback request with grafana_session Cookie
+    Gateway->>Grafana: 8. GET /api/user (verify session & fetch user profile)
+    Grafana-->>Gateway: 9. User profile (ID, username, email)
+    Gateway->>Redis: 10. Store single-use authorization code (5-min TTL)
+    Gateway-->>Dev: 11. 302 Redirect to Agent loopback with authorization code
+    Dev->>Gateway: 12. POST /mcp/auth/token (code + code_verifier)
+    Gateway->>Gateway: 13. Verify PKCE S256 and issue mcp_access_token & mcp_refresh_token
+    Gateway->>Redis: 14. Encrypt session (XChaCha20-Poly1305) & store under HMAC-SHA3-512(token)
+    Gateway-->>Dev: 15. Return tokens JSON (mcp_access_token, mcp_refresh_token)
+
+    Note over Dev,DS: Phase 2: Coding Agent MCP Tool Execution
+    Dev->>Gateway: 16. Call MCP Tool (POST /mcp/query or SSE /mcp/sse with Bearer token)
+    Gateway->>Gateway: 17. Extract Bearer token from Authorization header
+    Gateway->>Redis: 18. Lookup HMAC-SHA3-512(mcp_token) & decrypt session payload
+    Redis-->>Gateway: 19. Decrypted session (grafana_session, username)
+    Gateway->>Gateway: 20. Mutate request: strip Authorization, inject Cookie: grafana_session
+    Gateway->>MCP: 21. Reverse proxy HTTP request to upstream TARGET_MCP_URL (:8000)
+    MCP->>Grafana: 22. Call Grafana API with forwarded grafana_session Cookie
+    Grafana->>Grafana: 23. Lookup user OAuth token in user_auth table
+    Grafana->>DS: 24. Forward query with header "Authorization: Bearer user_oauth_token"
+    DS-->>Grafana: 25. Return data filtered by user OAuth claims
+    Grafana-->>MCP: 26. Grafana API query response
+    MCP-->>Gateway: 27. MCP tool response stream
+    Gateway-->>Dev: 28. Stream reverse proxy response back to Coding Agent
 ```
 
 ---

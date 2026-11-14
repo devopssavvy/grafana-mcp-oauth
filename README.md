@@ -10,30 +10,85 @@ Centralized security and authentication layer for **Grafana Model Context Protoc
 
 Grafana Server uses Generic OAuth combined with `oauth_pass_thru = true` on Data Sources (Prometheus, Loki, Tempo...) to enforce data access control based on user OAuth claims. When users log in via the web UI, Grafana issues a session cookie (`grafana_session`) and maps it to their OAuth tokens in an internal database table.
 
-This project implements a **Centralized Gateway (`grafana-mcp-oauth`)** architecture **without requiring any forks or modifications to the upstream source code** of `grafana/mcp-grafana`:
+This project implements a **Centralized Gateway (`grafana-mcp-oauth`)** architecture **without requiring any forks or modifications to the upstream source code** of `grafana/mcp-grafana`. It supports two flexible deployment architectures:
 
+### Architecture A: Centralized Envoy Gateway (`MODE=extauthz`)
+
+Envoy Gateway acts as the central ingress. Regular Grafana web traffic bypasses external authorization, while MCP traffic is intercepted by Envoy's `ext_authz` HTTP/gRPC filter. `grafana-mcp-oauth` validates the Bearer token against Redis, injects the user's `grafana_session` cookie, and strips the Authorization header before forwarding to stock `mcp-grafana`:
+
+```mermaid
+flowchart TD
+    subgraph Clients["Client Tier"]
+        WebUser["Web Browser User"]
+        Agent["Coding Agent / MCP Client (Cursor, Claude Desktop, Antigravity)"]
+    end
+
+    subgraph Envoy["Envoy Gateway Tier (:8080)"]
+        RouteWeb["Route: /dashboards, /explore, / (Direct Pass-through)"]
+        RouteAuth["Route: /.well-known/*, /mcp/auth/* (Pass-through to Gateway)"]
+        RouteMCP["Route: /mcp/* (Protected by ext_authz Filter)"]
+    end
+
+    subgraph AuthLayer["Auth & Session Tier"]
+        Gateway["grafana-mcp-oauth (:8081 HTTP / :9001 gRPC)\n- RFC 9728 & RFC 8414 Discovery\n- PKCE OAuth 2.1 Handshake\n- gRPC Check() Handler"]
+        Redis[("Redis Session Store\n- HMAC-SHA3-512 Key Lookup\n- XChaCha20-Poly1305 AEAD")]
+    end
+
+    subgraph MCPTier["MCP Processing Tier"]
+        StockMCP["stock grafana/mcp-grafana\n(GRAFANA_FORWARD_HEADERS=Cookie)"]
+    end
+
+    subgraph GrafanaTier["Grafana & Data Tier"]
+        Grafana["Grafana Server (:3000)\n- Resolves grafana_session\n- Extracts OAuth Token from user_auth\n- Applies oauth_pass_thru=true"]
+        DataSources[("Datasources\n(Prometheus / Loki / Tempo)")]
+    end
+
+    WebUser -->|"Browser Traffic"| RouteWeb
+    RouteWeb -->|"Direct Pass-through"| Grafana
+    Agent -->|"OAuth Handshake /mcp/auth/*"| RouteAuth
+    RouteAuth --> Gateway
+    Agent -->|"MCP Calls (Bearer Token)"| RouteMCP
+    RouteMCP -->|"1. gRPC Check()"| Gateway
+    Gateway <-->|"2. Decrypt Session"| Redis
+    Gateway -->>|"3. Mutate: Inject Cookie, Strip Auth"| RouteMCP
+    RouteMCP -->|"4. Forward with Cookie: grafana_session"| StockMCP
+    Gateway <-->|"Validate Session via /api/user"| Grafana
+    StockMCP -->|"Forward with Cookie"| Grafana
+    Grafana -->|"Bearer user_oauth_token"| DataSources
 ```
-+-----------------------------------------------------------------------------------------+
-|                                    ENVOY GATEWAY                                        |
-|                                                                                         |
-|  1. /dashboards, /explore, / (Web User Traffic) ---> Direct Pass-through to Grafana     |
-|  2. /.well-known/oauth-* (MCP Discovery RFC 9728) ---> grafana-mcp-oauth                |
-|  3. /mcp/auth/* (SSO Login & Token Endpoint)    ---> grafana-mcp-oauth (Go 1.27)        |
-|  4. /mcp/* (Remote MCP Agent Calls)             ---> Protected by ext_authz Filter      |
-|       |                                                                                 |
-|       +---> [gRPC ext_authz Check] ---> grafana-mcp-oauth (Resolves Bearer Token)       |
-|       |                                        |                                        |
-|       |                                        v                                        |
-|       |                              Redis (Encrypted Session)                          |
-|       |                                        |                                        |
-|       +<--- [Mutate: Cookie: grafana_session] <+                                        |
-|       |                                                                                 |
-|       v (Header Mutated)                                                                |
-|  Stock mcp-grafana (GRAFANA_FORWARD_HEADERS=Cookie)                                     |
-|       |                                                                                 |
-|       v (Cookie forwarded)                                                              |
-|  Grafana Server ---> Resolves Session & Passes User OAuth Token ---> Upstream Datasource|
-+-----------------------------------------------------------------------------------------+
+
+### Architecture B: Direct Sidecar Proxy (`MODE=proxy`)
+
+`grafana-mcp-oauth` runs as a lightweight, authenticated reverse proxy directly fronting stock `mcp-grafana` (`TARGET_MCP_URL`) without requiring Envoy. Ideal for Kubernetes sidecars or standalone lightweight setups:
+
+```mermaid
+flowchart TD
+    subgraph Clients["Client Tier"]
+        Agent["Coding Agent / MCP Client (Cursor, Claude Desktop, Antigravity)"]
+    end
+
+    subgraph Sidecar["Direct Reverse Proxy Tier (:8080)"]
+        Gateway["grafana-mcp-oauth (MODE=proxy)\n- Built-in Authenticated Reverse Proxy\n- RFC 9728 Discovery & PKCE SSO\n- Resolves Bearer Token to Cookie"]
+        Redis[("Redis Session Store\n- Zero-Knowledge Encryption\n- XChaCha20-Poly1305 / HMAC-SHA3-512")]
+    end
+
+    subgraph MCPTier["MCP Processing Tier"]
+        StockMCP["stock grafana/mcp-grafana (:8000)\n(TARGET_MCP_URL, GRAFANA_FORWARD_HEADERS=Cookie)"]
+    end
+
+    subgraph GrafanaTier["Grafana & Data Tier"]
+        Grafana["Grafana Server (:3000)\n- Generic OAuth & Session Store\n- oauth_pass_thru=true"]
+        DataSources[("Datasources\n(Prometheus / Loki / Tempo)")]
+    end
+
+    Agent -->|"1. OAuth Discovery & PKCE Login"| Gateway
+    Gateway <-->|"Session Harvesting (/api/user)"| Grafana
+    Gateway <-->|"Store Encrypted Session"| Redis
+    Agent -->|"2. MCP Tool Calls (Bearer Token)"| Gateway
+    Gateway <-->|"3. Lookup & Decrypt Session"| Redis
+    Gateway -->|"4. Reverse Proxy (Inject Cookie, Strip Auth)"| StockMCP
+    StockMCP -->|"5. Forward with grafana_session Cookie"| Grafana
+    Grafana -->|"6. Forward with Bearer user_oauth_token"| DataSources
 ```
 
 ---
