@@ -26,6 +26,7 @@ type Config struct {
 	GrafanaURL        string // e.g. "http://grafana:3000" (Internal backend API URL)
 	GrafanaPublicURL  string // e.g. "http://localhost:8080" (Public URL for browser redirects, defaults to BaseURL)
 	CallbackBaseURL   string // e.g. "http://localhost:8080/mcp/auth/callback" or relative "/mcp/auth/callback"
+	CookieSecure      bool   // Force Secure attribute on cookies
 	IdPTokenURL       string
 	ClientID          string
 	ClientSecret      string
@@ -230,13 +231,14 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Set browser state cookie to protect against OAuth Login CSRF / Session Fixation
-	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- state cookie Secure flag matches scheme (allows HTTP in local dev/testing)
+	// #nosec G124 -- state cookie protected with HttpOnly, SameSite=Lax, and configurable Secure attribute
+	http.SetCookie(w, &http.Cookie{
 		Name:     "mcp_auth_state",
 		Value:    internalState,
 		Path:     "/mcp/auth",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   strings.HasPrefix(h.cfg.BaseURL, "https://"),
+		Secure:   h.cfg.CookieSecure,
 		MaxAge:   int(h.cfg.PendingAuthTTL.Seconds()),
 	})
 
@@ -277,13 +279,14 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Clear the state cookie
-	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- state cookie clearance
+	// #nosec G124 -- state cookie cleanup with explicit HttpOnly, SameSite, and configurable Secure attributes
+	http.SetCookie(w, &http.Cookie{
 		Name:     "mcp_auth_state",
 		Value:    "",
 		Path:     "/mcp/auth",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   strings.HasPrefix(h.cfg.BaseURL, "https://"),
+		Secure:   h.cfg.CookieSecure,
 		MaxAge:   -1,
 	})
 

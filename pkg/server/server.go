@@ -117,6 +117,7 @@ func New(opts Options) (*Server, error) {
 		GrafanaURL:        cfg.GrafanaURL,
 		GrafanaPublicURL:  cfg.GrafanaPublicURL,
 		CallbackBaseURL:   cfg.CallbackBaseURL,
+		CookieSecure:      cfg.CookieSecure,
 		SessionTTL:        cfg.SessionTTL,
 		RefreshTTL:        cfg.RefreshTTL,
 		PendingAuthTTL:    cfg.PendingAuthTTL,
@@ -212,9 +213,11 @@ func (s *Server) Start() (<-chan error, error) {
 
 	// 1. Bind HTTP Listener upfront before launching any background goroutines
 	if s.httpListener == nil {
-		ln, err := net.Listen("tcp", ":"+s.cfg.HTTPPort) // #nosec G102 -- Server intentionally binds to all interfaces in container environment
+		httpAddr := net.JoinHostPort(s.cfg.HTTPHost, s.cfg.HTTPPort)
+		// #nosec G102 -- configurable bind interface via HTTP_HOST / BIND_HOST environment variable and CLI flag
+		ln, err := net.Listen("tcp", httpAddr)
 		if err != nil {
-			return nil, fmt.Errorf("failed to listen on HTTP port %s: %w", s.cfg.HTTPPort, err)
+			return nil, fmt.Errorf("failed to listen on HTTP %s: %w", httpAddr, err)
 		}
 		s.httpListener = ln
 	}
@@ -223,11 +226,13 @@ func (s *Server) Start() (<-chan error, error) {
 	// 2. Bind gRPC Listener upfront if in extauthz or all mode
 	if s.grpcServer != nil {
 		if s.grpcListener == nil {
-			ln, err := net.Listen("tcp", ":"+s.cfg.GRPCPort) // #nosec G102 -- gRPC Server intentionally binds to all interfaces in container environment
+			grpcAddr := net.JoinHostPort(s.cfg.GRPCHost, s.cfg.GRPCPort)
+			// #nosec G102 -- configurable bind interface via GRPC_HOST / BIND_HOST environment variable and CLI flag
+			ln, err := net.Listen("tcp", grpcAddr)
 			if err != nil {
 				_ = s.httpListener.Close()
 				s.httpListener = nil
-				return nil, fmt.Errorf("failed to listen on gRPC port %s: %w", s.cfg.GRPCPort, err)
+				return nil, fmt.Errorf("failed to listen on gRPC %s: %w", grpcAddr, err)
 			}
 			s.grpcListener = ln
 		}

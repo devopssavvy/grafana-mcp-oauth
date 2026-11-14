@@ -14,8 +14,11 @@ import (
 type AppConfig struct {
 	Mode             string
 	BaseURL          string
+	HTTPHost         string
 	HTTPPort         string
+	GRPCHost         string
 	GRPCPort         string
+	CookieSecure     bool
 	TargetMCPURL     string
 	GrafanaURL       string
 	GrafanaPublicURL string
@@ -47,9 +50,18 @@ func LoadFromEnv() *AppConfig {
 	if mode == "extauthz" {
 		defaultHTTPPort = "8081"
 	}
+	httpHost := getEnv("HTTP_HOST", getEnv("BIND_HOST", ""))
 	httpPort := getEnv("PORT", getEnv("HTTP_PORT", defaultHTTPPort))
 
+	grpcHost := getEnv("GRPC_HOST", getEnv("BIND_HOST", ""))
 	grpcPort := getEnv("GRPC_PORT", "9001")
+
+	cookieSecure := strings.HasPrefix(baseURL, "https://")
+	if csStr := os.Getenv("COOKIE_SECURE"); csStr != "" {
+		if cs, err := strconv.ParseBool(csStr); err == nil {
+			cookieSecure = cs
+		}
+	}
 	targetMCPURL := getEnv("TARGET_MCP_URL", "http://127.0.0.1:8000")
 	grafanaURL := getEnv("GRAFANA_URL", "http://grafana:3000")
 	grafanaPublicURL := strings.TrimRight(getEnv("GRAFANA_PUBLIC_URL", baseURL), "/")
@@ -135,8 +147,11 @@ func LoadFromEnv() *AppConfig {
 	return &AppConfig{
 		Mode:             mode,
 		BaseURL:          baseURL,
+		HTTPHost:         httpHost,
 		HTTPPort:         httpPort,
+		GRPCHost:         grpcHost,
 		GRPCPort:         grpcPort,
+		CookieSecure:     cookieSecure,
 		TargetMCPURL:     targetMCPURL,
 		GrafanaURL:       grafanaURL,
 		GrafanaPublicURL: grafanaPublicURL,

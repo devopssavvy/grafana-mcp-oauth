@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -24,8 +25,11 @@ func main() {
 	// Define command-line flags
 	var (
 		flagMode         = flag.String("mode", "", "Server mode: 'proxy' (default), 'extauthz', or 'all' [env: MODE]")
+		flagHost         = flag.String("http-host", "", "HTTP host/interface to listen on [env: HTTP_HOST or BIND_HOST]")
 		flagPort         = flag.String("port", "", "HTTP port to listen on [env: PORT or HTTP_PORT]")
+		flagGRPCHost     = flag.String("grpc-host", "", "gRPC host/interface to listen on [env: GRPC_HOST or BIND_HOST]")
 		flagGRPCPort     = flag.String("grpc-port", "", "gRPC port to listen on for Envoy ext_authz [env: GRPC_PORT]")
+		flagCookieSecure = flag.String("cookie-secure", "", "Force Secure flag on cookies ('true' or 'false') [env: COOKIE_SECURE]")
 		flagTargetMCPURL = flag.String("target-mcp-url", "", "Upstream stock MCP Server URL for proxying [env: TARGET_MCP_URL]")
 		flagVersion      = flag.Bool("version", false, "Print version and exit")
 	)
@@ -63,6 +67,9 @@ func main() {
 	if *flagMode != "" {
 		cfg.Mode = strings.ToLower(strings.TrimSpace(*flagMode))
 	}
+	if *flagHost != "" {
+		cfg.HTTPHost = *flagHost
+	}
 	if *flagPort != "" {
 		cfg.HTTPPort = *flagPort
 	} else if os.Getenv("PORT") == "" && os.Getenv("HTTP_PORT") == "" {
@@ -73,8 +80,16 @@ func main() {
 		}
 	}
 
+	if *flagGRPCHost != "" {
+		cfg.GRPCHost = *flagGRPCHost
+	}
 	if *flagGRPCPort != "" {
 		cfg.GRPCPort = *flagGRPCPort
+	}
+	if *flagCookieSecure != "" {
+		if cs, err := strconv.ParseBool(*flagCookieSecure); err == nil {
+			cfg.CookieSecure = cs
+		}
 	}
 	if *flagTargetMCPURL != "" {
 		cfg.TargetMCPURL = *flagTargetMCPURL
@@ -86,8 +101,11 @@ func main() {
 	logger.Info("Initializing Grafana MCP OAuth Gateway",
 		"version", Version,
 		"mode", cfg.Mode,
+		"http_host", cfg.HTTPHost,
 		"http_port", cfg.HTTPPort,
+		"grpc_host", cfg.GRPCHost,
 		"grpc_port", cfg.GRPCPort,
+		"cookie_secure", cfg.CookieSecure,
 		"target_mcp_url", cfg.TargetMCPURL,
 		"base_url", cfg.BaseURL,
 		"grafana_url", cfg.GrafanaURL,
