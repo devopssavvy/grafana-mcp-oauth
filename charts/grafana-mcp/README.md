@@ -134,7 +134,8 @@ ingress:
 
 ### Example C: Kubernetes Gateway API (HTTPRoute)
 
-Deploy with Kubernetes Gateway API (`gateway.networking.k8s.io/v1`) using Envoy Gateway, Cilium, or Istio:
+Deploy with Kubernetes Gateway API (`gateway.networking.k8s.io/v1`) using Envoy Gateway, Cilium, or Istio.
+By default, the HTTPRoute only intercepts MCP-specific prefixes (`/mcp` and RFC 9728 discovery endpoints), allowing Grafana web routes (`/`) to operate concurrently on the same Gateway without conflicts:
 
 ```yaml
 httpRoute:
@@ -145,11 +146,10 @@ httpRoute:
       sectionName: http
   hostnames:
     - mcp.company.com
-  rules:
-    - matches:
-        - path:
-            type: PathPrefix
-            value: /
+  # pathPrefixes defaults to:
+  # - /mcp
+  # - /.well-known/oauth-protected-resource
+  # - /.well-known/oauth-authorization-server
 ```
 
 ---
@@ -183,7 +183,8 @@ httpRoute:
 | `httpRoute.enabled` | Enable Kubernetes Gateway API HTTPRoute resource (v1) | `false` |
 | `httpRoute.parentRefs` | Gateway parent references for HTTPRoute attachment | `[{"name": "eg"}]` |
 | `httpRoute.hostnames` | Hostnames matched by this HTTPRoute | `["mcp.company.com"]` |
-| `httpRoute.rules` | Custom routing rules (defaults to prefix `/` if omitted) | `[]` |
+| `httpRoute.pathPrefixes` | Specific path prefixes directed to MCP (avoids conflict with Grafana root `/`) | `["/mcp", "/.well-known/oauth-protected-resource", "/.well-known/oauth-authorization-server"]` |
+| `httpRoute.rules` | Advanced custom routing rules (overrides `pathPrefixes` if specified) | `[]` |
 | `serviceAccount.create` | Create dedicated ServiceAccount | `true` |
 | `hpa.enabled` | Enable HorizontalPodAutoscaler | `false` |
 | `serviceMonitor.enabled` | Enable Prometheus Operator ServiceMonitor | `false` |
