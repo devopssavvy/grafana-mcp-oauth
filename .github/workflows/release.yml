@@ -63,6 +63,11 @@ jobs:
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true
           cache-from: type=gha,scope=buildx-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=buildx-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.title=grafana-mcp-oauth
+            org.opencontainers.image.description=Zero-Fork OAuth 2.1 & RFC 9728 authentication layer for upstream Grafana MCP server
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.licenses=Apache-2.0
 
       - name: Export digest
         run: |

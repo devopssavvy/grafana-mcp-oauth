@@ -2,7 +2,7 @@ apiVersion: v2
 name: grafana-mcp
 description: Model Context Protocol (MCP) server for Grafana with integrated OAuth 2.1 proxy sidecar and secure Valkey session storage.
 type: application
-version: 0.1.2
+version: 0.1.3
 appVersion: "v0.1.1"
 kubeVersion: ">=1.25.0-0"
 home: https://github.com/devopssavvy/grafana-mcp-oauth
@@ -19,3 +19,8 @@ dependencies:
     version: "1.0.0"
     repository: "https://valkey.io/valkey-helm/"
     condition: valkey.enabled
+annotations:
+  org.opencontainers.image.title: "grafana-mcp"
+  org.opencontainers.image.description: "Model Context Protocol (MCP) server for Grafana with integrated OAuth 2.1 proxy sidecar and secure Valkey session storage."
+  org.opencontainers.image.source: "https://github.com/devopssavvy/grafana-mcp-oauth"
+  org.opencontainers.image.licenses: "Apache-2.0"

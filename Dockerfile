@@ -22,6 +22,11 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
 # Pinned to immutable cryptographic digest for zero-vulnerability static base
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 
+LABEL org.opencontainers.image.title="grafana-mcp-oauth" \
+      org.opencontainers.image.description="Zero-Fork OAuth 2.1 & RFC 9728 authentication layer for upstream Grafana MCP server" \
+      org.opencontainers.image.source="https://github.com/devopssavvy/grafana-mcp-oauth" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
 WORKDIR /app
 
 COPY --from=builder /app/grafana-mcp-oauth /app/grafana-mcp-oauth
