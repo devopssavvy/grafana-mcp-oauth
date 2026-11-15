@@ -76,6 +76,7 @@
           },
           "required": ["repository", "tag"]
         },
+        "listenAddress": { "type": "string" },
         "disableWrite": { "type": "boolean" },
         "disabledCategories": {
           "type": "array",
@@ -162,6 +163,20 @@
         "labels": { "type": "object" },
         "hosts": { "type": "array" },
         "tls": { "type": "array" }
+      }
+    },
+    "httpRoute": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "annotations": { "type": "object" },
+        "labels": { "type": "object" },
+        "parentRefs": { "type": "array" },
+        "hostnames": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "rules": { "type": "array" }
       }
     },
     "serviceAccount": {

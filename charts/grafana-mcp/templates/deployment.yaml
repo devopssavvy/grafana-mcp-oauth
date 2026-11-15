@@ -158,11 +158,9 @@ spec:
           imagePullPolicy: {{ .Values.mcpGrafana.image.pullPolicy | default .Values.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.mcpGrafana.containerSecurityContext | nindent 12 }}
-          ports:
-            - name: mcp-internal
-              containerPort: 8000
-              protocol: TCP
           args:
+            - "--address"
+            - {{ .Values.mcpGrafana.listenAddress | default "127.0.0.1:8000" | quote }}
             - "--base-path"
             - "/mcp"
             {{- if .Values.debug }}
@@ -186,15 +184,21 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
           readinessProbe:
-            tcpSocket:
-              port: 8000
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - echo > /dev/tcp/127.0.0.1/8000
             initialDelaySeconds: 5
             periodSeconds: 5
             timeoutSeconds: 2
             failureThreshold: 5
           livenessProbe:
-            tcpSocket:
-              port: 8000
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - echo > /dev/tcp/127.0.0.1/8000
             initialDelaySeconds: 10
             periodSeconds: 10
             timeoutSeconds: 2

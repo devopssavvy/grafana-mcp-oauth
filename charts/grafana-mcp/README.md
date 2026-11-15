@@ -132,6 +132,26 @@ ingress:
         - mcp.company.com
 ```
 
+### Example C: Kubernetes Gateway API (HTTPRoute)
+
+Deploy with Kubernetes Gateway API (`gateway.networking.k8s.io/v1`) using Envoy Gateway, Cilium, or Istio:
+
+```yaml
+httpRoute:
+  enabled: true
+  parentRefs:
+    - name: eg
+      namespace: default
+      sectionName: http
+  hostnames:
+    - mcp.company.com
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+```
+
 ---
 
 ## 5. Values Reference
@@ -147,6 +167,7 @@ ingress:
 | `oauthProxy.masterSecret` | Optional static encryption secret (minimum 16 bytes). Omit for zero-knowledge mode | `""` |
 | `mcpGrafana.image.repository` | Image repository for stock `mcp-grafana` | `grafana/mcp-grafana` |
 | `mcpGrafana.image.tag` | Image tag for stock `mcp-grafana` | `"2.3.0"` |
+| `mcpGrafana.listenAddress` | Internal listen address strictly bound to loopback | `"127.0.0.1:8000"` |
 | `mcpGrafana.disableWrite` | Disable write operations to Grafana | `false` |
 | `mcpGrafana.disabledCategories` | Categories to disable (e.g. `[oncall, incident]`) | `[]` |
 | `grafana.url` | Internal Grafana endpoint reachable by the pod | `"http://grafana:3000"` |
@@ -159,6 +180,10 @@ ingress:
 | `service.type` | Kubernetes Service type | `ClusterIP` |
 | `service.port` | External service port mapping to proxy `:8080` | `80` |
 | `ingress.enabled` | Enable Kubernetes Ingress resource | `false` |
+| `httpRoute.enabled` | Enable Kubernetes Gateway API HTTPRoute resource (v1) | `false` |
+| `httpRoute.parentRefs` | Gateway parent references for HTTPRoute attachment | `[]` |
+| `httpRoute.hostnames` | Hostnames matched by this HTTPRoute | `["mcp.company.com"]` |
+| `httpRoute.rules` | Custom routing rules (defaults to prefix `/` if omitted) | `[]` |
 | `serviceAccount.create` | Create dedicated ServiceAccount | `true` |
 | `hpa.enabled` | Enable HorizontalPodAutoscaler | `false` |
 | `serviceMonitor.enabled` | Enable Prometheus Operator ServiceMonitor | `false` |
