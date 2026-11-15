@@ -78,8 +78,10 @@ func ValidateRedirectURI(doc *Document, requestedURI string) bool {
 				continue
 			}
 			if isLoopbackHost(allowU.Hostname()) {
-				// Scheme and path must match for loopback (treating empty path and / identically)
-				if strings.EqualFold(allowU.Scheme, reqU.Scheme) && normalizePath(allowU.Path) == normalizePath(reqU.Path) {
+				// RFC 8252 Section 7.3: Scheme, host, and path must match; only port can vary
+				if strings.EqualFold(allowU.Scheme, reqU.Scheme) &&
+					strings.EqualFold(allowU.Hostname(), reqU.Hostname()) &&
+					normalizePath(allowU.Path) == normalizePath(reqU.Path) {
 					return true
 				}
 			}

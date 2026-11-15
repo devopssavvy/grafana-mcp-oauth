@@ -75,6 +75,15 @@ func (f *Fetcher) Fetch(ctx context.Context, clientID string) (*Document, error)
 	if u.Hostname() == "" {
 		return nil, fmt.Errorf("client_id must have a valid host")
 	}
+	if u.Path == "" || u.Path == "/" {
+		return nil, fmt.Errorf("client_id must contain a path component")
+	}
+	if strings.Contains(u.Path, "/.") || strings.Contains(u.Path, "/..") {
+		return nil, fmt.Errorf("client_id path must not contain relative dot-segments")
+	}
+	if u.RawQuery != "" {
+		return nil, fmt.Errorf("client_id must not contain query parameters")
+	}
 
 	// 2. Check Cache
 	if doc, ok := f.cache.Get(clientID); ok {
@@ -117,12 +126,23 @@ func (f *Fetcher) Fetch(ctx context.Context, clientID string) (*Document, error)
 		return nil, fmt.Errorf("invalid client metadata document: %w", err)
 	}
 
-	// 5. Cache with TTL
-	ttl := f.cfg.DefaultTTL
-	if maxAge, ok := parseCacheControlMaxAge(resp.Header.Get("Cache-Control")); ok {
-		ttl = maxAge
+	// 5. Cache with TTL unless Cache-Control prohibits it
+	ccHeader := strings.ToLower(resp.Header.Get("Cache-Control"))
+	shouldCache := !strings.Contains(ccHeader, "no-store") && !strings.Contains(ccHeader, "no-cache")
+
+	if shouldCache {
+		ttl := f.cfg.DefaultTTL
+		if maxAge, ok := parseCacheControlMaxAge(resp.Header.Get("Cache-Control")); ok {
+			if maxAge <= 0 {
+				shouldCache = false
+			} else {
+				ttl = maxAge
+			}
+		}
+		if shouldCache {
+			f.cache.Set(clientID, &doc, ttl)
+		}
 	}
-	f.cache.Set(clientID, &doc, ttl)
 
 	return &doc, nil
 }
@@ -138,7 +158,10 @@ func parseCacheControlMaxAge(header string) (time.Duration, bool) {
 		if strings.HasPrefix(lower, "max-age=") {
 			valStr := strings.TrimPrefix(lower, "max-age=")
 			valStr = strings.TrimSpace(valStr)
-			if sec, err := strconv.Atoi(valStr); err == nil && sec > 0 {
+			if sec, err := strconv.Atoi(valStr); err == nil {
+				if sec <= 0 {
+					return 0, true
+				}
 				d := time.Duration(sec) * time.Second
 				if d < 1*time.Minute {
 					d = 1 * time.Minute

@@ -111,6 +111,10 @@ func TestValidateRedirectURI(t *testing.T) {
 		assert.True(t, cimd.ValidateRedirectURI(doc, "http://localhost:38291/mcp-auth"))
 		assert.True(t, cimd.ValidateRedirectURI(doc, "http://localhost/mcp-auth"))
 
+		// Hostname mismatch between 127.0.0.1 and localhost is rejected per RFC 8252 Section 7.3
+		assert.False(t, cimd.ValidateRedirectURI(doc, "http://localhost:54321/callback"))
+		assert.False(t, cimd.ValidateRedirectURI(doc, "http://127.0.0.1:38291/mcp-auth"))
+
 		// Mismatched path
 		assert.False(t, cimd.ValidateRedirectURI(doc, "http://127.0.0.1:54321/wrong-path"))
 
@@ -185,6 +189,31 @@ func TestMemoryCache(t *testing.T) {
 	assert.False(t, ok)
 }
 
+func TestMemoryCache_CapacityAndPruning(t *testing.T) {
+	// Create cache bounded to 3 entries
+	cache := cimd.NewMemoryCacheWithCapacity(3)
+	doc := &cimd.Document{ClientID: "https://example.com/client.json"}
+
+	// Fill to capacity
+	cache.Set("https://example.com/1.json", doc, 1*time.Hour)
+	cache.Set("https://example.com/2.json", doc, 50*time.Millisecond)
+	cache.Set("https://example.com/3.json", doc, 1*time.Hour)
+	assert.Equal(t, 3, cache.Len())
+
+	// Wait for entry 2 to expire
+	time.Sleep(60 * time.Millisecond)
+
+	// Inserting a 4th entry should trigger expired entry pruning and fit
+	cache.Set("https://example.com/4.json", doc, 1*time.Hour)
+	assert.LessOrEqual(t, cache.Len(), 3)
+	_, ok := cache.Get("https://example.com/4.json")
+	assert.True(t, ok)
+
+	// Explicit CleanupExpired
+	cache.CleanupExpired()
+	assert.LessOrEqual(t, cache.Len(), 3)
+}
+
 func TestFetcher_Fetch(t *testing.T) {
 	var requestCount int64
 
@@ -197,6 +226,28 @@ func TestFetcher_Fetch(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"client_id":     fmt.Sprintf("http://%s/oauth/client.json", r.Host),
 				"client_name":   "My Coding Agent",
+				"redirect_uris": []string{"http://127.0.0.1/callback"},
+			})
+			return
+		}
+
+		if r.URL.Path == "/no-store/client.json" {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"client_id":     fmt.Sprintf("http://%s/no-store/client.json", r.Host),
+				"client_name":   "No Store Agent",
+				"redirect_uris": []string{"http://127.0.0.1/callback"},
+			})
+			return
+		}
+
+		if r.URL.Path == "/max-age-zero/client.json" {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "max-age=0")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"client_id":     fmt.Sprintf("http://%s/max-age-zero/client.json", r.Host),
+				"client_name":   "Max Age Zero Agent",
 				"redirect_uris": []string{"http://127.0.0.1/callback"},
 			})
 			return
@@ -239,6 +290,56 @@ func TestFetcher_Fetch(t *testing.T) {
 		_, err := f.Fetch(context.Background(), "http://example.com/client.json#section")
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "must not contain a URL fragment")
+	})
+
+	t.Run("bare domain without path is rejected", func(t *testing.T) {
+		f := cimd.NewFetcher(cimd.FetcherConfig{AllowInsecureHTTP: true})
+		_, err := f.Fetch(context.Background(), "http://example.com")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "must contain a path component")
+	})
+
+	t.Run("relative dot-segments in path are rejected", func(t *testing.T) {
+		f := cimd.NewFetcher(cimd.FetcherConfig{AllowInsecureHTTP: true})
+		_, err := f.Fetch(context.Background(), "http://example.com/a/../client.json")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "relative dot-segments")
+	})
+
+	t.Run("query parameters in URL are rejected", func(t *testing.T) {
+		f := cimd.NewFetcher(cimd.FetcherConfig{AllowInsecureHTTP: true})
+		_, err := f.Fetch(context.Background(), "http://example.com/client.json?param=1")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "query parameters")
+	})
+
+	t.Run("no-store and max-age=0 are not cached", func(t *testing.T) {
+		f := cimd.NewFetcher(cimd.FetcherConfig{
+			AllowInsecureHTTP: true,
+			HTTPClient:        server.Client(),
+		})
+
+		noStoreURL := fmt.Sprintf("%s/no-store/client.json", server.URL)
+		c1 := atomic.LoadInt64(&requestCount)
+		_, err := f.Fetch(context.Background(), noStoreURL)
+		require.NoError(t, err)
+		assert.Equal(t, c1+1, atomic.LoadInt64(&requestCount))
+
+		// Second fetch must NOT hit cache
+		_, err = f.Fetch(context.Background(), noStoreURL)
+		require.NoError(t, err)
+		assert.Equal(t, c1+2, atomic.LoadInt64(&requestCount), "no-store document must not be cached")
+
+		maxAgeZeroURL := fmt.Sprintf("%s/max-age-zero/client.json", server.URL)
+		c2 := atomic.LoadInt64(&requestCount)
+		_, err = f.Fetch(context.Background(), maxAgeZeroURL)
+		require.NoError(t, err)
+		assert.Equal(t, c2+1, atomic.LoadInt64(&requestCount))
+
+		// Second fetch must NOT hit cache
+		_, err = f.Fetch(context.Background(), maxAgeZeroURL)
+		require.NoError(t, err)
+		assert.Equal(t, c2+2, atomic.LoadInt64(&requestCount), "max-age=0 document must not be cached")
 	})
 
 	t.Run("successful fetch and caching with AllowInsecureHTTP", func(t *testing.T) {

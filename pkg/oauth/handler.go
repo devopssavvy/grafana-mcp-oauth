@@ -245,14 +245,14 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := h.validateCIMD(r.Context(), clientID, redirectURI); err != nil {
 			h.cfg.Logger.Warn("Login rejected: CIMD validation failed", "client_id", clientID, "error", err)
-			http.Error(w, fmt.Sprintf("invalid_client: %s", err.Error()), http.StatusBadRequest)
+			http.Error(w, "invalid_client: client metadata document could not be fetched or verified", http.StatusBadRequest)
 			return
 		}
 	case "permissive":
 		if clientID != "" && isPossibleURL(clientID) {
 			if err := h.validateCIMD(r.Context(), clientID, redirectURI); err != nil {
 				h.cfg.Logger.Warn("Login rejected in permissive mode: CIMD validation failed", "client_id", clientID, "error", err)
-				http.Error(w, fmt.Sprintf("invalid_client: %s", err.Error()), http.StatusBadRequest)
+				http.Error(w, "invalid_client: client metadata document could not be fetched or verified", http.StatusBadRequest)
 				return
 			}
 		}
@@ -519,9 +519,23 @@ func (h *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 		}
 	}
 
-	// Verify client_id if present in token request
+	// Verify client_id in token request per OAuth 2.1 Section 4.1.3 and CIMD specification
 	reqClientID := r.FormValue("client_id")
-	if reqClientID != "" && authCtx.ClientID != "" {
+	if h.cfg.CIMDEnforcement == "required" {
+		if reqClientID == "" {
+			h.cfg.Logger.Warn("Token exchange rejected: missing client_id parameter", "expected", authCtx.ClientID)
+			sendTokenError(w, http.StatusBadRequest, "invalid_client", "client_id parameter is required")
+			return
+		}
+		if subtle.ConstantTimeCompare([]byte(reqClientID), []byte(authCtx.ClientID)) != 1 {
+			h.cfg.Logger.Warn("Token exchange rejected due to client_id mismatch",
+				"expected", authCtx.ClientID,
+				"received", reqClientID,
+			)
+			sendTokenError(w, http.StatusBadRequest, "invalid_grant", "client_id mismatch")
+			return
+		}
+	} else if reqClientID != "" && authCtx.ClientID != "" {
 		if subtle.ConstantTimeCompare([]byte(reqClientID), []byte(authCtx.ClientID)) != 1 {
 			h.cfg.Logger.Warn("Token exchange rejected due to client_id mismatch",
 				"expected", authCtx.ClientID,

@@ -546,7 +546,7 @@ func TestHandler_CIMD_Enforcement(t *testing.T) {
 		h.HandleLogin(rec, req)
 
 		assert.Equal(t, http.StatusBadRequest, rec.Code)
-		assert.Contains(t, rec.Body.String(), "not authorized in client metadata document")
+		assert.Contains(t, rec.Body.String(), "client metadata document could not be fetched or verified")
 	})
 
 	t.Run("required mode: valid CIMD with dynamic loopback port succeeds", func(t *testing.T) {
@@ -671,6 +671,61 @@ func TestHandler_CIMD_Enforcement(t *testing.T) {
 
 		assert.Equal(t, http.StatusBadRequest, tokRec.Code)
 		assert.Contains(t, tokRec.Body.String(), "client_id mismatch")
+	})
+
+	t.Run("token exchange missing client_id under required mode is rejected", func(t *testing.T) {
+		h := oauth.NewHandler(oauth.Config{
+			BaseURL:               "http://localhost:8080",
+			GrafanaURL:            mockGrafana.URL,
+			CIMDEnforcement:       "required",
+			CIMDAllowInsecureHTTP: true,
+		}, st)
+		defer h.Close()
+
+		loginURI := fmt.Sprintf("/mcp/auth/login?client_id=%s&redirect_uri=%s&code_challenge=%s&code_challenge_method=S256",
+			url.QueryEscape(validClientID),
+			url.QueryEscape("http://127.0.0.1:59182/callback"),
+			challenge,
+		)
+		req := httptest.NewRequest(http.MethodGet, loginURI, nil)
+		rec := httptest.NewRecorder()
+		h.HandleLogin(rec, req)
+		require.Equal(t, http.StatusFound, rec.Code)
+
+		var stateCookie *http.Cookie
+		for _, c := range rec.Result().Cookies() {
+			if c.Name == "mcp_auth_state" {
+				stateCookie = c
+				break
+			}
+		}
+		require.NotNil(t, stateCookie)
+
+		cbReq := httptest.NewRequest(http.MethodGet, "/mcp/auth/callback?mcp_state="+stateCookie.Value, nil)
+		cbReq.AddCookie(stateCookie)
+		cbReq.AddCookie(&http.Cookie{Name: "grafana_session", Value: "valid_session_12345"})
+		cbRec := httptest.NewRecorder()
+		h.HandleCallback(cbRec, cbReq)
+		require.Equal(t, http.StatusFound, cbRec.Code)
+
+		u, err := url.Parse(cbRec.Header().Get("Location"))
+		require.NoError(t, err)
+		authCode := u.Query().Get("code")
+
+		// Token exchange without client_id parameter
+		tokenBody := url.Values{
+			"grant_type":    {"authorization_code"},
+			"code":          {authCode},
+			"code_verifier": {verifier},
+			"redirect_uri":  {"http://127.0.0.1:59182/callback"},
+		}
+		tokReq := httptest.NewRequest(http.MethodPost, "/mcp/auth/token", strings.NewReader(tokenBody.Encode()))
+		tokReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		tokRec := httptest.NewRecorder()
+		h.HandleToken(tokRec, tokReq)
+
+		assert.Equal(t, http.StatusBadRequest, tokRec.Code)
+		assert.Contains(t, tokRec.Body.String(), "client_id parameter is required")
 	})
 
 	t.Run("RFC 8414 metadata advertises CIMD support", func(t *testing.T) {

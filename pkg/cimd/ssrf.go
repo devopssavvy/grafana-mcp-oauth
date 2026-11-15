@@ -148,19 +148,25 @@ func NewSSRFSafeClient(timeout time.Duration, allowLoopback bool) *http.Client {
 			}
 
 			// Check all resolved IPs; if any is blocked, reject
-			var safeIP net.IP
+			var safeIPs []net.IP
 			for _, ip := range ips {
 				if IsBlockedIP(ip, allowLoopback) {
 					return nil, fmt.Errorf("host %s resolved to blocked IP %s", host, ip)
 				}
-				if safeIP == nil {
-					safeIP = ip
-				}
+				safeIPs = append(safeIPs, ip)
 			}
 
-			// Dial the validated IP directly to prevent DNS rebinding
-			safeAddr := net.JoinHostPort(safeIP.String(), port)
-			return dialer.DialContext(ctx, network, safeAddr)
+			// Dial validated safe IPs with fallback (dual-stack IPv6/IPv4 support)
+			var lastErr error
+			for _, sip := range safeIPs {
+				safeAddr := net.JoinHostPort(sip.String(), port)
+				conn, err := dialer.DialContext(ctx, network, safeAddr)
+				if err == nil {
+					return conn, nil
+				}
+				lastErr = err
+			}
+			return nil, fmt.Errorf("failed to connect to resolved IPs for %s: %w", host, lastErr)
 		},
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
