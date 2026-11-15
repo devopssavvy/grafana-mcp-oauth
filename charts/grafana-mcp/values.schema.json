@@ -176,6 +176,10 @@
           "type": "array",
           "items": { "type": "string" }
         },
+        "pathPrefixes": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
         "rules": { "type": "array" }
       }
     },

@@ -225,7 +225,11 @@ ingress:
   hosts:
     - host: mcp.company.com
       paths:
-        - path: /
+        - path: /mcp
+          pathType: Prefix
+        - path: /.well-known/oauth-protected-resource
+          pathType: Prefix
+        - path: /.well-known/oauth-authorization-server
           pathType: Prefix
   tls: []
 
@@ -254,12 +258,20 @@ httpRoute:
   hostnames:
     - mcp.company.com
 
-  # -- Custom routing rules. If empty, defaults to prefix "/" routing to grafana-mcp service
+  # -- Specific path prefixes directed to the MCP proxy.
+  # Defaults to MCP endpoints (/mcp and RFC 9728 discovery) to avoid conflicting with
+  # Grafana web routes (/) when sharing the same Gateway or hostname.
+  pathPrefixes:
+    - /mcp
+    - /.well-known/oauth-protected-resource
+    - /.well-known/oauth-authorization-server
+
+  # -- Advanced custom routing rules (overrides pathPrefixes if specified).
   rules: []
   #   - matches:
   #       - path:
   #           type: PathPrefix
-  #           value: /
+  #           value: /mcp
   #     # backendRefs is optional and automatically defaults to the chart's generated Service if omitted
   #     backendRefs:
   #       - name: my-custom-service

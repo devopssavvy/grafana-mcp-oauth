@@ -38,11 +38,19 @@ RENDERED_GW=$(helm template test-gateway "${CHART_DIR}" \
 
 grep -q "kind: HTTPRoute" <<< "${RENDERED_GW}" || { echo "HTTPRoute resource not found in rendered manifest"; exit 1; }
 grep -q "name: test-gateway-grafana-mcp" <<< "${RENDERED_GW}" || { echo "HTTPRoute name mismatch"; exit 1; }
+grep -q "value: /mcp" <<< "${RENDERED_GW}" || { echo "HTTPRoute default /mcp prefix not found"; exit 1; }
+grep -q "value: /.well-known/oauth-protected-resource" <<< "${RENDERED_GW}" || { echo "HTTPRoute default OAuth discovery prefix not found"; exit 1; }
 grep -q -- "--address" <<< "${RENDERED_GW}" || { echo "mcp-grafana --address flag not found"; exit 1; }
 grep -q "127.0.0.1:8000" <<< "${RENDERED_GW}" || { echo "127.0.0.1:8000 not found"; exit 1; }
 grep -q "/dev/tcp/127.0.0.1/8000" <<< "${RENDERED_GW}" || { echo "exec probe not found"; exit 1; }
 if grep -q "containerPort: 8000" <<< "${RENDERED_GW}"; then
   echo "Security violation: containerPort 8000 should not be exposed on internal mcp container"; exit 1;
+fi
+
+# Ensure default HTTPRoute does NOT route root / (which would collide with Grafana web UI)
+HTTPROUTE_MATCHES=$(echo "${RENDERED_GW}" | sed -n '/kind: HTTPRoute/,/kind:/p')
+if echo "${HTTPROUTE_MATCHES}" | grep -E "^\s+value: /$"; then
+  echo "Routing conflict: HTTPRoute default matches root / which conflicts with Grafana"; exit 1;
 fi
 
 echo "=== 4. Ephemeral KinD Mock Cluster Deployment Test ==="

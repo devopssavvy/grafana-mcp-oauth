@@ -51,9 +51,11 @@ spec:
     {{- end }}
     {{- else }}
     - matches:
+        {{- range (.Values.httpRoute.pathPrefixes | default (list "/mcp" "/.well-known/oauth-protected-resource" "/.well-known/oauth-authorization-server")) }}
         - path:
             type: PathPrefix
-            value: /
+            value: {{ . }}
+        {{- end }}
       backendRefs:
         - name: {{ $fullName }}
           port: {{ $svcPort }}
