@@ -87,7 +87,7 @@ spec:
             - name: GRAFANA_PUBLIC_URL
               value: {{ .Values.oauthProxy.grafanaPublicUrl | default .Values.grafana.url | quote }}
             - name: TARGET_MCP_URL
-              value: "http://127.0.0.1:8000"
+              value: {{ printf "http://%s" (.Values.mcpGrafana.listenAddress | default "127.0.0.1:8000") | quote }}
             - name: REDIS_ADDR
               value: {{ include "grafana-mcp.redisAddr" . | quote }}
             - name: REDIS_PASSWORD
@@ -188,7 +188,7 @@ spec:
               command:
                 - /bin/bash
                 - -c
-                - echo > /dev/tcp/127.0.0.1/8000
+                - echo > /dev/tcp/{{ replace ":" "/" (.Values.mcpGrafana.listenAddress | default "127.0.0.1:8000") }}
             initialDelaySeconds: 5
             periodSeconds: 5
             timeoutSeconds: 2
@@ -198,7 +198,7 @@ spec:
               command:
                 - /bin/bash
                 - -c
-                - echo > /dev/tcp/127.0.0.1/8000
+                - echo > /dev/tcp/{{ replace ":" "/" (.Values.mcpGrafana.listenAddress | default "127.0.0.1:8000") }}
             initialDelaySeconds: 10
             periodSeconds: 10
             timeoutSeconds: 2

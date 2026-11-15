@@ -260,8 +260,9 @@ httpRoute:
   #       - path:
   #           type: PathPrefix
   #           value: /
+  #     # backendRefs is optional and automatically defaults to the chart's generated Service if omitted
   #     backendRefs:
-  #       - name: grafana-mcp
+  #       - name: my-custom-service
   #         port: 80
 
 # ==============================================================================

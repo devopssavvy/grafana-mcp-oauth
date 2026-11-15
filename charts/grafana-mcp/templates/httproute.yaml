@@ -28,7 +28,8 @@ spec:
   rules:
     {{- if .Values.httpRoute.rules }}
     {{- range .Values.httpRoute.rules }}
-    - {{- with .matches }}
+    -
+      {{- with .matches }}
       matches:
         {{- toYaml . | nindent 8 }}
       {{- end }}

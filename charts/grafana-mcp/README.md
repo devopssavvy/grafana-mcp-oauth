@@ -181,7 +181,7 @@ httpRoute:
 | `service.port` | External service port mapping to proxy `:8080` | `80` |
 | `ingress.enabled` | Enable Kubernetes Ingress resource | `false` |
 | `httpRoute.enabled` | Enable Kubernetes Gateway API HTTPRoute resource (v1) | `false` |
-| `httpRoute.parentRefs` | Gateway parent references for HTTPRoute attachment | `[]` |
+| `httpRoute.parentRefs` | Gateway parent references for HTTPRoute attachment | `[{"name": "eg"}]` |
 | `httpRoute.hostnames` | Hostnames matched by this HTTPRoute | `["mcp.company.com"]` |
 | `httpRoute.rules` | Custom routing rules (defaults to prefix `/` if omitted) | `[]` |
 | `serviceAccount.create` | Create dedicated ServiceAccount | `true` |
