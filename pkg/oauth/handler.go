@@ -37,6 +37,7 @@ type Config struct {
 	AuthCodeTTL           time.Duration
 	RateLimitLoginRPM     int           // Max requests per minute per IP for /mcp/auth/login (default: 60)
 	RateLimitTokenRPM     int           // Max requests per minute per IP for /mcp/auth/token (default: 120)
+	TrustedProxies        []*net.IPNet  // Parsed CIDRs/IPs allowed to supply X-Forwarded-For headers
 	CIMDEnforcement       string        // "required", "permissive", "disabled" (default: "required")
 	CIMDAllowInsecureHTTP bool          // Allow http:// and loopback IPs for testing/dev
 	CIMDCacheTTL          time.Duration // Cache TTL for CIMD metadata
@@ -202,7 +203,7 @@ func (h *Handler) HandleAuthorizationServerMetadata(w http.ResponseWriter, r *ht
 // HandleLogin initiates browser SSO by redirecting to Grafana generic OAuth.
 func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	// Rate limiting: 60 requests per minute per IP to prevent state table flooding DoS
-	clientIP := ExtractClientIP(r)
+	clientIP := ExtractClientIP(r, h.cfg.TrustedProxies)
 	if h.loginLimiter != nil && !h.loginLimiter.Allow(clientIP) {
 		h.cfg.Logger.Warn("Rate limit exceeded on /mcp/auth/login", "client_ip", clientIP)
 		w.Header().Set("Retry-After", "60")
@@ -292,7 +293,7 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		Path:     "/mcp/auth",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   true,
+		Secure:   h.cfg.CookieSecure,
 		MaxAge:   int(h.cfg.PendingAuthTTL.Seconds()),
 	})
 
@@ -339,7 +340,7 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		Path:     "/mcp/auth",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   true,
+		Secure:   h.cfg.CookieSecure,
 		MaxAge:   -1,
 	})
 
@@ -459,7 +460,7 @@ func (h *Handler) HandleToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Rate limiting: 120 requests per minute per IP to prevent brute-force and resource exhaustion DoS
-	clientIP := ExtractClientIP(r)
+	clientIP := ExtractClientIP(r, h.cfg.TrustedProxies)
 	if h.tokenLimiter != nil && !h.tokenLimiter.Allow(clientIP) {
 		h.cfg.Logger.Warn("Rate limit exceeded on /mcp/auth/token", "client_ip", clientIP)
 		w.Header().Set("Retry-After", "60")
@@ -573,6 +574,7 @@ func (h *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 		UserID:         fmt.Sprintf("%d", authCtx.UserInfo.ID),
 		Username:       authCtx.UserInfo.Login,
 		Email:          authCtx.UserInfo.Email,
+		ClientID:       authCtx.ClientID,
 		GrafanaSession: authCtx.GrafanaSession,
 		RefreshToken:   refreshToken,
 		UserClaims: map[string]interface{}{
@@ -630,6 +632,24 @@ func (h *Handler) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		sendTokenError(w, http.StatusUnauthorized, "invalid_grant", "refresh token is invalid, expired, or already used")
 		return
+	}
+
+	// Verify client_id binding per OAuth 2.1 Section 4.3.2 and CIMD specification
+	reqClientID := r.FormValue("client_id")
+	if h.cfg.CIMDEnforcement == "required" {
+		if reqClientID == "" {
+			sendTokenError(w, http.StatusBadRequest, "invalid_client", "client_id parameter is required")
+			return
+		}
+		if session.ClientID != "" && subtle.ConstantTimeCompare([]byte(reqClientID), []byte(session.ClientID)) != 1 {
+			sendTokenError(w, http.StatusBadRequest, "invalid_grant", "client_id mismatch")
+			return
+		}
+	} else if reqClientID != "" && session.ClientID != "" {
+		if subtle.ConstantTimeCompare([]byte(reqClientID), []byte(session.ClientID)) != 1 {
+			sendTokenError(w, http.StatusBadRequest, "invalid_grant", "client_id mismatch")
+			return
+		}
 	}
 
 	// Active upstream session verification: Verify that the Grafana session is still alive in Grafana

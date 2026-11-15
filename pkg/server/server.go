@@ -156,6 +156,7 @@ func New(opts Options) (*Server, error) {
 		CIMDAllowInsecureHTTP: cfg.CIMDAllowInsecureHTTP,
 		CIMDCacheTTL:          cfg.CIMDCacheTTL,
 		CIMDCache:             cimdCache,
+		TrustedProxies:        cfg.TrustedProxies,
 		Logger:                logger,
 	}, sessionStore)
 

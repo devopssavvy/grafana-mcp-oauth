@@ -87,27 +87,48 @@ func (l *IPRateLimiter) Close() {
 	})
 }
 
-// ExtractClientIP extracts the client IP from request headers or RemoteAddr.
-func ExtractClientIP(r *http.Request) string {
-	// If behind a trusted reverse proxy, check X-Forwarded-For
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		if len(parts) > 0 {
-			ip := strings.TrimSpace(parts[0])
-			if net.ParseIP(ip) != nil {
-				return ip
+// ExtractClientIP extracts the client IP from RemoteAddr, or from X-Forwarded-For / X-Real-IP if RemoteAddr is a trusted proxy.
+func ExtractClientIP(r *http.Request, trustedProxies ...[]*net.IPNet) string {
+	remoteIPStr, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil || remoteIPStr == "" {
+		remoteIPStr = r.RemoteAddr
+	}
+	remoteIP := net.ParseIP(remoteIPStr)
+
+	var proxies []*net.IPNet
+	if len(trustedProxies) > 0 {
+		proxies = trustedProxies[0]
+	}
+
+	// Only inspect forwarded headers if remote peer is explicitly in trustedProxies
+	if remoteIP != nil && isTrustedPeer(remoteIP, proxies) {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			parts := strings.Split(xff, ",")
+			if len(parts) > 0 {
+				ip := strings.TrimSpace(parts[0])
+				if net.ParseIP(ip) != nil {
+					return ip
+				}
+			}
+		}
+		if xri := r.Header.Get("X-Real-IP"); xri != "" {
+			if net.ParseIP(xri) != nil {
+				return xri
 			}
 		}
 	}
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		if net.ParseIP(xri) != nil {
-			return xri
+
+	return remoteIPStr
+}
+
+func isTrustedPeer(ip net.IP, trustedProxies []*net.IPNet) bool {
+	if len(trustedProxies) == 0 || ip == nil {
+		return false
+	}
+	for _, cidr := range trustedProxies {
+		if cidr.Contains(ip) {
+			return true
 		}
 	}
-
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil && host != "" {
-		return host
-	}
-	return r.RemoteAddr
+	return false
 }

@@ -1,11 +1,13 @@
 package config_test
 
 import (
+	"net"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"grafana-mcp-oauth/pkg/config"
 )
 
@@ -172,5 +174,48 @@ func TestLoadFromEnv_CIMD(t *testing.T) {
 		t.Setenv("CIMD_CACHE_TTL", "30m")
 		cfg := config.LoadFromEnv()
 		assert.Equal(t, 30*time.Minute, cfg.CIMDCacheTTL)
+	})
+}
+
+func TestParseTrustedProxies(t *testing.T) {
+	t.Run("empty string returns nil", func(t *testing.T) {
+		assert.Nil(t, config.ParseTrustedProxies(""))
+		assert.Nil(t, config.ParseTrustedProxies("   "))
+	})
+
+	t.Run("single IPv4 single IPv6 and CIDRs", func(t *testing.T) {
+		res := config.ParseTrustedProxies("192.168.1.1, 10.0.0.0/8, ::1, 2001:db8::/32")
+		require.Len(t, res, 4)
+		assert.True(t, res[0].Contains(net.ParseIP("192.168.1.1")))
+		assert.False(t, res[0].Contains(net.ParseIP("192.168.1.2")))
+		assert.True(t, res[1].Contains(net.ParseIP("10.5.1.2")))
+		assert.False(t, res[1].Contains(net.ParseIP("172.16.0.1")))
+		assert.True(t, res[2].Contains(net.ParseIP("::1")))
+		assert.True(t, res[3].Contains(net.ParseIP("2001:db8::1234")))
+	})
+
+	t.Run("invalid entries are skipped", func(t *testing.T) {
+		res := config.ParseTrustedProxies("invalid-entry, 127.0.0.1, 999.999.999.999, 10.0.0.0/8")
+		require.Len(t, res, 2)
+		assert.True(t, res[0].Contains(net.ParseIP("127.0.0.1")))
+		assert.True(t, res[1].Contains(net.ParseIP("10.1.2.3")))
+	})
+}
+
+func TestLoadFromEnv_TrustedProxies(t *testing.T) {
+	t.Run("default is empty/nil", func(t *testing.T) {
+		os.Unsetenv("TRUSTED_PROXIES")
+		cfg := config.LoadFromEnv()
+		assert.Nil(t, cfg.TrustedProxies)
+		assert.Empty(t, cfg.TrustedProxiesRaw)
+	})
+
+	t.Run("loaded from environment variable", func(t *testing.T) {
+		t.Setenv("TRUSTED_PROXIES", "10.0.0.0/8, 172.16.0.0/12")
+		cfg := config.LoadFromEnv()
+		assert.Equal(t, "10.0.0.0/8, 172.16.0.0/12", cfg.TrustedProxiesRaw)
+		require.Len(t, cfg.TrustedProxies, 2)
+		assert.True(t, cfg.TrustedProxies[0].Contains(net.ParseIP("10.10.10.10")))
+		assert.True(t, cfg.TrustedProxies[1].Contains(net.ParseIP("172.16.5.5")))
 	})
 }
