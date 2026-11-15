@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"log/slog"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -39,6 +40,8 @@ type AppConfig struct {
 	AuthCodeTTL                time.Duration
 	RateLimitLoginRPM          int
 	RateLimitTokenRPM          int
+	TrustedProxies             []*net.IPNet  // Parsed CIDRs/IPs allowed to supply X-Forwarded-For headers
+	TrustedProxiesRaw          string        // Raw comma-separated string from TRUSTED_PROXIES
 	CIMDEnforcement            string        // "required" (default), "permissive", "disabled"
 	CIMDAllowInsecureHTTP      bool          // Allow http:// and loopback IPs for testing/dev (default false)
 	CIMDCacheTTL               time.Duration // Cache TTL for fetched CIMD metadata (default 1 hour)
@@ -194,6 +197,9 @@ func LoadFromEnv() *AppConfig {
 		logLevel = slog.LevelError
 	}
 
+	trustedProxiesRaw := getEnv("TRUSTED_PROXIES", "")
+	trustedProxies := ParseTrustedProxies(trustedProxiesRaw)
+
 	return &AppConfig{
 		Mode:                       mode,
 		BaseURL:                    baseURL,
@@ -222,6 +228,8 @@ func LoadFromEnv() *AppConfig {
 		AuthCodeTTL:                time.Duration(authCodeSeconds) * time.Second,
 		RateLimitLoginRPM:          rateLimitLoginRPM,
 		RateLimitTokenRPM:          rateLimitTokenRPM,
+		TrustedProxies:             trustedProxies,
+		TrustedProxiesRaw:          trustedProxiesRaw,
 		CIMDEnforcement:            cimdEnforcement,
 		CIMDAllowInsecureHTTP:      cimdAllowInsecureHTTP,
 		CIMDCacheTTL:               cimdCacheTTL,
@@ -248,4 +256,37 @@ func getEnv(key, defaultVal string) string {
 		return v
 	}
 	return defaultVal
+}
+
+// ParseTrustedProxies parses a comma-separated list of IP addresses or CIDR blocks.
+func ParseTrustedProxies(raw string) []*net.IPNet {
+	var list []*net.IPNet
+	if raw == "" {
+		return list
+	}
+	parts := strings.Split(raw, ",")
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if strings.Contains(p, "/") {
+			_, ipNet, err := net.ParseCIDR(p)
+			if err == nil && ipNet != nil {
+				list = append(list, ipNet)
+			}
+		} else {
+			ip := net.ParseIP(p)
+			if ip != nil {
+				var mask net.IPMask
+				if ip.To4() != nil {
+					mask = net.CIDRMask(32, 32)
+				} else {
+					mask = net.CIDRMask(128, 128)
+				}
+				list = append(list, &net.IPNet{IP: ip, Mask: mask})
+			}
+		}
+	}
+	return list
 }

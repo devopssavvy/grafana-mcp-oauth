@@ -32,6 +32,7 @@ func main() {
 		flagCookieSecure = flag.String("cookie-secure", "", "Force Secure flag on cookies ('true' or 'false') [env: COOKIE_SECURE]")
 		flagTargetMCPURL    = flag.String("target-mcp-url", "", "Upstream stock MCP Server URL for proxying [env: TARGET_MCP_URL]")
 		flagCIMDEnforcement = flag.String("cimd-enforcement", "", "CIMD enforcement mode: 'required' (default), 'permissive', or 'disabled' [env: CIMD_ENFORCEMENT]")
+		flagTrustedProxies  = flag.String("trusted-proxies", "", "Comma-separated list of trusted proxy IPs/CIDRs for X-Forwarded-For [env: TRUSTED_PROXIES]")
 		flagVersion         = flag.Bool("version", false, "Print version and exit")
 	)
 
@@ -62,6 +63,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  CIMD_ENFORCEMENT     CIMD enforcement mode: required (default), permissive, disabled\n")
 		fmt.Fprintf(os.Stderr, "  CIMD_ALLOW_INSECURE_HTTP Allow insecure HTTP and loopback for CIMD in dev (default false)\n")
 		fmt.Fprintf(os.Stderr, "  CIMD_CACHE_TTL       Cache TTL for CIMD metadata (default 1h)\n")
+		fmt.Fprintf(os.Stderr, "  TRUSTED_PROXIES      Comma-separated list of trusted proxy IPs/CIDRs for X-Forwarded-For\n")
 	}
 
 	flag.Parse()
@@ -106,6 +108,10 @@ func main() {
 	}
 	if *flagCIMDEnforcement != "" {
 		cfg.CIMDEnforcement = strings.ToLower(strings.TrimSpace(*flagCIMDEnforcement))
+	}
+	if *flagTrustedProxies != "" {
+		cfg.TrustedProxiesRaw = *flagTrustedProxies
+		cfg.TrustedProxies = config.ParseTrustedProxies(*flagTrustedProxies)
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))

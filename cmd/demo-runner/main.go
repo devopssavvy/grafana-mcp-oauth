@@ -130,6 +130,7 @@ func main() {
 		CallbackBaseURL: "http://127.0.0.1:8080/mcp/auth/callback",
 		SessionTTL:      2 * time.Hour,
 		RefreshTTL:      30 * 24 * time.Hour,
+		RedisClient:     rdb,
 		Logger:          logger,
 	}
 	oauthHandler := oauth.NewHandler(oauthCfg, sessionStore)

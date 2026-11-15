@@ -41,6 +41,9 @@ func ValidateDocument(doc *Document, expectedClientID string) error {
 		if err != nil || !u.IsAbs() {
 			return fmt.Errorf("invalid redirect_uri in document: %q", rawURI)
 		}
+		if !strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https") {
+			return fmt.Errorf("redirect_uri scheme must be http or https, got %q", u.Scheme)
+		}
 		if u.Fragment != "" {
 			return fmt.Errorf("redirect_uri must not contain fragment: %q", rawURI)
 		}

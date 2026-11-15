@@ -19,6 +19,8 @@ import (
 	"grafana-mcp-oauth/pkg/cimd"
 	"grafana-mcp-oauth/pkg/crypto"
 	"grafana-mcp-oauth/pkg/store"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // Config holds configuration parameters for the OAuth handler.
@@ -37,6 +39,8 @@ type Config struct {
 	AuthCodeTTL           time.Duration
 	RateLimitLoginRPM     int           // Max requests per minute per IP for /mcp/auth/login (default: 60)
 	RateLimitTokenRPM     int           // Max requests per minute per IP for /mcp/auth/token (default: 120)
+	TrustedProxies        []*net.IPNet  // Parsed CIDRs/IPs allowed to supply X-Forwarded-For headers
+	RedisClient           redis.UniversalClient // Redis client for distributed rate limiting
 	CIMDEnforcement       string        // "required", "permissive", "disabled" (default: "required")
 	CIMDAllowInsecureHTTP bool          // Allow http:// and loopback IPs for testing/dev
 	CIMDCacheTTL          time.Duration // Cache TTL for CIMD metadata
@@ -50,8 +54,8 @@ type Config struct {
 type Handler struct {
 	cfg          Config
 	store        store.SessionStore
-	loginLimiter *IPRateLimiter
-	tokenLimiter *IPRateLimiter
+	loginLimiter RateLimiter
+	tokenLimiter RateLimiter
 	cimdFetcher  *cimd.Fetcher
 }
 
@@ -131,11 +135,25 @@ func NewHandler(cfg Config, s store.SessionStore) *Handler {
 		})
 	}
 
+	redisClient := cfg.RedisClient
+	if redisClient == nil {
+		if rs, ok := s.(interface{ Client() redis.UniversalClient }); ok {
+			redisClient = rs.Client()
+		}
+	}
+
+	var loginLimiter RateLimiter
+	var tokenLimiter RateLimiter
+	if redisClient != nil {
+		loginLimiter = NewRedisRateLimiter(redisClient, "mcp:ratelimit:login", loginRPM, time.Minute, cfg.Logger)
+		tokenLimiter = NewRedisRateLimiter(redisClient, "mcp:ratelimit:token", tokenRPM, time.Minute, cfg.Logger)
+	}
+
 	return &Handler{
 		cfg:          cfg,
 		store:        s,
-		loginLimiter: NewIPRateLimiter(loginRPM, time.Minute),
-		tokenLimiter: NewIPRateLimiter(tokenRPM, time.Minute),
+		loginLimiter: loginLimiter,
+		tokenLimiter: tokenLimiter,
 		cimdFetcher:  cimdFetcher,
 	}
 }
@@ -147,6 +165,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 			w.Header().Set("X-Content-Type-Options", "nosniff")
 			w.Header().Set("X-Frame-Options", "DENY")
 			w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+			w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")
 			fn(w, r)
 		}
 	}
@@ -201,9 +220,9 @@ func (h *Handler) HandleAuthorizationServerMetadata(w http.ResponseWriter, r *ht
 
 // HandleLogin initiates browser SSO by redirecting to Grafana generic OAuth.
 func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
-	// Rate limiting: 60 requests per minute per IP to prevent state table flooding DoS
-	clientIP := ExtractClientIP(r)
-	if h.loginLimiter != nil && !h.loginLimiter.Allow(clientIP) {
+	// Rate limiting: 60 requests per minute per IP via distributed Redis
+	clientIP := ExtractClientIP(r, h.cfg.TrustedProxies)
+	if h.loginLimiter != nil && !h.loginLimiter.Allow(r.Context(), clientIP) {
 		h.cfg.Logger.Warn("Rate limit exceeded on /mcp/auth/login", "client_ip", clientIP)
 		w.Header().Set("Retry-After", "60")
 		http.Error(w, "rate_limit_exceeded: too many login requests, please try again later", http.StatusTooManyRequests)
@@ -286,13 +305,14 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Set browser state cookie to protect against OAuth Login CSRF / Session Fixation
+	// #nosec G124 -- Secure flag dynamically matches CookieSecure configuration (true in HTTPS production, configurable for local dev)
 	http.SetCookie(w, &http.Cookie{
 		Name:     "mcp_auth_state",
 		Value:    internalState,
 		Path:     "/mcp/auth",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   true,
+		Secure:   h.cfg.CookieSecure,
 		MaxAge:   int(h.cfg.PendingAuthTTL.Seconds()),
 	})
 
@@ -333,13 +353,14 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Clear the state cookie
+	// #nosec G124 -- Secure flag dynamically matches CookieSecure configuration (true in HTTPS production, configurable for local dev)
 	http.SetCookie(w, &http.Cookie{
 		Name:     "mcp_auth_state",
 		Value:    "",
 		Path:     "/mcp/auth",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   true,
+		Secure:   h.cfg.CookieSecure,
 		MaxAge:   -1,
 	})
 
@@ -438,6 +459,7 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	// Direct browser confirmation fallback (XSS sanitized & anti-cache)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store, private")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")
 	w.WriteHeader(http.StatusOK)
 	escapedUser := html.EscapeString(userInfo.Login)
 	escapedURL := html.EscapeString(h.cfg.BaseURL)
@@ -458,9 +480,9 @@ func (h *Handler) HandleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Rate limiting: 120 requests per minute per IP to prevent brute-force and resource exhaustion DoS
-	clientIP := ExtractClientIP(r)
-	if h.tokenLimiter != nil && !h.tokenLimiter.Allow(clientIP) {
+	// Rate limiting: 120 requests per minute per IP via distributed Redis
+	clientIP := ExtractClientIP(r, h.cfg.TrustedProxies)
+	if h.tokenLimiter != nil && !h.tokenLimiter.Allow(r.Context(), clientIP) {
 		h.cfg.Logger.Warn("Rate limit exceeded on /mcp/auth/token", "client_ip", clientIP)
 		w.Header().Set("Retry-After", "60")
 		sendTokenError(w, http.StatusTooManyRequests, "slow_down", "rate limit exceeded, please try again later")
@@ -573,6 +595,7 @@ func (h *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 		UserID:         fmt.Sprintf("%d", authCtx.UserInfo.ID),
 		Username:       authCtx.UserInfo.Login,
 		Email:          authCtx.UserInfo.Email,
+		ClientID:       authCtx.ClientID,
 		GrafanaSession: authCtx.GrafanaSession,
 		RefreshToken:   refreshToken,
 		UserClaims: map[string]interface{}{
@@ -625,11 +648,34 @@ func (h *Handler) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	reqClientID := r.FormValue("client_id")
+	if h.cfg.CIMDEnforcement == "required" && reqClientID == "" {
+		sendTokenError(w, http.StatusBadRequest, "invalid_client", "client_id parameter is required")
+		return
+	}
+
 	// Atomically retrieve and delete the refresh session using Lua script (eliminates race condition & enforces single-use)
 	session, err := h.store.GetAndDeleteRefreshSession(r.Context(), refreshToken)
 	if err != nil {
 		sendTokenError(w, http.StatusUnauthorized, "invalid_grant", "refresh token is invalid, expired, or already used")
 		return
+	}
+
+	// Verify client_id binding per OAuth 2.1 Section 4.3.2 and CIMD specification
+	if h.cfg.CIMDEnforcement == "required" || session.ClientID != "" {
+		if reqClientID == "" {
+			sendTokenError(w, http.StatusBadRequest, "invalid_client", "client_id parameter is required")
+			return
+		}
+		if subtle.ConstantTimeCompare([]byte(reqClientID), []byte(session.ClientID)) != 1 {
+			sendTokenError(w, http.StatusBadRequest, "invalid_grant", "client_id mismatch")
+			return
+		}
+	} else if reqClientID != "" {
+		if subtle.ConstantTimeCompare([]byte(reqClientID), []byte(session.ClientID)) != 1 {
+			sendTokenError(w, http.StatusBadRequest, "invalid_grant", "client_id mismatch")
+			return
+		}
 	}
 
 	// Active upstream session verification: Verify that the Grafana session is still alive in Grafana

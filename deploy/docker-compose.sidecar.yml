@@ -18,7 +18,7 @@ services:
       - GRAFANA_PUBLIC_URL=http://localhost:3000
       - TARGET_MCP_URL=http://mcp-grafana:8000
       - REDIS_ADDR=redis:6379
-      - MCP_MASTER_SECRET=production-grade-master-secret-at-least-32-bytes!
+      - MCP_MASTER_SECRET=${MCP_MASTER_SECRET:-}
     depends_on:
       - redis
       - mcp-grafana

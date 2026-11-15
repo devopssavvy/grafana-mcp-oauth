@@ -43,6 +43,7 @@ type SessionData struct {
 	UserID         string                 `json:"user_id"`
 	Username       string                 `json:"username"`
 	Email          string                 `json:"email"`
+	ClientID       string                 `json:"client_id,omitempty"`
 	GrafanaSession string                 `json:"grafana_session"`
 	RefreshToken   string                 `json:"refresh_token,omitempty"`
 	IDToken        string                 `json:"id_token,omitempty"`
@@ -124,6 +125,11 @@ func NewRedisSessionStore(client redis.UniversalClient, masterSecret []byte) (*R
 		client:       client,
 		masterSecret: masterSecret,
 	}, nil
+}
+
+// Client returns the underlying Redis UniversalClient.
+func (s *RedisSessionStore) Client() redis.UniversalClient {
+	return s.client
 }
 
 // SaveSession encrypts and stores the session in Redis under an HMAC-SHA3-512 hashed key.
@@ -528,6 +534,7 @@ func sessionToMap(s *SessionData) map[string]any {
 		"user_id":         s.UserID,
 		"username":        s.Username,
 		"email":           s.Email,
+		"client_id":       s.ClientID,
 		"grafana_session": s.GrafanaSession,
 		"refresh_token":   s.RefreshToken,
 		"id_token":        s.IDToken,

@@ -18,6 +18,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"grafana-mcp-oauth/pkg/config"
 	"grafana-mcp-oauth/pkg/oauth"
 	"grafana-mcp-oauth/pkg/store"
 )
@@ -728,6 +729,68 @@ func TestHandler_CIMD_Enforcement(t *testing.T) {
 		assert.Contains(t, tokRec.Body.String(), "client_id parameter is required")
 	})
 
+	t.Run("token exchange with valid client_id stores client_id in session", func(t *testing.T) {
+		h := oauth.NewHandler(oauth.Config{
+			BaseURL:               "http://localhost:8080",
+			GrafanaURL:            mockGrafana.URL,
+			CIMDEnforcement:       "required",
+			CIMDAllowInsecureHTTP: true,
+		}, st)
+		defer h.Close()
+
+		loginURI := fmt.Sprintf("/mcp/auth/login?client_id=%s&redirect_uri=%s&code_challenge=%s&code_challenge_method=S256",
+			url.QueryEscape(validClientID),
+			url.QueryEscape("http://127.0.0.1:59182/callback"),
+			challenge,
+		)
+		req := httptest.NewRequest(http.MethodGet, loginURI, nil)
+		rec := httptest.NewRecorder()
+		h.HandleLogin(rec, req)
+		require.Equal(t, http.StatusFound, rec.Code)
+
+		var stateCookie *http.Cookie
+		for _, c := range rec.Result().Cookies() {
+			if c.Name == "mcp_auth_state" {
+				stateCookie = c
+				break
+			}
+		}
+		require.NotNil(t, stateCookie)
+
+		cbReq := httptest.NewRequest(http.MethodGet, "/mcp/auth/callback?mcp_state="+stateCookie.Value, nil)
+		cbReq.AddCookie(stateCookie)
+		cbReq.AddCookie(&http.Cookie{Name: "grafana_session", Value: "valid_session_12345"})
+		cbRec := httptest.NewRecorder()
+		h.HandleCallback(cbRec, cbReq)
+		require.Equal(t, http.StatusFound, cbRec.Code)
+
+		u, err := url.Parse(cbRec.Header().Get("Location"))
+		require.NoError(t, err)
+		authCode := u.Query().Get("code")
+
+		// Token exchange with valid client_id parameter
+		tokenBody := url.Values{
+			"grant_type":    {"authorization_code"},
+			"code":          {authCode},
+			"code_verifier": {verifier},
+			"redirect_uri":  {"http://127.0.0.1:59182/callback"},
+			"client_id":     {validClientID},
+		}
+		tokReq := httptest.NewRequest(http.MethodPost, "/mcp/auth/token", strings.NewReader(tokenBody.Encode()))
+		tokReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		tokRec := httptest.NewRecorder()
+		h.HandleToken(tokRec, tokReq)
+
+		assert.Equal(t, http.StatusOK, tokRec.Code)
+		var resp oauth.TokenResponse
+		require.NoError(t, json.NewDecoder(tokRec.Body).Decode(&resp))
+		assert.NotEmpty(t, resp.AccessToken)
+
+		sess, err := st.GetSession(context.Background(), resp.AccessToken)
+		require.NoError(t, err)
+		assert.Equal(t, validClientID, sess.ClientID)
+	})
+
 	t.Run("RFC 8414 metadata advertises CIMD support", func(t *testing.T) {
 		hRequired := oauth.NewHandler(oauth.Config{
 			BaseURL:         "http://localhost:8080",
@@ -756,4 +819,403 @@ func TestHandler_CIMD_Enforcement(t *testing.T) {
 		require.NoError(t, err)
 		assert.Nil(t, meta2["client_id_metadata_document_supported"])
 	})
+}
+
+func TestHandler_RefreshToken_CIMD_Required(t *testing.T) {
+	_, st, mockGrafana := setupOAuthTestEnv(t)
+	defer mockGrafana.Close()
+
+	h := oauth.NewHandler(oauth.Config{
+		BaseURL:          "http://localhost:8080",
+		GrafanaURL:       mockGrafana.URL,
+		GrafanaPublicURL: mockGrafana.URL,
+		SessionTTL:       1 * time.Hour,
+		RefreshTTL:       24 * time.Hour,
+		CIMDEnforcement:  "required",
+		HTTPClient:       mockGrafana.Client(),
+	}, st)
+	defer h.Close()
+
+	ctx := context.Background()
+	clientID := "https://trusted-client.example.com/client.json"
+
+	t.Run("missing client_id is rejected with 400 invalid_client", func(t *testing.T) {
+		rt := "mcp_rt_req_missing"
+		sess := &store.SessionData{
+			UserID:         "42",
+			Username:       "bob",
+			ClientID:       clientID,
+			GrafanaSession: "valid_grafana_session_123",
+			RefreshToken:   rt,
+			ExpiresAt:      time.Now().Add(1 * time.Hour),
+		}
+		require.NoError(t, st.SaveSession(ctx, "mcp_at_req_missing", sess, 1*time.Hour))
+		require.NoError(t, st.SaveRefreshTokenSession(ctx, rt, sess, 24*time.Hour))
+
+		form := url.Values{
+			"grant_type":    {"refresh_token"},
+			"refresh_token": {rt},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/mcp/auth/token", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+
+		h.HandleToken(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, rec.Body.String(), "invalid_client")
+		assert.Contains(t, rec.Body.String(), "client_id parameter is required")
+
+		// Verify refresh token was NOT prematurely consumed, allowing client to retry with valid client_id
+		retryForm := url.Values{
+			"grant_type":    {"refresh_token"},
+			"refresh_token": {rt},
+			"client_id":     {clientID},
+		}
+		retryReq := httptest.NewRequest(http.MethodPost, "/mcp/auth/token", strings.NewReader(retryForm.Encode()))
+		retryReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		retryRec := httptest.NewRecorder()
+		h.HandleToken(retryRec, retryReq)
+		assert.Equal(t, http.StatusOK, retryRec.Code)
+	})
+
+	t.Run("mismatched client_id is rejected with 400 invalid_grant", func(t *testing.T) {
+		rt := "mcp_rt_req_mismatch"
+		sess := &store.SessionData{
+			UserID:         "42",
+			Username:       "bob",
+			ClientID:       clientID,
+			GrafanaSession: "valid_grafana_session_123",
+			RefreshToken:   rt,
+			ExpiresAt:      time.Now().Add(1 * time.Hour),
+		}
+		require.NoError(t, st.SaveSession(ctx, "mcp_at_req_mismatch", sess, 1*time.Hour))
+		require.NoError(t, st.SaveRefreshTokenSession(ctx, rt, sess, 24*time.Hour))
+
+		form := url.Values{
+			"grant_type":    {"refresh_token"},
+			"refresh_token": {rt},
+			"client_id":     {"https://rogue-client.example.com/client.json"},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/mcp/auth/token", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+
+		h.HandleToken(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, rec.Body.String(), "invalid_grant")
+		assert.Contains(t, rec.Body.String(), "client_id mismatch")
+	})
+
+	t.Run("matching client_id succeeds and preserves client_id", func(t *testing.T) {
+		rt := "mcp_rt_req_match"
+		sess := &store.SessionData{
+			UserID:         "42",
+			Username:       "bob",
+			ClientID:       clientID,
+			GrafanaSession: "valid_grafana_session_123",
+			RefreshToken:   rt,
+			ExpiresAt:      time.Now().Add(1 * time.Hour),
+		}
+		require.NoError(t, st.SaveSession(ctx, "mcp_at_req_match", sess, 1*time.Hour))
+		require.NoError(t, st.SaveRefreshTokenSession(ctx, rt, sess, 24*time.Hour))
+
+		form := url.Values{
+			"grant_type":    {"refresh_token"},
+			"refresh_token": {rt},
+			"client_id":     {clientID},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/mcp/auth/token", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+
+		h.HandleToken(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+
+		var resp oauth.TokenResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.NotEmpty(t, resp.AccessToken)
+		assert.NotEmpty(t, resp.RefreshToken)
+
+		// Verify client_id in newly issued access token session
+		newSess, err := st.GetSession(ctx, resp.AccessToken)
+		require.NoError(t, err)
+		assert.Equal(t, clientID, newSess.ClientID)
+
+		// Verify client_id in rotated refresh token session
+		rotSess, err := st.GetAndDeleteRefreshSession(ctx, resp.RefreshToken)
+		require.NoError(t, err)
+		assert.Equal(t, clientID, rotSess.ClientID)
+	})
+
+	t.Run("empty session client_id is rejected with 400 invalid_grant when CIMD is required", func(t *testing.T) {
+		rt := "mcp_rt_req_empty_sess"
+		sess := &store.SessionData{
+			UserID:         "42",
+			Username:       "bob",
+			ClientID:       "", // Empty client_id in stored session
+			GrafanaSession: "valid_grafana_session_123",
+			RefreshToken:   rt,
+			ExpiresAt:      time.Now().Add(1 * time.Hour),
+		}
+		require.NoError(t, st.SaveSession(ctx, "mcp_at_req_empty_sess", sess, 1*time.Hour))
+		require.NoError(t, st.SaveRefreshTokenSession(ctx, rt, sess, 24*time.Hour))
+
+		form := url.Values{
+			"grant_type":    {"refresh_token"},
+			"refresh_token": {rt},
+			"client_id":     {clientID},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/mcp/auth/token", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+
+		h.HandleToken(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, rec.Body.String(), "invalid_grant")
+		assert.Contains(t, rec.Body.String(), "client_id mismatch")
+	})
+}
+
+func TestHandler_RefreshToken_CIMD_Permissive(t *testing.T) {
+	_, st, mockGrafana := setupOAuthTestEnv(t)
+	defer mockGrafana.Close()
+
+	h := oauth.NewHandler(oauth.Config{
+		BaseURL:          "http://localhost:8080",
+		GrafanaURL:       mockGrafana.URL,
+		GrafanaPublicURL: mockGrafana.URL,
+		SessionTTL:       1 * time.Hour,
+		RefreshTTL:       24 * time.Hour,
+		CIMDEnforcement:  "permissive",
+		HTTPClient:       mockGrafana.Client(),
+	}, st)
+	defer h.Close()
+
+	ctx := context.Background()
+	clientID := "https://trusted-client.example.com/client.json"
+
+	t.Run("missing client_id is allowed under permissive mode for non-CIMD session", func(t *testing.T) {
+		rt := "mcp_rt_perm_missing"
+		sess := &store.SessionData{
+			UserID:         "42",
+			Username:       "bob",
+			ClientID:       "", // Non-CIMD session
+			GrafanaSession: "valid_grafana_session_123",
+			RefreshToken:   rt,
+			ExpiresAt:      time.Now().Add(1 * time.Hour),
+		}
+		require.NoError(t, st.SaveSession(ctx, "mcp_at_perm_missing", sess, 1*time.Hour))
+		require.NoError(t, st.SaveRefreshTokenSession(ctx, rt, sess, 24*time.Hour))
+
+		form := url.Values{
+			"grant_type":    {"refresh_token"},
+			"refresh_token": {rt},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/mcp/auth/token", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+
+		h.HandleToken(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code)
+	})
+
+	t.Run("missing client_id is rejected under permissive mode when session has bound client_id", func(t *testing.T) {
+		rt := "mcp_rt_perm_bound_missing"
+		sess := &store.SessionData{
+			UserID:         "42",
+			Username:       "bob",
+			ClientID:       clientID, // CIMD-bound session
+			GrafanaSession: "valid_grafana_session_123",
+			RefreshToken:   rt,
+			ExpiresAt:      time.Now().Add(1 * time.Hour),
+		}
+		require.NoError(t, st.SaveSession(ctx, "mcp_at_perm_bound_missing", sess, 1*time.Hour))
+		require.NoError(t, st.SaveRefreshTokenSession(ctx, rt, sess, 24*time.Hour))
+
+		form := url.Values{
+			"grant_type":    {"refresh_token"},
+			"refresh_token": {rt},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/mcp/auth/token", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+
+		h.HandleToken(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, rec.Body.String(), "invalid_client")
+	})
+
+	t.Run("mismatched client_id is rejected under permissive mode", func(t *testing.T) {
+		rt := "mcp_rt_perm_mismatch"
+		sess := &store.SessionData{
+			UserID:         "42",
+			Username:       "bob",
+			ClientID:       clientID,
+			GrafanaSession: "valid_grafana_session_123",
+			RefreshToken:   rt,
+			ExpiresAt:      time.Now().Add(1 * time.Hour),
+		}
+		require.NoError(t, st.SaveSession(ctx, "mcp_at_perm_mismatch", sess, 1*time.Hour))
+		require.NoError(t, st.SaveRefreshTokenSession(ctx, rt, sess, 24*time.Hour))
+
+		form := url.Values{
+			"grant_type":    {"refresh_token"},
+			"refresh_token": {rt},
+			"client_id":     {"https://rogue-client.example.com/client.json"},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/mcp/auth/token", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+
+		h.HandleToken(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, rec.Body.String(), "invalid_grant")
+		assert.Contains(t, rec.Body.String(), "client_id mismatch")
+	})
+}
+
+func TestHandler_CookieSecure_Configuration(t *testing.T) {
+	_, st, mockGrafana := setupOAuthTestEnv(t)
+	defer mockGrafana.Close()
+
+	challenge := "E9Melhoa2OwvFrGMTJguCH5rtx64KAIUUrJJiah95_I"
+
+	t.Run("CookieSecure false sets cookie Secure false", func(t *testing.T) {
+		h := oauth.NewHandler(oauth.Config{
+			BaseURL:          "http://localhost:8080",
+			GrafanaURL:       mockGrafana.URL,
+			GrafanaPublicURL: mockGrafana.URL,
+			CallbackBaseURL:  "http://localhost:8080/mcp/auth/callback",
+			CookieSecure:     false,
+			PendingAuthTTL:   5 * time.Minute,
+			CIMDEnforcement:  "disabled",
+		}, st)
+		defer h.Close()
+
+		loginURI := fmt.Sprintf("/mcp/auth/login?redirect_uri=%s&code_challenge=%s&code_challenge_method=S256",
+			url.QueryEscape("http://127.0.0.1:59182/callback"),
+			challenge,
+		)
+		req := httptest.NewRequest(http.MethodGet, loginURI, nil)
+		rec := httptest.NewRecorder()
+		h.HandleLogin(rec, req)
+		require.Equal(t, http.StatusFound, rec.Code)
+
+		var stateCookie *http.Cookie
+		for _, c := range rec.Result().Cookies() {
+			if c.Name == "mcp_auth_state" {
+				stateCookie = c
+				break
+			}
+		}
+		require.NotNil(t, stateCookie)
+		assert.False(t, stateCookie.Secure, "CookieSecure=false should yield Secure=false")
+
+		// Callback clearing cookie
+		cbReq := httptest.NewRequest(http.MethodGet, "/mcp/auth/callback?mcp_state="+stateCookie.Value, nil)
+		cbReq.AddCookie(stateCookie)
+		cbReq.AddCookie(&http.Cookie{Name: "grafana_session", Value: "valid_grafana_session_123"})
+		cbRec := httptest.NewRecorder()
+		h.HandleCallback(cbRec, cbReq)
+
+		var clearCookie *http.Cookie
+		for _, c := range cbRec.Result().Cookies() {
+			if c.Name == "mcp_auth_state" {
+				clearCookie = c
+				break
+			}
+		}
+		require.NotNil(t, clearCookie)
+		assert.False(t, clearCookie.Secure, "Cookie deletion should match CookieSecure=false")
+	})
+
+	t.Run("CookieSecure true sets cookie Secure true", func(t *testing.T) {
+		h := oauth.NewHandler(oauth.Config{
+			BaseURL:          "https://example.com",
+			GrafanaURL:       mockGrafana.URL,
+			GrafanaPublicURL: mockGrafana.URL,
+			CallbackBaseURL:  "https://example.com/mcp/auth/callback",
+			CookieSecure:     true,
+			PendingAuthTTL:   5 * time.Minute,
+			CIMDEnforcement:  "disabled",
+		}, st)
+		defer h.Close()
+
+		loginURI := fmt.Sprintf("/mcp/auth/login?redirect_uri=%s&code_challenge=%s&code_challenge_method=S256",
+			url.QueryEscape("http://127.0.0.1:59182/callback"),
+			challenge,
+		)
+		req := httptest.NewRequest(http.MethodGet, loginURI, nil)
+		rec := httptest.NewRecorder()
+		h.HandleLogin(rec, req)
+		require.Equal(t, http.StatusFound, rec.Code)
+
+		var stateCookie *http.Cookie
+		for _, c := range rec.Result().Cookies() {
+			if c.Name == "mcp_auth_state" {
+				stateCookie = c
+				break
+			}
+		}
+		require.NotNil(t, stateCookie)
+		assert.True(t, stateCookie.Secure, "CookieSecure=true should yield Secure=true")
+
+		// Callback clearing cookie
+		cbReq := httptest.NewRequest(http.MethodGet, "/mcp/auth/callback?mcp_state="+stateCookie.Value, nil)
+		cbReq.AddCookie(stateCookie)
+		cbReq.AddCookie(&http.Cookie{Name: "grafana_session", Value: "valid_grafana_session_123"})
+		cbRec := httptest.NewRecorder()
+		h.HandleCallback(cbRec, cbReq)
+
+		var clearCookie *http.Cookie
+		for _, c := range cbRec.Result().Cookies() {
+			if c.Name == "mcp_auth_state" {
+				clearCookie = c
+				break
+			}
+		}
+		require.NotNil(t, clearCookie)
+		assert.True(t, clearCookie.Secure, "Cookie deletion should match CookieSecure=true")
+	})
+}
+
+func TestHandler_RateLimiter_ForwardedHeaders_UntrustedPeer(t *testing.T) {
+	_, st, mockGrafana := setupOAuthTestEnv(t)
+	defer mockGrafana.Close()
+
+	// Rate limit login to 2 RPM
+	h := oauth.NewHandler(oauth.Config{
+		BaseURL:           "http://localhost:8080",
+		GrafanaURL:        mockGrafana.URL,
+		GrafanaPublicURL:  mockGrafana.URL,
+		CallbackBaseURL:   "http://localhost:8080/mcp/auth/callback",
+		RateLimitLoginRPM: 2,
+		CIMDEnforcement:   "disabled",
+		TrustedProxies:    config.ParseTrustedProxies("10.0.0.0/8"),
+	}, st)
+	defer h.Close()
+
+	challenge := "E9Melhoa2OwvFrGMTJguCH5rtx64KAIUUrJJiah95_I"
+	loginURI := fmt.Sprintf("/mcp/auth/login?redirect_uri=%s&code_challenge=%s&code_challenge_method=S256",
+		url.QueryEscape("http://127.0.0.1:59182/callback"),
+		challenge,
+	)
+
+	// Attacker at 203.0.113.1 attempts to bypass rate limiting by rotating X-Forwarded-For
+	for i := 1; i <= 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, loginURI, nil)
+		req.RemoteAddr = "203.0.113.1:12345"
+		req.Header.Set("X-Forwarded-For", fmt.Sprintf("198.51.100.%d", i))
+		rec := httptest.NewRecorder()
+		h.HandleLogin(rec, req)
+		assert.Equal(t, http.StatusFound, rec.Code)
+	}
+
+	// Third request from same RemoteAddr with a different spoofed XFF must be rate limited!
+	reqBlocked := httptest.NewRequest(http.MethodGet, loginURI, nil)
+	reqBlocked.RemoteAddr = "203.0.113.1:12345"
+	reqBlocked.Header.Set("X-Forwarded-For", "198.51.100.99")
+	recBlocked := httptest.NewRecorder()
+	h.HandleLogin(recBlocked, reqBlocked)
+	assert.Equal(t, http.StatusTooManyRequests, recBlocked.Code)
 }

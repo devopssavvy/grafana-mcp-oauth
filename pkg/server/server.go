@@ -156,6 +156,8 @@ func New(opts Options) (*Server, error) {
 		CIMDAllowInsecureHTTP: cfg.CIMDAllowInsecureHTTP,
 		CIMDCacheTTL:          cfg.CIMDCacheTTL,
 		CIMDCache:             cimdCache,
+		TrustedProxies:        cfg.TrustedProxies,
+		RedisClient:           rdb,
 		Logger:                logger,
 	}, sessionStore)
 
@@ -209,6 +211,7 @@ func New(opts Options) (*Server, error) {
 	})
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")
 		_, _ = fmt.Fprintf(w, `<!DOCTYPE html>
 <html>
 <head><title>Grafana MCP Gateway (%s mode)</title></head>
