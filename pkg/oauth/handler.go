@@ -305,6 +305,7 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Set browser state cookie to protect against OAuth Login CSRF / Session Fixation
+	// #nosec G124 -- Secure flag dynamically matches CookieSecure configuration (true in HTTPS production, configurable for local dev)
 	http.SetCookie(w, &http.Cookie{
 		Name:     "mcp_auth_state",
 		Value:    internalState,
@@ -352,6 +353,7 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Clear the state cookie
+	// #nosec G124 -- Secure flag dynamically matches CookieSecure configuration (true in HTTPS production, configurable for local dev)
 	http.SetCookie(w, &http.Cookie{
 		Name:     "mcp_auth_state",
 		Value:    "",
