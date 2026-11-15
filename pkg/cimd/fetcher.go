@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -17,14 +18,16 @@ type FetcherConfig struct {
 	AllowInsecureHTTP bool
 	DefaultTTL        time.Duration
 	HTTPClient        *http.Client
-	Cache             *MemoryCache
+	Cache             Cache
+	Logger            *slog.Logger
 }
 
 // Fetcher retrieves, parses, and validates Client ID Metadata Documents.
 type Fetcher struct {
 	cfg        FetcherConfig
 	httpClient *http.Client
-	cache      *MemoryCache
+	cache      Cache
+	logger     *slog.Logger
 }
 
 // NewFetcher creates a new CIMD Fetcher.
@@ -45,7 +48,13 @@ func NewFetcher(cfg FetcherConfig) *Fetcher {
 		cfg:        cfg,
 		httpClient: client,
 		cache:      cache,
+		logger:     cfg.Logger,
 	}
+}
+
+// Cache returns the underlying Cache implementation.
+func (f *Fetcher) Cache() Cache {
+	return f.cache
 }
 
 // Fetch retrieves and validates the Client ID Metadata Document from the given client_id URL.
@@ -86,8 +95,10 @@ func (f *Fetcher) Fetch(ctx context.Context, clientID string) (*Document, error)
 	}
 
 	// 2. Check Cache
-	if doc, ok := f.cache.Get(clientID); ok {
-		return doc, nil
+	if f.cache != nil {
+		if doc, ok := f.cache.Get(ctx, clientID); ok {
+			return doc, nil
+		}
 	}
 
 	// 3. Outbound HTTP GET
@@ -139,8 +150,10 @@ func (f *Fetcher) Fetch(ctx context.Context, clientID string) (*Document, error)
 				ttl = maxAge
 			}
 		}
-		if shouldCache {
-			f.cache.Set(clientID, &doc, ttl)
+		if shouldCache && f.cache != nil {
+			if err := f.cache.Set(ctx, clientID, &doc, ttl); err != nil && f.logger != nil {
+				f.logger.Warn("Failed to cache CIMD document", "client_id", clientID, "error", err)
+			}
 		}
 	}
 
@@ -154,21 +167,12 @@ func parseCacheControlMaxAge(header string) (time.Duration, bool) {
 	parts := strings.Split(header, ",")
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
-		lower := strings.ToLower(part)
-		if strings.HasPrefix(lower, "max-age=") {
-			valStr := strings.TrimPrefix(lower, "max-age=")
-			valStr = strings.TrimSpace(valStr)
-			if sec, err := strconv.Atoi(valStr); err == nil {
-				if sec <= 0 {
-					return 0, true
-				}
-				d := time.Duration(sec) * time.Second
-				if d < 1*time.Minute {
-					d = 1 * time.Minute
-				} else if d > 24*time.Hour {
-					d = 24 * time.Hour
-				}
-				return d, true
+		if strings.HasPrefix(part, "max-age=") {
+			valStr := strings.TrimPrefix(part, "max-age=")
+			valStr = strings.Trim(valStr, "\"")
+			seconds, err := strconv.Atoi(valStr)
+			if err == nil {
+				return time.Duration(seconds) * time.Second, true
 			}
 		}
 	}

@@ -40,6 +40,7 @@ type Config struct {
 	CIMDEnforcement       string        // "required", "permissive", "disabled" (default: "required")
 	CIMDAllowInsecureHTTP bool          // Allow http:// and loopback IPs for testing/dev
 	CIMDCacheTTL          time.Duration // Cache TTL for CIMD metadata
+	CIMDCache             cimd.Cache    // Custom or distributed CIMD cache (optional)
 	CIMDFetcher           *cimd.Fetcher // Custom or mock CIMD fetcher (optional)
 	HTTPClient            *http.Client
 	Logger                *slog.Logger
@@ -125,6 +126,8 @@ func NewHandler(cfg Config, s store.SessionStore) *Handler {
 		cimdFetcher = cimd.NewFetcher(cimd.FetcherConfig{
 			AllowInsecureHTTP: cfg.CIMDAllowInsecureHTTP,
 			DefaultTTL:        cfg.CIMDCacheTTL,
+			Cache:             cfg.CIMDCache,
+			Logger:            cfg.Logger,
 		})
 	}
 
