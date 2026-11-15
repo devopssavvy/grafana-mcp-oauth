@@ -264,7 +264,7 @@ go test -v -count=1 -race ./...
 ```
 
 100% verified automated test scenarios:
-- [x] **`pkg/cimd`**: Verifies Client ID Metadata Document (CIMD) validation per `draft-ietf-oauth-client-id-metadata-document`, RFC 8252 Section 7.3 dynamic loopback port matching, DNS pinning SSRF defenses (blocking private/link-local/cloud-metadata CIDRs), in-memory TTL caching, and 64KB body bounds.
+- [x] **`pkg/cimd`**: Verifies Client ID Metadata Document (CIMD) validation per `draft-ietf-oauth-client-id-metadata-document`, RFC 8252 Section 7.3 dynamic loopback port matching, DNS pinning SSRF defenses (blocking private/link-local/cloud-metadata CIDRs), distributed Redis caching (`mcp:cimd:<sha256>`), Two-Tier L1/L2 caching, and 64KB body bounds.
 - [x] **`pkg/config`**: Verifies configuration loading from environment variables, including `CIMD_ENFORCEMENT`, `CIMD_ALLOW_INSECURE_HTTP`, and `CIMD_CACHE_TTL`.
 - [x] **`pkg/crypto`**: Verifies HMAC-SHA3-512, HKDF-SHA3-512, Argon2id, XChaCha20-Poly1305 AEAD encryption/decryption, and tamper resistance.
 - [x] **`pkg/store`**: Verifies Zero-Knowledge encryption in Redis, ensures raw storage contains no plaintext tokens or sessions, verifies session updates and refresh token rotation.

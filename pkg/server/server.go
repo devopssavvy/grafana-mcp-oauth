@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 
+	"grafana-mcp-oauth/pkg/cimd"
 	"grafana-mcp-oauth/pkg/config"
 	"grafana-mcp-oauth/pkg/extauthz"
 	"grafana-mcp-oauth/pkg/oauth"
@@ -125,22 +126,36 @@ func New(opts Options) (*Server, error) {
 		return nil, fmt.Errorf("failed to initialize session store: %w", err)
 	}
 
+	// 2.5 CIMD Metadata Cache (Two-Tier: L1 Memory + L2 Redis if available)
+	var cimdCache cimd.Cache
+	if rdb != nil {
+		cimdCache = cimd.NewTwoTierCache(
+			cimd.NewMemoryCache(),
+			cimd.NewRedisCache(rdb),
+		)
+		logger.Info("Initialized CIMD distributed cache (Two-Tier: L1 Memory + L2 Redis)")
+	} else {
+		cimdCache = cimd.NewMemoryCache()
+		logger.Info("Initialized CIMD in-memory cache")
+	}
+
 	// 3. OAuth 2.1 & RFC 9728 Discovery Handler
 	oauthHandler := oauth.NewHandler(oauth.Config{
-		BaseURL:           cfg.BaseURL,
-		GrafanaURL:        cfg.GrafanaURL,
-		GrafanaPublicURL:  cfg.GrafanaPublicURL,
-		CallbackBaseURL:   cfg.CallbackBaseURL,
-		CookieSecure:      cfg.CookieSecure,
-		SessionTTL:        cfg.SessionTTL,
-		RefreshTTL:        cfg.RefreshTTL,
-		PendingAuthTTL:    cfg.PendingAuthTTL,
-		AuthCodeTTL:       cfg.AuthCodeTTL,
+		BaseURL:               cfg.BaseURL,
+		GrafanaURL:            cfg.GrafanaURL,
+		GrafanaPublicURL:      cfg.GrafanaPublicURL,
+		CallbackBaseURL:       cfg.CallbackBaseURL,
+		CookieSecure:          cfg.CookieSecure,
+		SessionTTL:            cfg.SessionTTL,
+		RefreshTTL:            cfg.RefreshTTL,
+		PendingAuthTTL:        cfg.PendingAuthTTL,
+		AuthCodeTTL:           cfg.AuthCodeTTL,
 		RateLimitLoginRPM:     cfg.RateLimitLoginRPM,
 		RateLimitTokenRPM:     cfg.RateLimitTokenRPM,
 		CIMDEnforcement:       cfg.CIMDEnforcement,
 		CIMDAllowInsecureHTTP: cfg.CIMDAllowInsecureHTTP,
 		CIMDCacheTTL:          cfg.CIMDCacheTTL,
+		CIMDCache:             cimdCache,
 		Logger:                logger,
 	}, sessionStore)
 

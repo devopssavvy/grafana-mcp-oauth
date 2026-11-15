@@ -1,9 +1,20 @@
 package cimd
 
 import (
+	"context"
 	"sync"
 	"time"
 )
+
+// Cache defines the interface for caching Client ID Metadata Documents.
+type Cache interface {
+	Get(ctx context.Context, clientID string) (*Document, bool)
+	Set(ctx context.Context, clientID string, doc *Document, ttl time.Duration) error
+	Delete(ctx context.Context, clientID string) error
+	Clear(ctx context.Context) error
+}
+
+var _ Cache = (*MemoryCache)(nil)
 
 const defaultMaxEntries = 10000
 
@@ -37,7 +48,7 @@ func NewMemoryCacheWithCapacity(maxEntries int) *MemoryCache {
 }
 
 // Get retrieves a document from cache if not expired.
-func (c *MemoryCache) Get(clientID string) (*Document, bool) {
+func (c *MemoryCache) Get(ctx context.Context, clientID string) (*Document, bool) {
 	c.mu.RLock()
 	entry, ok := c.entries[clientID]
 	c.mu.RUnlock()
@@ -58,9 +69,9 @@ func (c *MemoryCache) Get(clientID string) (*Document, bool) {
 }
 
 // Set stores a document with given TTL and enforces capacity limits.
-func (c *MemoryCache) Set(clientID string, doc *Document, ttl time.Duration) {
+func (c *MemoryCache) Set(ctx context.Context, clientID string, doc *Document, ttl time.Duration) error {
 	if doc == nil || ttl <= 0 {
-		return
+		return nil
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -87,6 +98,7 @@ func (c *MemoryCache) Set(clientID string, doc *Document, ttl time.Duration) {
 		doc:       doc,
 		expiresAt: time.Now().Add(ttl),
 	}
+	return nil
 }
 
 // CleanupExpired purges all expired entries from the cache.
@@ -103,19 +115,21 @@ func (c *MemoryCache) CleanupExpired() {
 }
 
 // Delete removes an entry from the cache.
-func (c *MemoryCache) Delete(clientID string) {
+func (c *MemoryCache) Delete(ctx context.Context, clientID string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	delete(c.entries, clientID)
+	return nil
 }
 
 // Clear cleans up all entries in the cache.
-func (c *MemoryCache) Clear() {
+func (c *MemoryCache) Clear(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	c.entries = make(map[string]cacheEntry)
+	return nil
 }
 
 // Len returns current entry count in cache.

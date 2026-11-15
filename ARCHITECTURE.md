@@ -249,7 +249,7 @@ flowchart TD
     CheckMode -->|"required (default)"| CheckMissing{"client_id present & valid URL?"}
 
     CheckMissing -->|"No"| Reject400["HTTP 400 Bad Request (invalid_client)"]
-    CheckMissing -->|"Yes"| CacheCheck{"In Memory Cache?"}
+    CheckMissing -->|"Yes"| CacheCheck{"In Cache?<br/>(L1 Memory / L2 Redis)"}
 
     CheckURL -->|"No"| Skip
     CheckURL -->|"Yes"| CacheCheck
@@ -277,7 +277,10 @@ flowchart TD
    - The connection dials the validated IP directly (`safeIP:port`), effectively defeating DNS Rebinding attacks.
    - Redirects are strictly prohibited on metadata fetches to prevent redirect-based SSRF.
 2. **RFC 8252 Section 7.3 Ephemeral Port Compatibility**: Native MCP coding agents (Cursor, Claude Desktop, Antigravity) listen on random ephemeral loopback ports (`http://127.0.0.1:<port>/callback` or `http://localhost:<port>/callback`). `pkg/cimd` verifies that the scheme, host category (loopback), and path match an authorized loopback URI in the client document, allowing arbitrary local ports while strictly enforcing exact matching for non-loopback URLs.
-3. **In-Memory Thread-Safe Cache**: Eliminates redundant outbound fetches and protects client metadata servers from DoS. Bounded to 64KB per document with a 5-second HTTP deadline.
+3. **Two-Tier Cache (L1 Memory + L2 Redis)**: Eliminates redundant outbound fetches and protects client metadata servers from DoS. Bounded to 64KB per document with a 5-second HTTP deadline:
+   - **L1 (In-Memory `MemoryCache`)**: Sub-microsecond local hits (< 1µs) with bounded capacity (10,000 entries) and automatic expiration pruning.
+   - **L2 (Distributed `RedisCache`)**: Stored under `mcp:cimd:<sha256(clientID)>` with native Redis TTL, shared across horizontally scaled pods (HPA) and persistent across pod restarts.
+   - **Graceful Fallback**: Automatically falls back to local in-memory caching if Redis is unconfigured or temporarily unavailable.
 
 ---
 
@@ -313,11 +316,13 @@ The gateway is built as a single, multi-architecture static binary (`grafana-mcp
 │       └── main.go                 # Unified Gateway entrypoint (proxy, extauthz, all modes)
 ├── pkg
 │   ├── cimd
-│   │   ├── cache.go                # Thread-safe in-memory cache with TTL support
+│   │   ├── cache.go                # Cache interface and bounded MemoryCache with expiration pruning
 │   │   ├── document.go             # CIMD Document model, RFC 8252 loopback matching & validation
 │   │   ├── fetcher.go              # Document fetcher, URL syntax checks, Cache-Control parsing
+│   │   ├── redis_cache.go          # Distributed Redis cache implementation (mcp:cimd:<sha256>)
+│   │   ├── two_tier_cache.go       # Hybrid Two-Tier cache (L1 Memory + L2 Redis) coordinator
 │   │   ├── ssrf.go                 # SSRF safe dialer, DNS pinning, private/cloud IP blacklist
-│   │   └── cimd_test.go            # Comprehensive unit tests for CIMD validation & SSRF defense
+│   │   └── cimd_test.go            # Comprehensive unit tests for CIMD validation, SSRF, & Redis cache
 │   ├── config
 │   │   ├── config.go               # Configuration loader supporting MODE, port, and CIMD settings
 │   │   └── config_test.go          # Config unit tests
