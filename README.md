@@ -191,6 +191,24 @@ docker compose -f docker-compose.sidecar.yml up -d
 Service Ports:
 * **`:8080`**: Front-door Proxy port for Coding Agents.
 
+### 3.4. Production Kubernetes Deployment (Helm Chart & Gateway API)
+
+For enterprise production deployments, use the production-ready Helm chart in `charts/grafana-mcp`:
+
+```bash
+# Add Valkey repository
+helm repo add valkey https://valkey.io/valkey-helm/
+helm repo update
+
+# Install chart with Kubernetes Gateway API HTTPRoute
+helm install grafana-mcp charts/grafana-mcp \
+  --set oauthProxy.baseUrl="https://mcp.company.com" \
+  --set grafana.url="http://grafana.monitoring.svc:3000" \
+  --set httpRoute.enabled=true
+```
+
+Features include dual-container sidecar architecture with strict loopback isolation (`127.0.0.1`), Kubernetes Gateway API (`HTTPRoute` v1) and Ingress support, official Linux Foundation Valkey session store with mTLS, restrictive NetworkPolicies, and hardened security contexts. See the [Helm Chart Documentation](charts/grafana-mcp/README.md) for complete details.
+
 ---
 
 ## 4. Client Configuration Guide (Fully Automated - Zero Token Entry)

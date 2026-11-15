@@ -30,6 +30,21 @@ helm template test-ingress "${CHART_DIR}" \
   --set ingress.hosts[0].host="mcp.company.com" \
   --set hpa.enabled=true > /dev/null
 
+echo "  [3d] Scenario D: Gateway API HTTPRoute Enabled & Loopback Isolation"
+RENDERED_GW=$(helm template test-gateway "${CHART_DIR}" \
+  --set httpRoute.enabled=true \
+  --set httpRoute.parentRefs[0].name="eg" \
+  --set httpRoute.hostnames[0]="mcp.company.com")
+
+grep -q "kind: HTTPRoute" <<< "${RENDERED_GW}" || { echo "HTTPRoute resource not found in rendered manifest"; exit 1; }
+grep -q "name: test-gateway-grafana-mcp" <<< "${RENDERED_GW}" || { echo "HTTPRoute name mismatch"; exit 1; }
+grep -q -- "--address" <<< "${RENDERED_GW}" || { echo "mcp-grafana --address flag not found"; exit 1; }
+grep -q "127.0.0.1:8000" <<< "${RENDERED_GW}" || { echo "127.0.0.1:8000 not found"; exit 1; }
+grep -q "/dev/tcp/127.0.0.1/8000" <<< "${RENDERED_GW}" || { echo "exec probe not found"; exit 1; }
+if grep -q "containerPort: 8000" <<< "${RENDERED_GW}"; then
+  echo "Security violation: containerPort 8000 should not be exposed on internal mcp container"; exit 1;
+fi
+
 echo "=== 4. Ephemeral KinD Mock Cluster Deployment Test ==="
 if command -v kind >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   cleanup() {

@@ -78,6 +78,9 @@ mcpGrafana:
     # -- Image pull policy
     pullPolicy: IfNotPresent
 
+  # -- Listen address for internal mcp-grafana server (restricted strictly to 127.0.0.1 loopback)
+  listenAddress: "127.0.0.1:8000"
+
   # -- Disable write operations to Grafana
   disableWrite: false
 
@@ -225,6 +228,42 @@ ingress:
         - path: /
           pathType: Prefix
   tls: []
+
+# ==============================================================================
+# Kubernetes Gateway API Configuration
+# ==============================================================================
+httpRoute:
+  # -- Enable Kubernetes Gateway API HTTPRoute resource (gateway.networking.k8s.io/v1)
+  enabled: false
+
+  # -- Custom annotations for the HTTPRoute resource
+  annotations: {}
+
+  # -- Custom labels for the HTTPRoute resource
+  labels: {}
+
+  # -- Gateway parent references (which Gateway and listener to attach to)
+  # @default -- See values.yaml for example
+  parentRefs:
+    - name: eg
+      # namespace: default
+      # sectionName: http
+      # port: 80
+
+  # -- Hostnames matched by this HTTPRoute
+  hostnames:
+    - mcp.company.com
+
+  # -- Custom routing rules. If empty, defaults to prefix "/" routing to grafana-mcp service
+  rules: []
+  #   - matches:
+  #       - path:
+  #           type: PathPrefix
+  #           value: /
+  #     # backendRefs is optional and automatically defaults to the chart's generated Service if omitted
+  #     backendRefs:
+  #       - name: my-custom-service
+  #         port: 80
 
 # ==============================================================================
 # Security & System Configuration
