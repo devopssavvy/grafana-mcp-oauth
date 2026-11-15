@@ -38,6 +38,7 @@ func init() {
 		"::/128",        // Unspecified
 		"::1/128",       // Loopback
 		"64:ff9b::/96",  // IPv4/IPv6 translation
+		"64:ff9b:1::/48", // Local-use IPv4/IPv6 translation (RFC 8215)
 		"100::/64",      // Discard prefix
 		"2001::/23",     // IETF Protocol Assignments
 		"2001:db8::/32", // Documentation

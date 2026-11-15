@@ -1,97 +1,100 @@
 package oauth
 
 import (
+	"context"
+	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
-// IPRateLimiter provides sliding-window in-memory rate limiting per client IP.
-type IPRateLimiter struct {
-	mu        sync.Mutex
-	limits    map[string]*clientBucket
-	maxReqs   int
-	window    time.Duration
-	cleanInt  time.Duration
-	stopChan  chan struct{}
-	closeOnce sync.Once
+// RateLimiter defines the interface for distributed rate limiting.
+type RateLimiter interface {
+	Allow(ctx context.Context, ip string) bool
+	Close()
 }
 
-type clientBucket struct {
-	count     int
-	resetTime time.Time
+// RedisRateLimiter provides atomic distributed sliding/fixed-window rate limiting in Redis per client IP.
+// All gateway replicas share the exact same synchronized counter in Redis. No in-memory bucket table
+// is maintained to prevent inter-replica desynchronization and eliminate memory exhaustion risks.
+type RedisRateLimiter struct {
+	client  redis.UniversalClient
+	prefix  string
+	maxReqs int
+	window  time.Duration
+	logger  *slog.Logger
+	script  *redis.Script
 }
 
-// NewIPRateLimiter creates a new rate limiter allowing maxReqs within window.
-func NewIPRateLimiter(maxReqs int, window time.Duration) *IPRateLimiter {
-	limiter := &IPRateLimiter{
-		limits:   make(map[string]*clientBucket),
-		maxReqs:  maxReqs,
-		window:   window,
-		cleanInt: 5 * time.Minute,
-		stopChan: make(chan struct{}),
+// luaRateLimitScript provides atomic rate limit counting with automatic key expiration.
+var luaRateLimitScript = redis.NewScript(`
+	local current = redis.call('INCR', KEYS[1])
+	if current == 1 then
+		redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+	elseif redis.call('TTL', KEYS[1]) < 0 then
+		redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+	end
+	if current > tonumber(ARGV[1]) then
+		return 0
+	end
+	return 1
+`)
+
+// NewRedisRateLimiter creates a new RedisRateLimiter.
+func NewRedisRateLimiter(client redis.UniversalClient, prefix string, maxReqs int, window time.Duration, logger *slog.Logger) *RedisRateLimiter {
+	if prefix == "" {
+		prefix = "mcp:ratelimit"
 	}
-	go limiter.cleanupLoop()
-	return limiter
+	if window <= 0 {
+		window = time.Minute
+	}
+	if maxReqs <= 0 {
+		maxReqs = 60
+	}
+	return &RedisRateLimiter{
+		client:  client,
+		prefix:  prefix,
+		maxReqs: maxReqs,
+		window:  window,
+		logger:  logger,
+		script:  luaRateLimitScript,
+	}
 }
 
-// Allow checks if a request from the given IP is within rate limits.
-func (l *IPRateLimiter) Allow(ip string) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+// Allow atomically checks and increments the request counter in Redis for the given IP.
+// If Redis is nil or fails, it fails open to prevent blocking legitimate authentication traffic.
+func (r *RedisRateLimiter) Allow(ctx context.Context, ip string) bool {
+	if r == nil || r.client == nil || ip == "" {
+		return true
+	}
+	key := fmt.Sprintf("%s:%s", r.prefix, ip)
+	windowSecs := int(r.window.Seconds())
+	if windowSecs <= 0 {
+		windowSecs = 60
+	}
 
-	now := time.Now()
-	bucket, exists := l.limits[ip]
-	if !exists || now.After(bucket.resetTime) {
-		l.limits[ip] = &clientBucket{
-			count:     1,
-			resetTime: now.Add(l.window),
+	res, err := r.script.Run(ctx, r.client, []string{key}, r.maxReqs, windowSecs).Int()
+	if err != nil {
+		if r.logger != nil {
+			r.logger.Warn("Redis rate limit check failed; failing open", "error", err, "ip", ip, "key", key)
 		}
 		return true
 	}
-
-	if bucket.count >= l.maxReqs {
-		return false
-	}
-
-	bucket.count++
-	return true
+	return res == 1
 }
 
-func (l *IPRateLimiter) cleanupLoop() {
-	ticker := time.NewTicker(l.cleanInt)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-l.stopChan:
-			return
-		case now := <-ticker.C:
-			l.mu.Lock()
-			for ip, bucket := range l.limits {
-				if now.After(bucket.resetTime) {
-					delete(l.limits, ip)
-				}
-			}
-			l.mu.Unlock()
-		}
-	}
-}
-
-// Close stops background cleanup goroutines safely and idempotently.
-func (l *IPRateLimiter) Close() {
-	l.closeOnce.Do(func() {
-		close(l.stopChan)
-	})
-}
+// Close is a no-op for RedisRateLimiter as Redis TTL handles expiration without local background goroutines.
+func (r *RedisRateLimiter) Close() {}
 
 // ExtractClientIP extracts the client IP from RemoteAddr, or from X-Forwarded-For / X-Real-IP if RemoteAddr is a trusted proxy.
 func ExtractClientIP(r *http.Request, trustedProxies ...[]*net.IPNet) string {
 	remoteIPStr, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil || remoteIPStr == "" {
-		remoteIPStr = r.RemoteAddr
+		remoteIPStr = strings.Trim(strings.TrimSpace(r.RemoteAddr), "[]")
 	}
 	remoteIP := net.ParseIP(remoteIPStr)
 

@@ -127,6 +127,11 @@ func NewRedisSessionStore(client redis.UniversalClient, masterSecret []byte) (*R
 	}, nil
 }
 
+// Client returns the underlying Redis UniversalClient.
+func (s *RedisSessionStore) Client() redis.UniversalClient {
+	return s.client
+}
+
 // SaveSession encrypts and stores the session in Redis under an HMAC-SHA3-512 hashed key.
 func (s *RedisSessionStore) SaveSession(ctx context.Context, token string, session *SessionData, ttl time.Duration) error {
 	redisKey := sessionKeyPrefix + crypto.HashTokenKey(token, s.masterSecret)

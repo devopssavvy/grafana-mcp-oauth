@@ -1,13 +1,17 @@
 package oauth_test
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"grafana-mcp-oauth/pkg/config"
 	"grafana-mcp-oauth/pkg/oauth"
 )
@@ -77,20 +81,42 @@ func TestExtractClientIP_WithTrustedProxies(t *testing.T) {
 	})
 }
 
-func TestIPRateLimiter_AllowAndClose(t *testing.T) {
-	limiter := oauth.NewIPRateLimiter(2, 50*time.Millisecond)
-	defer limiter.Close()
+func TestRedisRateLimiter_DistributedSynchronization(t *testing.T) {
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	defer mr.Close()
+
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer rdb.Close()
+
+	ctx := context.Background()
+
+	// Simulate Replica 1 and Replica 2 sharing the same Redis instance
+	replica1 := oauth.NewRedisRateLimiter(rdb, "mcp:ratelimit:test", 3, 2*time.Second, nil)
+	replica2 := oauth.NewRedisRateLimiter(rdb, "mcp:ratelimit:test", 3, 2*time.Second, nil)
+	defer replica1.Close()
+	defer replica2.Close()
 
 	clientIP := "192.0.2.1"
-	assert.True(t, limiter.Allow(clientIP))
-	assert.True(t, limiter.Allow(clientIP))
-	assert.False(t, limiter.Allow(clientIP), "third request within window should be rejected")
 
-	// Wait for window reset
-	time.Sleep(60 * time.Millisecond)
-	assert.True(t, limiter.Allow(clientIP), "request after window expiration should be allowed")
+	// Request 1 on Replica 1
+	assert.True(t, replica1.Allow(ctx, clientIP), "replica1 request 1 should be allowed")
+	// Request 2 on Replica 2
+	assert.True(t, replica2.Allow(ctx, clientIP), "replica2 request 2 should be allowed")
+	// Request 3 on Replica 1
+	assert.True(t, replica1.Allow(ctx, clientIP), "replica1 request 3 should be allowed")
+	// Request 4 on Replica 2 - limit reached (3 requests), should be rejected across replicas
+	assert.False(t, replica2.Allow(ctx, clientIP), "replica2 request 4 should be rejected across replicas")
+	assert.False(t, replica1.Allow(ctx, clientIP), "replica1 request 5 should also be rejected")
 
-	// Verify Close is idempotent and does not panic
-	limiter.Close()
-	limiter.Close()
+	// Fast-forward miniredis time by 3 seconds
+	mr.FastForward(3 * time.Second)
+
+	// After window expires, counter resets
+	assert.True(t, replica1.Allow(ctx, clientIP), "request after window expiration should be allowed")
+}
+
+func TestRedisRateLimiter_FailOpenOnNilClient(t *testing.T) {
+	limiter := oauth.NewRedisRateLimiter(nil, "mcp:ratelimit:nil", 10, time.Minute, nil)
+	assert.True(t, limiter.Allow(context.Background(), "192.0.2.5"), "nil redis client should fail open")
 }

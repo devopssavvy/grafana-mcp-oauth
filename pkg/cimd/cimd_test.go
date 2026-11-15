@@ -85,6 +85,16 @@ func TestValidateDocument(t *testing.T) {
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "must not contain fragment")
 	})
+
+	t.Run("redirect_uri with invalid scheme", func(t *testing.T) {
+		doc := &cimd.Document{
+			ClientID:     "https://client.example.com/oauth/client.json",
+			RedirectURIs: []string{"javascript:alert(1)"},
+		}
+		err := cimd.ValidateDocument(doc, "https://client.example.com/oauth/client.json")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "scheme must be http or https")
+	})
 }
 
 func TestValidateRedirectURI(t *testing.T) {
@@ -229,11 +239,11 @@ func TestFetcher_Fetch(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&requestCount, 1)
 
-		if r.URL.Path == "/oauth/client.json" {
+		if r.URL.Path == "/oauth/client.json" || r.URL.Path == "/.well-known/oauth-client.json" {
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("Cache-Control", "max-age=3600")
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"client_id":     fmt.Sprintf("http://%s/oauth/client.json", r.Host),
+				"client_id":     fmt.Sprintf("http://%s%s", r.Host, r.URL.Path),
 				"client_name":   "My Coding Agent",
 				"redirect_uris": []string{"http://127.0.0.1/callback"},
 			})
@@ -313,6 +323,17 @@ func TestFetcher_Fetch(t *testing.T) {
 		_, err := f.Fetch(context.Background(), "http://example.com/a/../client.json")
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "relative dot-segments")
+	})
+
+	t.Run("RFC 8615 well-known path is permitted", func(t *testing.T) {
+		f := cimd.NewFetcher(cimd.FetcherConfig{
+			AllowInsecureHTTP: true,
+			HTTPClient:        server.Client(),
+		})
+		wellKnownURL := fmt.Sprintf("%s/.well-known/oauth-client.json", server.URL)
+		doc, err := f.Fetch(context.Background(), wellKnownURL)
+		require.NoError(t, err)
+		assert.Equal(t, wellKnownURL, doc.ClientID)
 	})
 
 	t.Run("query parameters in URL are rejected", func(t *testing.T) {
@@ -640,4 +661,21 @@ func TestFetcher_WithTwoTierCache(t *testing.T) {
 	assert.Equal(t, clientURL, doc3.ClientID)
 	assert.Equal(t, int64(1), atomic.LoadInt64(&reqCount))
 	assert.Equal(t, 1, l1.Len(), "L1 should be backfilled from L2")
+}
+
+func TestSSRF_RFC8215_And_PortRestriction(t *testing.T) {
+	t.Run("RFC 8215 local IPv4/IPv6 translation prefix is blocked", func(t *testing.T) {
+		ip := net.ParseIP("64:ff9b:1::1")
+		require.NotNil(t, ip)
+		assert.True(t, cimd.IsBlockedIP(ip, false), "64:ff9b:1::1 should be blocked")
+	})
+
+	t.Run("non-standard port rejected in secure fetcher", func(t *testing.T) {
+		f := cimd.NewFetcher(cimd.FetcherConfig{
+			AllowInsecureHTTP: false,
+		})
+		_, err := f.Fetch(context.Background(), "https://example.com:6379/client.json")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "is not permitted; must use standard HTTPS ports")
+	})
 }

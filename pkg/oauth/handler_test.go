@@ -864,6 +864,18 @@ func TestHandler_RefreshToken_CIMD_Required(t *testing.T) {
 		assert.Equal(t, http.StatusBadRequest, rec.Code)
 		assert.Contains(t, rec.Body.String(), "invalid_client")
 		assert.Contains(t, rec.Body.String(), "client_id parameter is required")
+
+		// Verify refresh token was NOT prematurely consumed, allowing client to retry with valid client_id
+		retryForm := url.Values{
+			"grant_type":    {"refresh_token"},
+			"refresh_token": {rt},
+			"client_id":     {clientID},
+		}
+		retryReq := httptest.NewRequest(http.MethodPost, "/mcp/auth/token", strings.NewReader(retryForm.Encode()))
+		retryReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		retryRec := httptest.NewRecorder()
+		h.HandleToken(retryRec, retryReq)
+		assert.Equal(t, http.StatusOK, retryRec.Code)
 	})
 
 	t.Run("mismatched client_id is rejected with 400 invalid_grant", func(t *testing.T) {
@@ -934,6 +946,34 @@ func TestHandler_RefreshToken_CIMD_Required(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, clientID, rotSess.ClientID)
 	})
+
+	t.Run("empty session client_id is rejected with 400 invalid_grant when CIMD is required", func(t *testing.T) {
+		rt := "mcp_rt_req_empty_sess"
+		sess := &store.SessionData{
+			UserID:         "42",
+			Username:       "bob",
+			ClientID:       "", // Empty client_id in stored session
+			GrafanaSession: "valid_grafana_session_123",
+			RefreshToken:   rt,
+			ExpiresAt:      time.Now().Add(1 * time.Hour),
+		}
+		require.NoError(t, st.SaveSession(ctx, "mcp_at_req_empty_sess", sess, 1*time.Hour))
+		require.NoError(t, st.SaveRefreshTokenSession(ctx, rt, sess, 24*time.Hour))
+
+		form := url.Values{
+			"grant_type":    {"refresh_token"},
+			"refresh_token": {rt},
+			"client_id":     {clientID},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/mcp/auth/token", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+
+		h.HandleToken(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, rec.Body.String(), "invalid_grant")
+		assert.Contains(t, rec.Body.String(), "client_id mismatch")
+	})
 }
 
 func TestHandler_RefreshToken_CIMD_Permissive(t *testing.T) {
@@ -954,12 +994,12 @@ func TestHandler_RefreshToken_CIMD_Permissive(t *testing.T) {
 	ctx := context.Background()
 	clientID := "https://trusted-client.example.com/client.json"
 
-	t.Run("missing client_id is allowed under permissive mode", func(t *testing.T) {
+	t.Run("missing client_id is allowed under permissive mode for non-CIMD session", func(t *testing.T) {
 		rt := "mcp_rt_perm_missing"
 		sess := &store.SessionData{
 			UserID:         "42",
 			Username:       "bob",
-			ClientID:       clientID,
+			ClientID:       "", // Non-CIMD session
 			GrafanaSession: "valid_grafana_session_123",
 			RefreshToken:   rt,
 			ExpiresAt:      time.Now().Add(1 * time.Hour),
@@ -977,6 +1017,32 @@ func TestHandler_RefreshToken_CIMD_Permissive(t *testing.T) {
 
 		h.HandleToken(rec, req)
 		assert.Equal(t, http.StatusOK, rec.Code)
+	})
+
+	t.Run("missing client_id is rejected under permissive mode when session has bound client_id", func(t *testing.T) {
+		rt := "mcp_rt_perm_bound_missing"
+		sess := &store.SessionData{
+			UserID:         "42",
+			Username:       "bob",
+			ClientID:       clientID, // CIMD-bound session
+			GrafanaSession: "valid_grafana_session_123",
+			RefreshToken:   rt,
+			ExpiresAt:      time.Now().Add(1 * time.Hour),
+		}
+		require.NoError(t, st.SaveSession(ctx, "mcp_at_perm_bound_missing", sess, 1*time.Hour))
+		require.NoError(t, st.SaveRefreshTokenSession(ctx, rt, sess, 24*time.Hour))
+
+		form := url.Values{
+			"grant_type":    {"refresh_token"},
+			"refresh_token": {rt},
+		}
+		req := httptest.NewRequest(http.MethodPost, "/mcp/auth/token", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+
+		h.HandleToken(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, rec.Body.String(), "invalid_client")
 	})
 
 	t.Run("mismatched client_id is rejected under permissive mode", func(t *testing.T) {

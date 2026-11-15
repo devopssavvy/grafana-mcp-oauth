@@ -84,11 +84,20 @@ func (f *Fetcher) Fetch(ctx context.Context, clientID string) (*Document, error)
 	if u.Hostname() == "" {
 		return nil, fmt.Errorf("client_id must have a valid host")
 	}
+	if port := u.Port(); port != "" {
+		if !f.cfg.AllowInsecureHTTP {
+			if port != "443" && port != "8443" {
+				return nil, fmt.Errorf("client_id port %s is not permitted; must use standard HTTPS ports (443, 8443)", port)
+			}
+		}
+	}
 	if u.Path == "" || u.Path == "/" {
 		return nil, fmt.Errorf("client_id must contain a path component")
 	}
-	if strings.Contains(u.Path, "/.") || strings.Contains(u.Path, "/..") {
-		return nil, fmt.Errorf("client_id path must not contain relative dot-segments")
+	for _, seg := range strings.Split(u.Path, "/") {
+		if seg == "." || seg == ".." {
+			return nil, fmt.Errorf("client_id path must not contain relative dot-segments")
+		}
 	}
 	if u.RawQuery != "" {
 		return nil, fmt.Errorf("client_id must not contain query parameters")
