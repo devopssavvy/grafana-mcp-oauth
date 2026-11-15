@@ -86,14 +86,32 @@ func TestE2E_FullSystemIntegration(t *testing.T) {
 	// Forward declaration of envoyGateway so handlers know their public entrypoint
 	var gatewayURL string
 
+	// Mock Client ID Metadata Document (CIMD) server
+	mockCIMD := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/oauth/client.json" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"client_id":     fmt.Sprintf("http://%s/oauth/client.json", r.Host),
+				"client_name":   "Cursor MCP Agent",
+				"redirect_uris": []string{"http://127.0.0.1", "http://127.0.0.1/callback", "http://localhost", "http://localhost/callback"},
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer mockCIMD.Close()
+	cimdClientID := fmt.Sprintf("%s/oauth/client.json", mockCIMD.URL)
+
 	// 3. mcp-auth-helper (OAuth handler + ext_authz server)
 	oauthHandler := oauth.NewHandler(oauth.Config{
-		BaseURL:         "http://gateway.local:8080",
-		GrafanaURL:      mockGrafana.URL,
-		CallbackBaseURL: "http://gateway.local:8080/mcp/auth/callback",
-		SessionTTL:      2 * time.Hour,
-		RefreshTTL:      30 * 24 * time.Hour,
-		HTTPClient:      mockGrafana.Client(),
+		BaseURL:               "http://gateway.local:8080",
+		GrafanaURL:            mockGrafana.URL,
+		CallbackBaseURL:       "http://gateway.local:8080/mcp/auth/callback",
+		SessionTTL:            2 * time.Hour,
+		RefreshTTL:            30 * 24 * time.Hour,
+		HTTPClient:            mockGrafana.Client(),
+		CIMDEnforcement:       "required",
+		CIMDAllowInsecureHTTP: true,
 	}, sessionStore)
 
 	extAuthServer := extauthz.NewServer(sessionStore, "http://gateway.local:8080", nil)
@@ -269,6 +287,7 @@ func TestE2E_FullSystemIntegration(t *testing.T) {
 
 		assert.Equal(t, "http://gateway.local:8080/mcp/auth/login", authMeta["authorization_endpoint"])
 		assert.Equal(t, "http://gateway.local:8080/mcp/auth/token", authMeta["token_endpoint"])
+		assert.Equal(t, true, authMeta["client_id_metadata_document_supported"])
 	})
 
 	t.Run("Scenario 3: Complete Zero-Manual-Input Client PKCE Authorization Flow", func(t *testing.T) {
@@ -286,18 +305,31 @@ func TestE2E_FullSystemIntegration(t *testing.T) {
 		hSha := sha256.Sum256([]byte(verifier))
 		challenge := base64.RawURLEncoding.EncodeToString(hSha[:])
 
-		// 3. Client opens the authorization_endpoint in user's browser
-		loginURL := fmt.Sprintf("%s/mcp/auth/login?response_type=code&client_id=cursor&redirect_uri=%s&code_challenge=%s&code_challenge_method=S256&state=state_auto_flow",
-			gatewayURL,
-			url.QueryEscape(localAgentServer.URL),
-			challenge,
-		)
-
 		noRedirectClient := &http.Client{
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
 		}
+
+		// 3a. Verify that an unauthenticated client attempting login without CIMD is rejected under CIMD enforcement
+		invalidLoginURL := fmt.Sprintf("%s/mcp/auth/login?response_type=code&client_id=legacy-client&redirect_uri=%s&code_challenge=%s&code_challenge_method=S256&state=state_auto_flow",
+			gatewayURL,
+			url.QueryEscape(localAgentServer.URL),
+			challenge,
+		)
+		invalidResp, err := noRedirectClient.Get(invalidLoginURL)
+		require.NoError(t, err)
+		defer invalidResp.Body.Close()
+		assert.Equal(t, http.StatusBadRequest, invalidResp.StatusCode)
+
+		// 3b. Client opens the authorization_endpoint in user's browser with valid CIMD client_id
+		loginURL := fmt.Sprintf("%s/mcp/auth/login?response_type=code&client_id=%s&redirect_uri=%s&code_challenge=%s&code_challenge_method=S256&state=state_auto_flow",
+			gatewayURL,
+			url.QueryEscape(cimdClientID),
+			url.QueryEscape(localAgentServer.URL),
+			challenge,
+		)
+
 		loginResp, err := noRedirectClient.Get(loginURL)
 		require.NoError(t, err)
 		defer loginResp.Body.Close()
@@ -340,6 +372,7 @@ func TestE2E_FullSystemIntegration(t *testing.T) {
 		form.Set("code", receivedAuthCode)
 		form.Set("code_verifier", verifier)
 		form.Set("redirect_uri", localAgentServer.URL)
+		form.Set("client_id", cimdClientID)
 
 		tokenReq, err := http.NewRequest(http.MethodPost, gatewayURL+"/mcp/auth/token", strings.NewReader(form.Encode()))
 		require.NoError(t, err)
@@ -437,16 +470,33 @@ func TestE2E_UnifiedProxyServer(t *testing.T) {
 	defer rdb.Close()
 
 	// 4. Start Unified Server in ModeProxy
+	mockProxyCIMD := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/oauth/client.json" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"client_id":     fmt.Sprintf("http://%s/oauth/client.json", r.Host),
+				"client_name":   "Proxy Test Agent",
+				"redirect_uris": []string{"http://127.0.0.1", "http://127.0.0.1/callback", "http://localhost", "http://localhost/callback"},
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer mockProxyCIMD.Close()
+	proxyCIMDClientID := fmt.Sprintf("%s/oauth/client.json", mockProxyCIMD.URL)
+
 	cfg := &config.AppConfig{
-		Mode:             server.ModeProxy,
-		HTTPPort:         "0",
-		BaseURL:          "http://127.0.0.1",
-		GrafanaURL:       mockGrafana.URL,
-		GrafanaPublicURL: mockGrafana.URL,
-		TargetMCPURL:     mockMCP.URL,
-		MasterSecret:     []byte("test-32-byte-master-secret-key!"),
-		SessionTTL:       time.Hour,
-		RefreshTTL:       time.Hour * 24,
+		Mode:                  server.ModeProxy,
+		HTTPPort:              "0",
+		BaseURL:               "http://127.0.0.1",
+		GrafanaURL:            mockGrafana.URL,
+		GrafanaPublicURL:      mockGrafana.URL,
+		TargetMCPURL:          mockMCP.URL,
+		MasterSecret:          []byte("test-32-byte-master-secret-key!"),
+		SessionTTL:            time.Hour,
+		RefreshTTL:            time.Hour * 24,
+		CIMDEnforcement:       "required",
+		CIMDAllowInsecureHTTP: true,
 	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -496,9 +546,9 @@ func TestE2E_UnifiedProxyServer(t *testing.T) {
 	}))
 	defer localAgent.Close()
 
-	// Initiate login
-	loginURL := fmt.Sprintf("%s/mcp/auth/login?client_id=agent&redirect_uri=%s&code_challenge=%s&code_challenge_method=S256&state=random123",
-		gatewayURL, url.QueryEscape(localAgent.URL), codeChallenge)
+	// Initiate login with CIMD client_id
+	loginURL := fmt.Sprintf("%s/mcp/auth/login?client_id=%s&redirect_uri=%s&code_challenge=%s&code_challenge_method=S256&state=random123",
+		gatewayURL, url.QueryEscape(proxyCIMDClientID), url.QueryEscape(localAgent.URL), codeChallenge)
 
 	noFollowClient := &http.Client{
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -543,6 +593,7 @@ func TestE2E_UnifiedProxyServer(t *testing.T) {
 	form.Set("code", localReceivedCode)
 	form.Set("code_verifier", codeVerifier)
 	form.Set("redirect_uri", localAgent.URL)
+	form.Set("client_id", proxyCIMDClientID)
 
 	tokenReq, err := http.NewRequest(http.MethodPost, gatewayURL+"/mcp/auth/token", strings.NewReader(form.Encode()))
 	require.NoError(t, err)

@@ -30,8 +30,9 @@ func main() {
 		flagGRPCHost     = flag.String("grpc-host", "", "gRPC host/interface to listen on [env: GRPC_HOST or BIND_HOST]")
 		flagGRPCPort     = flag.String("grpc-port", "", "gRPC port to listen on for Envoy ext_authz [env: GRPC_PORT]")
 		flagCookieSecure = flag.String("cookie-secure", "", "Force Secure flag on cookies ('true' or 'false') [env: COOKIE_SECURE]")
-		flagTargetMCPURL = flag.String("target-mcp-url", "", "Upstream stock MCP Server URL for proxying [env: TARGET_MCP_URL]")
-		flagVersion      = flag.Bool("version", false, "Print version and exit")
+		flagTargetMCPURL    = flag.String("target-mcp-url", "", "Upstream stock MCP Server URL for proxying [env: TARGET_MCP_URL]")
+		flagCIMDEnforcement = flag.String("cimd-enforcement", "", "CIMD enforcement mode: 'required' (default), 'permissive', or 'disabled' [env: CIMD_ENFORCEMENT]")
+		flagVersion         = flag.Bool("version", false, "Print version and exit")
 	)
 
 	flag.Usage = func() {
@@ -58,6 +59,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  REDIS_TLS_SERVER_NAME Override Server Name Indication (SNI)\n")
 		fmt.Fprintf(os.Stderr, "  REDIS_TLS_INSECURE_SKIP_VERIFY Skip Redis server cert verification (dev only)\n")
 		fmt.Fprintf(os.Stderr, "  MCP_MASTER_SECRET    32-byte encryption key for zero-knowledge session store\n")
+		fmt.Fprintf(os.Stderr, "  CIMD_ENFORCEMENT     CIMD enforcement mode: required (default), permissive, disabled\n")
+		fmt.Fprintf(os.Stderr, "  CIMD_ALLOW_INSECURE_HTTP Allow insecure HTTP and loopback for CIMD in dev (default false)\n")
+		fmt.Fprintf(os.Stderr, "  CIMD_CACHE_TTL       Cache TTL for CIMD metadata (default 1h)\n")
 	}
 
 	flag.Parse()
@@ -99,6 +103,9 @@ func main() {
 	}
 	if *flagTargetMCPURL != "" {
 		cfg.TargetMCPURL = *flagTargetMCPURL
+	}
+	if *flagCIMDEnforcement != "" {
+		cfg.CIMDEnforcement = strings.ToLower(strings.TrimSpace(*flagCIMDEnforcement))
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))

@@ -115,7 +115,13 @@ Key capabilities:
 2. **OAuth 2.1 PKCE Authorization Code Flow**:
    - `GET /mcp/auth/login`: Triggers browser authentication via Grafana Generic OAuth (`/login/generic_oauth?redirect=/mcp/auth/callback`). Enforces PKCE `S256` per RFC 9700. Prevents Open Redirect by strictly validating `redirect_uri` to loopback local interfaces only (`http://localhost`, `http://127.0.0.1`, `http://[::1]`) and prohibiting URI fragments. Sets browser cookie `mcp_auth_state` (SameSite=Lax, HttpOnly) to completely eliminate OAuth Login CSRF.
    - `GET /mcp/auth/callback`: Validates the `mcp_auth_state` cookie, captures the `grafana_session` cookie from Grafana's response, verifies identity via `/api/user` (strictly rejecting forged sessions), issues a single-use authorization code `mcp_code_...` encrypted and stored in Redis with a 5-minute TTL, then redirects back to the client loopback.
-   - `POST /mcp/auth/token`: Validates authorization code and `code_verifier` using constant-time comparison (`subtle.ConstantTimeCompare`), strictly verifies exact `redirect_uri` match per RFC 6749 Section 4.1.3, and issues JSON `mcp_access_token` and `mcp_refresh_token` pairs with a `Cache-Control: no-store` header. Supports `grant_type=refresh_token` flow with atomic token rotation and proactive Grafana session liveness checks.
+   - `POST /mcp/auth/token`: Validates authorization code and `code_verifier` using constant-time comparison (`subtle.ConstantTimeCompare`), strictly verifies exact `redirect_uri` match per RFC 6749 Section 4.1.3, verifies `client_id` match when provided, and issues JSON `mcp_access_token` and `mcp_refresh_token` pairs with a `Cache-Control: no-store` header. Supports `grant_type=refresh_token` flow with atomic token rotation and proactive Grafana session liveness checks.
+3. **Client ID Metadata Document (CIMD) Enforcement (`draft-ietf-oauth-client-id-metadata-document`)**:
+   - **Enforcement by Default**: Enforces that clients must identify themselves using a CIMD HTTPS URL as their `client_id` (`CIMD_ENFORCEMENT=required`). Requests without a valid CIMD client ID or attempting unauthorized `redirect_uri` values are rejected immediately with HTTP 400 (`invalid_client`).
+   - **SSRF Defense-in-Depth**: Outbound document fetching employs a dedicated secure HTTP transport with custom DNS resolution pinning. It actively blocks all private/internal networks (RFC 1918), loopback, link-local / cloud provider instance metadata endpoints (`169.254.169.254`), multicast, and reserved CIDRs to eliminate Server-Side Request Forgery risks.
+   - **RFC 8252 Dynamic Loopback Port Matching**: Native MCP clients (Cursor, Claude Desktop, Antigravity) binding to ephemeral ports on loopback interfaces (`127.0.0.1`, `localhost`, `::1`) are fully accommodated per RFC 8252 Section 7.3 while maintaining strict path and scheme checks against the registered `redirect_uris`.
+   - **Anti-DoS Caching & Limits**: Fetched documents are cached in-memory with automatic TTL (honoring `Cache-Control: max-age` or default 1 hour). Response body size is bounded to 64KB with a 5-second timeout and redirects are prohibited.
+   - **RFC 8414 Discovery**: Automatically advertises `"client_id_metadata_document_supported": true` at `/.well-known/oauth-authorization-server`.
 
 ### 2.2. Zero-Knowledge Cryptographic Storage & Distributed State in Redis
 * **Distributed State**: All pending login states (`mcp:pending_auth:`) and authorization codes (`mcp:auth_code:`) are distributed in Redis with automatic TTLs, fully supporting horizontal scaling (Horizontal Pod Autoscaling / Multi-replica).
@@ -258,11 +264,13 @@ go test -v -count=1 -race ./...
 ```
 
 100% verified automated test scenarios:
+- [x] **`pkg/cimd`**: Verifies Client ID Metadata Document (CIMD) validation per `draft-ietf-oauth-client-id-metadata-document`, RFC 8252 Section 7.3 dynamic loopback port matching, DNS pinning SSRF defenses (blocking private/link-local/cloud-metadata CIDRs), in-memory TTL caching, and 64KB body bounds.
+- [x] **`pkg/config`**: Verifies configuration loading from environment variables, including `CIMD_ENFORCEMENT`, `CIMD_ALLOW_INSECURE_HTTP`, and `CIMD_CACHE_TTL`.
 - [x] **`pkg/crypto`**: Verifies HMAC-SHA3-512, HKDF-SHA3-512, Argon2id, XChaCha20-Poly1305 AEAD encryption/decryption, and tamper resistance.
 - [x] **`pkg/store`**: Verifies Zero-Knowledge encryption in Redis, ensures raw storage contains no plaintext tokens or sessions, verifies session updates and refresh token rotation.
-- [x] **`pkg/oauth`**: Verifies RFC 9728 & RFC 8414 metadata, blocks Open Redirects against external redirect_uris, rejects forged sessions, and validates the complete PKCE S256 lifecycle and refresh flow.
+- [x] **`pkg/oauth`**: Verifies RFC 9728 & RFC 8414 metadata, blocks Open Redirects against external redirect_uris, rejects forged sessions, enforces CIMD validation and client_id consistency, and validates the complete PKCE S256 lifecycle and refresh flow.
 - [x] **`pkg/extauthz`**: Verifies gRPC Check requests, verifies RFC 9728 challenge headers on missing tokens, extracts Bearer tokens, strips Authorization headers, and injects `Cookie: grafana_session=...`.
-- [x] **`test/e2e_test.go`**: Simulates the complete End-to-End flow: Web User, Coding Agent automated MCP OAuth Discovery, Envoy Gateway, `mcp-grafana`, and Grafana Datasource OAuth Passthru.
+- [x] **`test/e2e_test.go`**: Simulates the complete End-to-End flow: Web User, Coding Agent automated MCP OAuth Discovery, Envoy Gateway, `mcp-grafana`, CIMD enforcement, and Grafana Datasource OAuth Passthru.
 
 ## License
 

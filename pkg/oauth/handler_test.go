@@ -58,6 +58,7 @@ func setupOAuthTestEnv(t *testing.T) (*oauth.Handler, *store.RedisSessionStore, 
 		SessionTTL:       1 * time.Hour,
 		RefreshTTL:       24 * time.Hour,
 		HTTPClient:       mockGrafana.Client(),
+		CIMDEnforcement:  "disabled",
 	}
 
 	h := oauth.NewHandler(cfg, st)
@@ -456,4 +457,248 @@ func TestHandler_RateLimiting(t *testing.T) {
 	}
 
 	assert.Equal(t, http.StatusTooManyRequests, lastCode, "Request exceeding rate limit must receive 429 Too Many Requests")
+}
+
+func TestHandler_CIMD_Enforcement(t *testing.T) {
+	// Set up mock Grafana server
+	mockGrafana := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/user" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(oauth.GrafanaUser{
+				ID:    1,
+				Login: "alice",
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer mockGrafana.Close()
+
+	// Set up mock CIMD server
+	mockCIMD := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/oauth/client.json" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"client_id":     fmt.Sprintf("http://%s/oauth/client.json", r.Host),
+				"client_name":   "Valid MCP Client",
+				"redirect_uris": []string{"http://127.0.0.1/callback", "http://localhost/callback"},
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer mockCIMD.Close()
+
+	validClientID := fmt.Sprintf("%s/oauth/client.json", mockCIMD.URL)
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st, err := store.NewRedisSessionStore(rdb, []byte("super-secret-master-salt-1234567890"))
+	require.NoError(t, err)
+
+	verifier, challenge := generateTestPKCE()
+
+	t.Run("required mode: missing client_id is rejected", func(t *testing.T) {
+		h := oauth.NewHandler(oauth.Config{
+			BaseURL:               "http://localhost:8080",
+			GrafanaURL:            mockGrafana.URL,
+			CIMDEnforcement:       "required",
+			CIMDAllowInsecureHTTP: true,
+		}, st)
+		defer h.Close()
+
+		req := httptest.NewRequest(http.MethodGet, "/mcp/auth/login?redirect_uri=http://127.0.0.1:54321/callback&code_challenge="+challenge+"&code_challenge_method=S256", nil)
+		rec := httptest.NewRecorder()
+		h.HandleLogin(rec, req)
+
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, rec.Body.String(), "client_id is required")
+	})
+
+	t.Run("required mode: non-URL client_id is rejected", func(t *testing.T) {
+		h := oauth.NewHandler(oauth.Config{
+			BaseURL:               "http://localhost:8080",
+			GrafanaURL:            mockGrafana.URL,
+			CIMDEnforcement:       "required",
+			CIMDAllowInsecureHTTP: true,
+		}, st)
+		defer h.Close()
+
+		req := httptest.NewRequest(http.MethodGet, "/mcp/auth/login?client_id=plain-string-agent&redirect_uri=http://127.0.0.1:54321/callback&code_challenge="+challenge+"&code_challenge_method=S256", nil)
+		rec := httptest.NewRecorder()
+		h.HandleLogin(rec, req)
+
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, rec.Body.String(), "invalid_client")
+	})
+
+	t.Run("required mode: redirect_uri not in metadata is rejected", func(t *testing.T) {
+		h := oauth.NewHandler(oauth.Config{
+			BaseURL:               "http://localhost:8080",
+			GrafanaURL:            mockGrafana.URL,
+			CIMDEnforcement:       "required",
+			CIMDAllowInsecureHTTP: true,
+		}, st)
+		defer h.Close()
+
+		req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/mcp/auth/login?client_id=%s&redirect_uri=http://127.0.0.1:54321/unauthorized-path&code_challenge=%s&code_challenge_method=S256", url.QueryEscape(validClientID), challenge), nil)
+		rec := httptest.NewRecorder()
+		h.HandleLogin(rec, req)
+
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, rec.Body.String(), "not authorized in client metadata document")
+	})
+
+	t.Run("required mode: valid CIMD with dynamic loopback port succeeds", func(t *testing.T) {
+		h := oauth.NewHandler(oauth.Config{
+			BaseURL:               "http://localhost:8080",
+			GrafanaURL:            mockGrafana.URL,
+			CIMDEnforcement:       "required",
+			CIMDAllowInsecureHTTP: true,
+		}, st)
+		defer h.Close()
+
+		// Uses ephemeral port 59182 on 127.0.0.1, matching document's http://127.0.0.1/callback per RFC 8252 Sec 7.3
+		loginURI := fmt.Sprintf("/mcp/auth/login?client_id=%s&redirect_uri=%s&code_challenge=%s&code_challenge_method=S256",
+			url.QueryEscape(validClientID),
+			url.QueryEscape("http://127.0.0.1:59182/callback"),
+			challenge,
+		)
+		req := httptest.NewRequest(http.MethodGet, loginURI, nil)
+		rec := httptest.NewRecorder()
+		h.HandleLogin(rec, req)
+
+		assert.Equal(t, http.StatusFound, rec.Code)
+		assert.Contains(t, rec.Header().Get("Location"), "/login/generic_oauth")
+
+		// Extract mcp_auth_state cookie
+		var stateCookie *http.Cookie
+		for _, c := range rec.Result().Cookies() {
+			if c.Name == "mcp_auth_state" {
+				stateCookie = c
+				break
+			}
+		}
+		require.NotNil(t, stateCookie)
+
+		// Complete callback
+		cbReq := httptest.NewRequest(http.MethodGet, "/mcp/auth/callback?mcp_state="+stateCookie.Value, nil)
+		cbReq.AddCookie(stateCookie)
+		cbReq.AddCookie(&http.Cookie{Name: "grafana_session", Value: "valid_session_12345"})
+		cbRec := httptest.NewRecorder()
+		h.HandleCallback(cbRec, cbReq)
+
+		assert.Equal(t, http.StatusFound, cbRec.Code)
+		cbLoc := cbRec.Header().Get("Location")
+		assert.Contains(t, cbLoc, "http://127.0.0.1:59182/callback?code=mcp_code_")
+
+		u, err := url.Parse(cbLoc)
+		require.NoError(t, err)
+		authCode := u.Query().Get("code")
+		require.NotEmpty(t, authCode)
+
+		// Token exchange with matching client_id
+		tokenBody := url.Values{
+			"grant_type":    {"authorization_code"},
+			"code":          {authCode},
+			"code_verifier": {verifier},
+			"redirect_uri":  {"http://127.0.0.1:59182/callback"},
+			"client_id":     {validClientID},
+		}
+		tokReq := httptest.NewRequest(http.MethodPost, "/mcp/auth/token", strings.NewReader(tokenBody.Encode()))
+		tokReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		tokRec := httptest.NewRecorder()
+		h.HandleToken(tokRec, tokReq)
+
+		assert.Equal(t, http.StatusOK, tokRec.Code)
+		var tokResp oauth.TokenResponse
+		err = json.NewDecoder(tokRec.Body).Decode(&tokResp)
+		require.NoError(t, err)
+		assert.NotEmpty(t, tokResp.AccessToken)
+	})
+
+	t.Run("token exchange with mismatched client_id fails", func(t *testing.T) {
+		h := oauth.NewHandler(oauth.Config{
+			BaseURL:               "http://localhost:8080",
+			GrafanaURL:            mockGrafana.URL,
+			CIMDEnforcement:       "required",
+			CIMDAllowInsecureHTTP: true,
+		}, st)
+		defer h.Close()
+
+		loginURI := fmt.Sprintf("/mcp/auth/login?client_id=%s&redirect_uri=%s&code_challenge=%s&code_challenge_method=S256",
+			url.QueryEscape(validClientID),
+			url.QueryEscape("http://127.0.0.1:59182/callback"),
+			challenge,
+		)
+		req := httptest.NewRequest(http.MethodGet, loginURI, nil)
+		rec := httptest.NewRecorder()
+		h.HandleLogin(rec, req)
+		require.Equal(t, http.StatusFound, rec.Code)
+
+		var stateCookie *http.Cookie
+		for _, c := range rec.Result().Cookies() {
+			if c.Name == "mcp_auth_state" {
+				stateCookie = c
+				break
+			}
+		}
+		require.NotNil(t, stateCookie)
+
+		cbReq := httptest.NewRequest(http.MethodGet, "/mcp/auth/callback?mcp_state="+stateCookie.Value, nil)
+		cbReq.AddCookie(stateCookie)
+		cbReq.AddCookie(&http.Cookie{Name: "grafana_session", Value: "valid_session_12345"})
+		cbRec := httptest.NewRecorder()
+		h.HandleCallback(cbRec, cbReq)
+		require.Equal(t, http.StatusFound, cbRec.Code)
+
+		u, err := url.Parse(cbRec.Header().Get("Location"))
+		require.NoError(t, err)
+		authCode := u.Query().Get("code")
+
+		// Token exchange with wrong client_id
+		tokenBody := url.Values{
+			"grant_type":    {"authorization_code"},
+			"code":          {authCode},
+			"code_verifier": {verifier},
+			"redirect_uri":  {"http://127.0.0.1:59182/callback"},
+			"client_id":     {"https://imposter.example.com/client.json"},
+		}
+		tokReq := httptest.NewRequest(http.MethodPost, "/mcp/auth/token", strings.NewReader(tokenBody.Encode()))
+		tokReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		tokRec := httptest.NewRecorder()
+		h.HandleToken(tokRec, tokReq)
+
+		assert.Equal(t, http.StatusBadRequest, tokRec.Code)
+		assert.Contains(t, tokRec.Body.String(), "client_id mismatch")
+	})
+
+	t.Run("RFC 8414 metadata advertises CIMD support", func(t *testing.T) {
+		hRequired := oauth.NewHandler(oauth.Config{
+			BaseURL:         "http://localhost:8080",
+			CIMDEnforcement: "required",
+		}, st)
+		defer hRequired.Close()
+
+		rec := httptest.NewRecorder()
+		hRequired.HandleAuthorizationServerMetadata(rec, httptest.NewRequest(http.MethodGet, "/.well-known/oauth-authorization-server", nil))
+		assert.Equal(t, http.StatusOK, rec.Code)
+		var meta map[string]interface{}
+		err := json.NewDecoder(rec.Body).Decode(&meta)
+		require.NoError(t, err)
+		assert.Equal(t, true, meta["client_id_metadata_document_supported"])
+
+		hDisabled := oauth.NewHandler(oauth.Config{
+			BaseURL:         "http://localhost:8080",
+			CIMDEnforcement: "disabled",
+		}, st)
+		defer hDisabled.Close()
+
+		rec2 := httptest.NewRecorder()
+		hDisabled.HandleAuthorizationServerMetadata(rec2, httptest.NewRequest(http.MethodGet, "/.well-known/oauth-authorization-server", nil))
+		var meta2 map[string]interface{}
+		err = json.NewDecoder(rec2.Body).Decode(&meta2)
+		require.NoError(t, err)
+		assert.Nil(t, meta2["client_id_metadata_document_supported"])
+	})
 }
