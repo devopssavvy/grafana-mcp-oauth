@@ -127,8 +127,9 @@ sequenceDiagram
     participant DS as Datasource (OAuth Passthru)
 
     Note over Dev,Grafana: Phase 1: User Login & Session Harvesting
-    Dev->>Envoy: 1. Access /mcp/auth/login?redirect_uri=... (PKCE S256)
+    Dev->>Envoy: 1. Access /mcp/auth/login?client_id=https://.../client.json&redirect_uri=... (PKCE S256)
     Envoy->>Gateway: 2. Proxy to grafana-mcp-oauth
+    Note over Gateway: CIMD Enforcement: Validate HTTPS client_id, Safe Outbound Fetch (SSRF Filter & DNS Pinning), Verify redirect_uri per RFC 8252
     Gateway-->>Dev: 3. HTTP 302 Redirect to /login/generic_oauth?redirect=/mcp/auth/callback
     Dev->>Grafana: 4. Open Grafana SSO login page (IdP authentication)
     Grafana->>Grafana: 5. Exchange OAuth code with IdP -> store tokens in user_auth -> issue grafana_session
@@ -232,7 +233,55 @@ The system establishes multi-layered session security to ensure end-to-end prote
 
 ---
 
-## 5. Unified Runtime & Operating Modes
+## 5. Client ID Metadata Document (CIMD) & Zero-Trust Client Verification
+
+Per `draft-ietf-oauth-client-id-metadata-document`, Model Context Protocol (MCP) clients can dynamically authenticate to authorization servers without requiring manual pre-registration or stateful Dynamic Client Registration (RFC 7591) endpoints.
+
+### 5.1. Enforcement Lifecycle & Validation Flow
+
+```mermaid
+flowchart TD
+    Req["Client sends /mcp/auth/login?<br/>client_id=https://.../client.json&<br/>redirect_uri=http://127.0.0.1:54321/cb"]
+    
+    CheckMode{"CIMD Enforcement Mode"}
+    CheckMode -->|"disabled"| Skip["Bypass CIMD Checks"]
+    CheckMode -->|"permissive"| CheckURL{"Is client_id a URL?"}
+    CheckMode -->|"required (default)"| CheckMissing{"client_id present & valid URL?"}
+
+    CheckMissing -->|"No"| Reject400["HTTP 400 Bad Request (invalid_client)"]
+    CheckMissing -->|"Yes"| CacheCheck{"In Memory Cache?"}
+
+    CheckURL -->|"No"| Skip
+    CheckURL -->|"Yes"| CacheCheck
+
+    CacheCheck -->|"Hit"| CheckDoc["Validate Document & redirect_uris"]
+    CacheCheck -->|"Miss"| SafeDial["DNS Resolution & SSRF Filtering"]
+
+    SafeDial -->|"Private/Loopback/Cloud-Metadata IP"| RejectSSRF["Block Outbound Fetch (SSRF Protection) -> HTTP 400"]
+    SafeDial -->|"Safe Public IP"| Fetch["Dial Pinned IP (Max 64KB, 5s timeout, No Redirects)"]
+
+    Fetch --> ParseJSON["Parse & Validate JSON: doc.client_id == requestedURL"]
+    ParseJSON --> CacheSet["Cache with TTL (Cache-Control max-age or default 1h)"]
+    CacheSet --> CheckDoc
+
+    CheckDoc --> MatchURI{"redirect_uri authorized in doc.redirect_uris?<br/>(RFC 8252 Dynamic Loopback Port Matching)"}
+    MatchURI -->|"No"| RejectURI["HTTP 400 Bad Request (invalid_client)"]
+    MatchURI -->|"Yes"| Proceed["Proceed to Grafana SSO Login (HTTP 302)"]
+    Skip --> Proceed
+```
+
+### 5.2. Defense-in-Depth Architecture
+1. **SSRF Prevention & DNS Pinning**: Outbound fetches resolve hostnames via `net.Resolver` and inspect all returned IP addresses against a comprehensive CIDR blacklist:
+   - IPv4: Loopback (`127.0.0.0/8`), Private networks (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), Link-local / Cloud metadata service (`169.254.0.0/16`, targeting `169.254.169.254`), Shared address space (`100.64.0.0/10`), Multicast, and Reserved networks.
+   - IPv6: Loopback (`::1/128`), ULA (`fc00::/7`), Link-local (`fe80::/10`), Multicast (`ff00::/8`).
+   - The connection dials the validated IP directly (`safeIP:port`), effectively defeating DNS Rebinding attacks.
+   - Redirects are strictly prohibited on metadata fetches to prevent redirect-based SSRF.
+2. **RFC 8252 Section 7.3 Ephemeral Port Compatibility**: Native MCP coding agents (Cursor, Claude Desktop, Antigravity) listen on random ephemeral loopback ports (`http://127.0.0.1:<port>/callback` or `http://localhost:<port>/callback`). `pkg/cimd` verifies that the scheme, host category (loopback), and path match an authorized loopback URI in the client document, allowing arbitrary local ports while strictly enforcing exact matching for non-loopback URLs.
+3. **In-Memory Thread-Safe Cache**: Eliminates redundant outbound fetches and protects client metadata servers from DoS. Bounded to 64KB per document with a 5-second HTTP deadline.
+
+---
+
+## 6. Unified Runtime & Operating Modes
 
 The gateway is built as a single, multi-architecture static binary (`grafana-mcp-oauth`) packaged into a minimal Distroless runtime (`gcr.io/distroless/static-debian12:nonroot`). It supports three distinct modes:
 
@@ -253,7 +302,7 @@ The gateway is built as a single, multi-architecture static binary (`grafana-mcp
 
 ---
 
-## 6. Project File Layout
+## 7. Project File Layout
 
 ```
 .
@@ -263,8 +312,14 @@ The gateway is built as a single, multi-architecture static binary (`grafana-mcp
 │   └── grafana-mcp-oauth
 │       └── main.go                 # Unified Gateway entrypoint (proxy, extauthz, all modes)
 ├── pkg
+│   ├── cimd
+│   │   ├── cache.go                # Thread-safe in-memory cache with TTL support
+│   │   ├── document.go             # CIMD Document model, RFC 8252 loopback matching & validation
+│   │   ├── fetcher.go              # Document fetcher, URL syntax checks, Cache-Control parsing
+│   │   ├── ssrf.go                 # SSRF safe dialer, DNS pinning, private/cloud IP blacklist
+│   │   └── cimd_test.go            # Comprehensive unit tests for CIMD validation & SSRF defense
 │   ├── config
-│   │   ├── config.go               # Configuration loader supporting MODE and port overrides
+│   │   ├── config.go               # Configuration loader supporting MODE, port, and CIMD settings
 │   │   └── config_test.go          # Config unit tests
 │   ├── server
 │   │   ├── server.go               # Unified Server managing HTTP Mux, gRPC, and Proxy

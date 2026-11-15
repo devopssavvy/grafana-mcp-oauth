@@ -136,9 +136,12 @@ func New(opts Options) (*Server, error) {
 		RefreshTTL:        cfg.RefreshTTL,
 		PendingAuthTTL:    cfg.PendingAuthTTL,
 		AuthCodeTTL:       cfg.AuthCodeTTL,
-		RateLimitLoginRPM: cfg.RateLimitLoginRPM,
-		RateLimitTokenRPM: cfg.RateLimitTokenRPM,
-		Logger:            logger,
+		RateLimitLoginRPM:     cfg.RateLimitLoginRPM,
+		RateLimitTokenRPM:     cfg.RateLimitTokenRPM,
+		CIMDEnforcement:       cfg.CIMDEnforcement,
+		CIMDAllowInsecureHTTP: cfg.CIMDAllowInsecureHTTP,
+		CIMDCacheTTL:          cfg.CIMDCacheTTL,
+		Logger:                logger,
 	}, sessionStore)
 
 	s := &Server{

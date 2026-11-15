@@ -16,28 +16,33 @@ import (
 	"strings"
 	"time"
 
+	"grafana-mcp-oauth/pkg/cimd"
 	"grafana-mcp-oauth/pkg/crypto"
 	"grafana-mcp-oauth/pkg/store"
 )
 
 // Config holds configuration parameters for the OAuth handler.
 type Config struct {
-	BaseURL           string // e.g. "http://localhost:8080" (Gateway Public Base URL)
-	GrafanaURL        string // e.g. "http://grafana:3000" (Internal backend API URL)
-	GrafanaPublicURL  string // e.g. "http://localhost:8080" (Public URL for browser redirects, defaults to BaseURL)
-	CallbackBaseURL   string // e.g. "http://localhost:8080/mcp/auth/callback" or relative "/mcp/auth/callback"
-	CookieSecure      bool   // Force Secure attribute on cookies
-	IdPTokenURL       string
-	ClientID          string
-	ClientSecret      string
-	SessionTTL        time.Duration
-	RefreshTTL        time.Duration
-	PendingAuthTTL    time.Duration
-	AuthCodeTTL       time.Duration
-	RateLimitLoginRPM int // Max requests per minute per IP for /mcp/auth/login (default: 60)
-	RateLimitTokenRPM int // Max requests per minute per IP for /mcp/auth/token (default: 120)
-	HTTPClient        *http.Client
-	Logger            *slog.Logger
+	BaseURL               string // e.g. "http://localhost:8080" (Gateway Public Base URL)
+	GrafanaURL            string // e.g. "http://grafana:3000" (Internal backend API URL)
+	GrafanaPublicURL      string // e.g. "http://localhost:8080" (Public URL for browser redirects, defaults to BaseURL)
+	CallbackBaseURL       string // e.g. "http://localhost:8080/mcp/auth/callback" or relative "/mcp/auth/callback"
+	CookieSecure          bool   // Force Secure attribute on cookies
+	IdPTokenURL           string
+	ClientID              string
+	ClientSecret          string
+	SessionTTL            time.Duration
+	RefreshTTL            time.Duration
+	PendingAuthTTL        time.Duration
+	AuthCodeTTL           time.Duration
+	RateLimitLoginRPM     int           // Max requests per minute per IP for /mcp/auth/login (default: 60)
+	RateLimitTokenRPM     int           // Max requests per minute per IP for /mcp/auth/token (default: 120)
+	CIMDEnforcement       string        // "required", "permissive", "disabled" (default: "required")
+	CIMDAllowInsecureHTTP bool          // Allow http:// and loopback IPs for testing/dev
+	CIMDCacheTTL          time.Duration // Cache TTL for CIMD metadata
+	CIMDFetcher           *cimd.Fetcher // Custom or mock CIMD fetcher (optional)
+	HTTPClient            *http.Client
+	Logger                *slog.Logger
 }
 
 // Handler manages browser SSO login, MCP client discovery (RFC 9728, RFC 8414), PKCE, and token lifecycle.
@@ -46,6 +51,7 @@ type Handler struct {
 	store        store.SessionStore
 	loginLimiter *IPRateLimiter
 	tokenLimiter *IPRateLimiter
+	cimdFetcher  *cimd.Fetcher
 }
 
 // GrafanaUser is an alias to store.GrafanaUser for API compatibility.
@@ -106,11 +112,28 @@ func NewHandler(cfg Config, s store.SessionStore) *Handler {
 		tokenRPM = 120
 	}
 
+	if cfg.CIMDEnforcement == "" {
+		cfg.CIMDEnforcement = "required"
+	}
+	cfg.CIMDEnforcement = strings.ToLower(strings.TrimSpace(cfg.CIMDEnforcement))
+	if cfg.CIMDEnforcement != "permissive" && cfg.CIMDEnforcement != "disabled" {
+		cfg.CIMDEnforcement = "required"
+	}
+
+	cimdFetcher := cfg.CIMDFetcher
+	if cimdFetcher == nil && cfg.CIMDEnforcement != "disabled" {
+		cimdFetcher = cimd.NewFetcher(cimd.FetcherConfig{
+			AllowInsecureHTTP: cfg.CIMDAllowInsecureHTTP,
+			DefaultTTL:        cfg.CIMDCacheTTL,
+		})
+	}
+
 	return &Handler{
 		cfg:          cfg,
 		store:        s,
 		loginLimiter: NewIPRateLimiter(loginRPM, time.Minute),
 		tokenLimiter: NewIPRateLimiter(tokenRPM, time.Minute),
+		cimdFetcher:  cimdFetcher,
 	}
 }
 
@@ -157,7 +180,7 @@ func (h *Handler) HandleProtectedResourceMetadata(w http.ResponseWriter, r *http
 func (h *Handler) HandleAuthorizationServerMetadata(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	meta := map[string]interface{}{
 		"issuer":                                h.cfg.BaseURL,
 		"authorization_endpoint":                fmt.Sprintf("%s/mcp/auth/login", h.cfg.BaseURL),
 		"token_endpoint":                        fmt.Sprintf("%s/mcp/auth/token", h.cfg.BaseURL),
@@ -166,7 +189,11 @@ func (h *Handler) HandleAuthorizationServerMetadata(w http.ResponseWriter, r *ht
 		"code_challenge_methods_supported":      []string{"S256"},
 		"token_endpoint_auth_methods_supported": []string{"none", "client_secret_post"},
 		"scopes_supported":                      []string{"mcp"},
-	})
+	}
+	if h.cfg.CIMDEnforcement != "disabled" {
+		meta["client_id_metadata_document_supported"] = true
+	}
+	_ = json.NewEncoder(w).Encode(meta)
 }
 
 // HandleLogin initiates browser SSO by redirecting to Grafana generic OAuth.
@@ -206,6 +233,31 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		h.cfg.Logger.Warn("Rejected login request with untrusted redirect_uri", "redirect_uri", redirectURI)
 		http.Error(w, "Invalid redirect_uri: only local loopback URLs (http://localhost or http://127.0.0.1) without fragments are permitted", http.StatusBadRequest)
 		return
+	}
+
+	// CIMD (Client ID Metadata Document) Enforcement per draft-ietf-oauth-client-id-metadata-document
+	switch h.cfg.CIMDEnforcement {
+	case "required":
+		if clientID == "" {
+			h.cfg.Logger.Warn("Login rejected: missing client_id (CIMD enforcement is required)", "remote_addr", clientIP)
+			http.Error(w, "invalid_client: client_id is required and must be a valid Client ID Metadata Document URL", http.StatusBadRequest)
+			return
+		}
+		if err := h.validateCIMD(r.Context(), clientID, redirectURI); err != nil {
+			h.cfg.Logger.Warn("Login rejected: CIMD validation failed", "client_id", clientID, "error", err)
+			http.Error(w, "invalid_client: client metadata document could not be fetched or verified", http.StatusBadRequest)
+			return
+		}
+	case "permissive":
+		if clientID != "" && isPossibleURL(clientID) {
+			if err := h.validateCIMD(r.Context(), clientID, redirectURI); err != nil {
+				h.cfg.Logger.Warn("Login rejected in permissive mode: CIMD validation failed", "client_id", clientID, "error", err)
+				http.Error(w, "invalid_client: client metadata document could not be fetched or verified", http.StatusBadRequest)
+				return
+			}
+		}
+	case "disabled":
+		// No CIMD validation
 	}
 
 	// Generate internal state to track this flow
@@ -467,6 +519,33 @@ func (h *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 		}
 	}
 
+	// Verify client_id in token request per OAuth 2.1 Section 4.1.3 and CIMD specification
+	reqClientID := r.FormValue("client_id")
+	if h.cfg.CIMDEnforcement == "required" {
+		if reqClientID == "" {
+			h.cfg.Logger.Warn("Token exchange rejected: missing client_id parameter", "expected", authCtx.ClientID)
+			sendTokenError(w, http.StatusBadRequest, "invalid_client", "client_id parameter is required")
+			return
+		}
+		if subtle.ConstantTimeCompare([]byte(reqClientID), []byte(authCtx.ClientID)) != 1 {
+			h.cfg.Logger.Warn("Token exchange rejected due to client_id mismatch",
+				"expected", authCtx.ClientID,
+				"received", reqClientID,
+			)
+			sendTokenError(w, http.StatusBadRequest, "invalid_grant", "client_id mismatch")
+			return
+		}
+	} else if reqClientID != "" && authCtx.ClientID != "" {
+		if subtle.ConstantTimeCompare([]byte(reqClientID), []byte(authCtx.ClientID)) != 1 {
+			h.cfg.Logger.Warn("Token exchange rejected due to client_id mismatch",
+				"expected", authCtx.ClientID,
+				"received", reqClientID,
+			)
+			sendTokenError(w, http.StatusBadRequest, "invalid_grant", "client_id mismatch")
+			return
+		}
+	}
+
 	// Verify PKCE with constant-time comparison
 	if codeVerifier == "" || !verifyPKCE(codeVerifier, authCtx.CodeChallenge, authCtx.CodeChallengeMethod) {
 		h.cfg.Logger.Warn("PKCE verification failed", "username", authCtx.UserInfo.Login)
@@ -720,4 +799,22 @@ func (h *Handler) Close() {
 	if h.tokenLimiter != nil {
 		h.tokenLimiter.Close()
 	}
+}
+
+func (h *Handler) validateCIMD(ctx context.Context, clientID, redirectURI string) error {
+	if h.cimdFetcher == nil {
+		return fmt.Errorf("CIMD fetcher not initialized")
+	}
+	doc, err := h.cimdFetcher.Fetch(ctx, clientID)
+	if err != nil {
+		return fmt.Errorf("failed to fetch client metadata: %w", err)
+	}
+	if !cimd.ValidateRedirectURI(doc, redirectURI) {
+		return fmt.Errorf("redirect_uri %q is not authorized in client metadata document", redirectURI)
+	}
+	return nil
+}
+
+func isPossibleURL(raw string) bool {
+	return strings.HasPrefix(raw, "https://") || strings.HasPrefix(raw, "http://")
 }

@@ -39,6 +39,9 @@ type AppConfig struct {
 	AuthCodeTTL                time.Duration
 	RateLimitLoginRPM          int
 	RateLimitTokenRPM          int
+	CIMDEnforcement            string        // "required" (default), "permissive", "disabled"
+	CIMDAllowInsecureHTTP      bool          // Allow http:// and loopback IPs for testing/dev (default false)
+	CIMDCacheTTL               time.Duration // Cache TTL for fetched CIMD metadata (default 1 hour)
 	LogLevel                   slog.Level
 }
 
@@ -162,6 +165,25 @@ func LoadFromEnv() *AppConfig {
 		}
 	}
 
+	cimdEnforcement := strings.ToLower(strings.TrimSpace(getEnv("CIMD_ENFORCEMENT", "required")))
+	if cimdEnforcement != "permissive" && cimdEnforcement != "disabled" {
+		cimdEnforcement = "required"
+	}
+
+	cimdAllowInsecureHTTP := false
+	if v := os.Getenv("CIMD_ALLOW_INSECURE_HTTP"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cimdAllowInsecureHTTP = b
+		}
+	}
+
+	cimdCacheTTL := 1 * time.Hour
+	if v := os.Getenv("CIMD_CACHE_TTL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			cimdCacheTTL = d
+		}
+	}
+
 	logLevel := slog.LevelInfo
 	switch strings.ToLower(os.Getenv("LOG_LEVEL")) {
 	case "debug":
@@ -200,6 +222,9 @@ func LoadFromEnv() *AppConfig {
 		AuthCodeTTL:                time.Duration(authCodeSeconds) * time.Second,
 		RateLimitLoginRPM:          rateLimitLoginRPM,
 		RateLimitTokenRPM:          rateLimitTokenRPM,
+		CIMDEnforcement:            cimdEnforcement,
+		CIMDAllowInsecureHTTP:      cimdAllowInsecureHTTP,
+		CIMDCacheTTL:               cimdCacheTTL,
 		LogLevel:                   logLevel,
 	}
 }

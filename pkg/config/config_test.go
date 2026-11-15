@@ -34,6 +34,9 @@ func TestLoadFromEnv_Defaults(t *testing.T) {
 	assert.Empty(t, cfg.RedisKeyPath)
 	assert.False(t, cfg.RedisTLSInsecureSkipVerify)
 	assert.Empty(t, cfg.RedisTLSServerName)
+	assert.Equal(t, "required", cfg.CIMDEnforcement)
+	assert.False(t, cfg.CIMDAllowInsecureHTTP)
+	assert.Equal(t, 1*time.Hour, cfg.CIMDCacheTTL)
 }
 
 func TestLoadFromEnv_ProductionWithoutMasterSecret(t *testing.T) {
@@ -131,5 +134,43 @@ func TestLoadFromEnv_RedisTLS(t *testing.T) {
 		cfg := config.LoadFromEnv()
 		assert.False(t, cfg.RedisTLSEnabled)
 		assert.Equal(t, "/certs/client.crt", cfg.RedisCertPath)
+	})
+}
+
+func TestLoadFromEnv_CIMD(t *testing.T) {
+	t.Run("default is required", func(t *testing.T) {
+		os.Unsetenv("CIMD_ENFORCEMENT")
+		cfg := config.LoadFromEnv()
+		assert.Equal(t, "required", cfg.CIMDEnforcement)
+	})
+
+	t.Run("permissive mode", func(t *testing.T) {
+		t.Setenv("CIMD_ENFORCEMENT", "permissive")
+		cfg := config.LoadFromEnv()
+		assert.Equal(t, "permissive", cfg.CIMDEnforcement)
+	})
+
+	t.Run("disabled mode", func(t *testing.T) {
+		t.Setenv("CIMD_ENFORCEMENT", "disabled")
+		cfg := config.LoadFromEnv()
+		assert.Equal(t, "disabled", cfg.CIMDEnforcement)
+	})
+
+	t.Run("invalid enforcement mode falls back to required", func(t *testing.T) {
+		t.Setenv("CIMD_ENFORCEMENT", "unknown_mode")
+		cfg := config.LoadFromEnv()
+		assert.Equal(t, "required", cfg.CIMDEnforcement)
+	})
+
+	t.Run("allow insecure http", func(t *testing.T) {
+		t.Setenv("CIMD_ALLOW_INSECURE_HTTP", "true")
+		cfg := config.LoadFromEnv()
+		assert.True(t, cfg.CIMDAllowInsecureHTTP)
+	})
+
+	t.Run("custom cache ttl", func(t *testing.T) {
+		t.Setenv("CIMD_CACHE_TTL", "30m")
+		cfg := config.LoadFromEnv()
+		assert.Equal(t, 30*time.Minute, cfg.CIMDCacheTTL)
 	})
 }
