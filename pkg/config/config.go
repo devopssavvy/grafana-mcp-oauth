@@ -45,6 +45,7 @@ type AppConfig struct {
 	CIMDEnforcement            string        // "required" (default), "permissive", "disabled"
 	CIMDAllowInsecureHTTP      bool          // Allow http:// and loopback IPs for testing/dev (default false)
 	CIMDCacheTTL               time.Duration // Cache TTL for fetched CIMD metadata (default 1 hour)
+	InstanceURL                string        // Reachable URL for this proxy instance used for cross-replica peer forwarding (e.g. "http://mcp-proxy-1:8080")
 	LogLevel                   slog.Level
 }
 
@@ -75,6 +76,14 @@ func LoadFromEnv() *AppConfig {
 		}
 	}
 	targetMCPURL := getEnv("TARGET_MCP_URL", "http://127.0.0.1:8000")
+	instanceURL := strings.TrimRight(getEnv("INSTANCE_URL", ""), "/")
+	if instanceURL == "" {
+		host := httpHost
+		if host == "" || host == "0.0.0.0" {
+			host = "127.0.0.1"
+		}
+		instanceURL = "http://" + net.JoinHostPort(host, httpPort)
+	}
 	grafanaURL := getEnv("GRAFANA_URL", "http://grafana:3000")
 	grafanaPublicURL := strings.TrimRight(getEnv("GRAFANA_PUBLIC_URL", baseURL), "/")
 	callbackBaseURL := getEnv("CALLBACK_BASE_URL", baseURL+"/mcp/auth/callback")
@@ -233,6 +242,7 @@ func LoadFromEnv() *AppConfig {
 		CIMDEnforcement:            cimdEnforcement,
 		CIMDAllowInsecureHTTP:      cimdAllowInsecureHTTP,
 		CIMDCacheTTL:               cimdCacheTTL,
+		InstanceURL:                instanceURL,
 		LogLevel:                   logLevel,
 	}
 }

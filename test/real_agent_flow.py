@@ -170,8 +170,15 @@ def main():
     endpoint_path = None
     for line in sse_stream:
         line_str = line.decode("utf-8")
-        if line_str.startswith("data: /mcp/messages?sessionId="):
-            endpoint_path = line_str.replace("data: ", "").strip()
+        if "sessionid=" in line_str.lower() or "session_id=" in line_str.lower():
+            raw_path = line_str.replace("data: ", "").strip()
+            if raw_path.startswith("http://") or raw_path.startswith("https://"):
+                parsed = urllib.parse.urlparse(raw_path)
+                endpoint_path = parsed.path
+                if parsed.query:
+                    endpoint_path += f"?{parsed.query}"
+            else:
+                endpoint_path = raw_path
             print(f"[*] Discovered SSE Message Endpoint: {endpoint_path}", flush=True)
             break
             

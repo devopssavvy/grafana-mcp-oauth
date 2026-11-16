@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"grafana-mcp-oauth/pkg/store"
@@ -19,23 +22,31 @@ type contextKey string
 
 const (
 	requestBodyContextKey contextKey = "mcp_request_body"
+	// #nosec G101 -- context key for internal request context, not a hardcoded credential
+	bearerTokenContextKey contextKey = "mcp_internal_auth"
 )
+
+var sessionIDRegex = regexp.MustCompile(`(?i)[?&]session_?id=([a-zA-Z0-9_\-\.]+)`)
 
 // Config configures the MCP authenticated reverse proxy.
 type Config struct {
-	TargetURL string
-	BaseURL   string
-	Logger    *slog.Logger
+	TargetURL   string
+	BaseURL     string
+	InstanceURL string
+	Logger      *slog.Logger
+	PeerClient  *http.Client
 }
 
 // Proxy is a reverse proxy that authenticates incoming MCP requests via Bearer token,
 // translates the token into a grafana_session cookie, and forwards to stock mcp-grafana.
 type Proxy struct {
-	targetURL *url.URL
-	baseURL   string
-	store     store.SessionStore
-	logger    *slog.Logger
-	rp        *httputil.ReverseProxy
+	targetURL   *url.URL
+	baseURL     string
+	instanceURL string
+	store       store.SessionStore
+	logger      *slog.Logger
+	peerClient  *http.Client
+	rp          *httputil.ReverseProxy
 }
 
 // NewProxy creates a new authenticated MCP reverse proxy.
@@ -53,15 +64,56 @@ func NewProxy(cfg Config, s store.SessionStore) (*Proxy, error) {
 	}
 	cfg.BaseURL = strings.TrimRight(cfg.BaseURL, "/")
 
+	if cfg.InstanceURL == "" {
+		cfg.InstanceURL = cfg.BaseURL
+	}
+	cfg.InstanceURL = strings.TrimRight(cfg.InstanceURL, "/")
+
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
 
+	peerClient := cfg.PeerClient
+	if peerClient == nil {
+		peerClient = &http.Client{
+			Timeout: 15 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse // Prohibit redirects on peer forwarding to prevent credential leakage
+			},
+			Transport: &http.Transport{
+				Proxy: http.ProxyFromEnvironment,
+				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					host, _, err := net.SplitHostPort(addr)
+					if err == nil {
+						if ip := net.ParseIP(host); ip != nil {
+							// Block cloud metadata (169.254.169.254 / link-local)
+							if ip.IsLinkLocalUnicast() || ip.String() == "169.254.169.254" {
+								return nil, fmt.Errorf("peer forward to metadata IP blocked: %s", ip)
+							}
+						}
+					}
+					dialer := &net.Dialer{
+						Timeout:   5 * time.Second,
+						KeepAlive: 30 * time.Second,
+					}
+					return dialer.DialContext(ctx, network, addr)
+				},
+				ForceAttemptHTTP2:     true,
+				MaxIdleConns:          100,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+			},
+		}
+	}
+
 	p := &Proxy{
-		targetURL: target,
-		baseURL:   cfg.BaseURL,
-		store:     s,
-		logger:    cfg.Logger,
+		targetURL:   target,
+		baseURL:     cfg.BaseURL,
+		instanceURL: cfg.InstanceURL,
+		store:       s,
+		logger:      cfg.Logger,
+		peerClient:  peerClient,
 	}
 
 	rp := &httputil.ReverseProxy{
@@ -75,6 +127,15 @@ func NewProxy(cfg Config, s store.SessionStore) (*Proxy, error) {
 		ModifyResponse: func(resp *http.Response) error {
 			if strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
 				resp.Header.Set("X-Accel-Buffering", "no")
+				if resp.Request != nil && resp.Body != nil {
+					sseCtx, cancel := context.WithCancel(resp.Request.Context())
+					resp.Body = &sseBodyWrapper{
+						ReadCloser: resp.Body,
+						proxy:      p,
+						ctx:        sseCtx,
+						cancel:     cancel,
+					}
+				}
 				return nil
 			}
 
@@ -82,11 +143,11 @@ func NewProxy(cfg Config, s store.SessionStore) (*Proxy, error) {
 			// retry transparently after a short backoff because notifications/initialized arrives
 			// within milliseconds.
 			if resp.Request != nil && resp.Body != nil {
-				if bodyBytes, ok := resp.Request.Context().Value(requestBodyContextKey).([]byte); ok && len(bodyBytes) > 0 {
+				if bodyBytes, ok := resp.Request.Context().Value(requestBodyContextKey).([]byte); ok {
 					respBytes, err := io.ReadAll(resp.Body)
 					if err == nil {
 						_ = resp.Body.Close()
-						if bytes.Contains(respBytes, []byte("is invalid during session initialization")) {
+						if bytes.Contains(respBytes, []byte("is invalid during session initialization")) && len(bodyBytes) > 0 {
 							p.logger.Info("Upstream MCP session is still initializing; retrying message request after brief backoff",
 								"path", resp.Request.URL.Path,
 							)
@@ -118,6 +179,66 @@ func NewProxy(cfg Config, s store.SessionStore) (*Proxy, error) {
 								}
 							}
 						} else if resp.StatusCode == http.StatusNotFound && bytes.Contains(respBytes, []byte("session not found")) {
+							sessID := extractSessionIDFromURL(resp.Request.URL)
+							isPeerHop := resp.Request.Header.Get("X-MCP-Peer-Hop") == "true"
+							if sessID != "" && !isPeerHop {
+								ownerURL, err := p.store.GetMCPSession(resp.Request.Context(), sessID)
+								if err == nil && ownerURL != "" && !isSelf(ownerURL, p.instanceURL) {
+									p.logger.Info("Upstream MCP session not found locally; forwarding to peer replica",
+										"session_id", sessID,
+										"peer", ownerURL,
+										"path", resp.Request.URL.Path,
+									)
+									targetURL, err := url.Parse(ownerURL)
+									if err == nil && (targetURL.Scheme == "http" || targetURL.Scheme == "https") {
+										peerReqURL := *resp.Request.URL
+										peerReqURL.Scheme = targetURL.Scheme
+										peerReqURL.Host = targetURL.Host
+										peerReq, err := http.NewRequestWithContext(
+											resp.Request.Context(),
+											resp.Request.Method,
+											peerReqURL.String(),
+											bytes.NewReader(bodyBytes),
+										)
+										if err == nil {
+											peerReq.Header = resp.Request.Header.Clone()
+											peerReq.Header.Set("X-MCP-Peer-Hop", "true")
+											if token, ok := resp.Request.Context().Value(bearerTokenContextKey).(string); ok && token != "" {
+												peerReq.Header.Set("Authorization", "Bearer "+token)
+											}
+											peerResp, err := p.peerClient.Do(peerReq)
+											if err != nil {
+												p.logger.Warn("Cross-replica peer forwarding network error",
+													"session_id", sessID,
+													"peer", ownerURL,
+													"error", err,
+												)
+											} else {
+												peerRespBytes, err := io.ReadAll(peerResp.Body)
+												_ = peerResp.Body.Close()
+												if err == nil {
+													if peerResp.StatusCode != http.StatusNotFound {
+														p.logger.Info("Cross-replica peer forwarding succeeded",
+															"session_id", sessID,
+															"peer", ownerURL,
+															"status", peerResp.StatusCode,
+														)
+														peerResp.Body = io.NopCloser(bytes.NewReader(peerRespBytes))
+														*resp = *peerResp
+														return nil
+													}
+													// Peer returned 404; prune dead session from Redis immediately
+													_ = p.store.DeleteMCPSession(resp.Request.Context(), sessID)
+													p.logger.Info("Pruned dead MCP session from Redis following peer 404",
+														"session_id", sessID,
+														"peer", ownerURL,
+													)
+												}
+											}
+										}
+									}
+								}
+							}
 							p.logger.Warn("Upstream MCP session not found; client is using a stale session ID or server restarted",
 								"path", resp.Request.URL.Path,
 								"query", resp.Request.URL.RawQuery,
@@ -177,18 +298,126 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Buffer POST request bodies to support transparent retry on session initialization
 	if r.Method == http.MethodPost && r.Body != nil {
-		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 4*1024*1024))
-		if err == nil {
-			_ = r.Body.Close()
-			outReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-			outReq.GetBody = func() (io.ReadCloser, error) {
-				return io.NopCloser(bytes.NewReader(bodyBytes)), nil
-			}
-			outReq = outReq.WithContext(context.WithValue(outReq.Context(), requestBodyContextKey, bodyBytes))
+		const maxBodyBytes = 4 * 1024 * 1024
+		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
+		if err != nil {
+			http.Error(w, "Failed to read request body", http.StatusBadRequest)
+			return
 		}
+		_ = r.Body.Close()
+		if len(bodyBytes) > maxBodyBytes {
+			p.logger.Warn("Request body exceeded maximum size limit", "size", len(bodyBytes), "limit", maxBodyBytes)
+			http.Error(w, "Payload Too Large: MCP message body exceeds 4MB limit", http.StatusRequestEntityTooLarge)
+			return
+		}
+		outReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		outReq.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(bodyBytes)), nil
+		}
+		outReq = outReq.WithContext(context.WithValue(outReq.Context(), requestBodyContextKey, bodyBytes))
 	}
 
+	outReq = outReq.WithContext(context.WithValue(outReq.Context(), bearerTokenContextKey, token))
 	p.rp.ServeHTTP(w, outReq)
+}
+
+type sseBodyWrapper struct {
+	io.ReadCloser
+	proxy      *Proxy
+	ctx        context.Context
+	cancel     context.CancelFunc
+	sessionID  string
+	registered bool
+	buf        []byte
+	mu         sync.Mutex
+}
+
+func (w *sseBodyWrapper) Read(p []byte) (int, error) {
+	n, err := w.ReadCloser.Read(p)
+	if n > 0 {
+		w.mu.Lock()
+		if !w.registered {
+			w.buf = append(w.buf, p[:n]...)
+			if m := sessionIDRegex.FindSubmatch(w.buf); len(m) > 1 {
+				w.sessionID = string(m[1])
+				w.registered = true
+				w.buf = nil
+				sessID := w.sessionID
+
+				// Register in Redis with 120s TTL
+				regCtx, regCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if regErr := w.proxy.store.RegisterMCPSession(regCtx, sessID, w.proxy.instanceURL, 120*time.Second); regErr != nil {
+					w.proxy.logger.Warn("Failed to register MCP session in Redis", "session_id", sessID, "error", regErr)
+				} else {
+					w.proxy.logger.Info("Registered active MCP SSE session in Redis", "session_id", sessID, "instance", w.proxy.instanceURL)
+				}
+				regCancel()
+
+				// Launch background sliding renewal ticker
+				go func(sid string, bgCtx context.Context) {
+					ticker := time.NewTicker(30 * time.Second)
+					defer ticker.Stop()
+					for {
+						select {
+						case <-bgCtx.Done():
+							return
+						case <-ticker.C:
+							tCtx, tCancel := context.WithTimeout(context.Background(), 5*time.Second)
+							_ = w.proxy.store.RegisterMCPSession(tCtx, sid, w.proxy.instanceURL, 120*time.Second)
+							tCancel()
+						}
+					}
+				}(sessID, w.ctx)
+			} else if len(w.buf) > 4096 {
+				w.buf = w.buf[len(w.buf)-1024:]
+			}
+		}
+		w.mu.Unlock()
+	}
+	return n, err
+}
+
+func (w *sseBodyWrapper) Close() error {
+	w.mu.Lock()
+	sessID := w.sessionID
+	w.cancel()
+	w.mu.Unlock()
+
+	if sessID != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if delErr := w.proxy.store.DeleteMCPSession(ctx, sessID); delErr != nil {
+			w.proxy.logger.Debug("Cleaned up MCP session on SSE disconnect", "session_id", sessID, "error", delErr)
+		} else {
+			w.proxy.logger.Info("Removed MCP SSE session on disconnect", "session_id", sessID)
+		}
+	}
+	return w.ReadCloser.Close()
+}
+
+func extractSessionIDFromURL(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	q := u.Query()
+	for _, k := range []string{"sessionId", "sessionid", "session_id"} {
+		if val := q.Get(k); val != "" {
+			return val
+		}
+	}
+	return ""
+}
+
+func isSelf(a, b string) bool {
+	if a == b {
+		return true
+	}
+	uA, errA := url.Parse(a)
+	uB, errB := url.Parse(b)
+	if errA == nil && errB == nil {
+		return strings.EqualFold(uA.Host, uB.Host)
+	}
+	return false
 }
 
 func (p *Proxy) send401(w http.ResponseWriter, challenge string, message string) {

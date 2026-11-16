@@ -31,11 +31,13 @@ const (
 	legacyRefreshKeyPrefix = "mcp:legacy_refresh:"
 	pendingAuthKeyPrefix   = "mcp:pending_auth:"
 	authCodeKeyPrefix      = "mcp:auth_code:"
+	mcpSessionKeyPrefix    = "mcp:mcp_session:"
 
 	hkdfInfoSession     = "mcp-session-encryption"
 	hkdfInfoRefresh     = "mcp-refresh-encryption"
 	hkdfInfoPendingAuth = "mcp-pending-auth-encryption"
 	hkdfInfoAuthCode    = "mcp-auth-code-encryption"
+	hkdfInfoMCPSession  = "mcp-mcp-session-encryption"
 )
 
 // SessionData represents the user identity and Grafana session credentials.
@@ -105,6 +107,11 @@ type SessionStore interface {
 	GetAuthCode(ctx context.Context, code string) (*AuthCodeContext, error)
 	GetAndDeleteAuthCode(ctx context.Context, code string) (*AuthCodeContext, error)
 	DeleteAuthCode(ctx context.Context, code string) error
+
+	// Distributed active MCP SSE sessions (session_id -> instance_url)
+	RegisterMCPSession(ctx context.Context, sessionID string, instanceURL string, ttl time.Duration) error
+	GetMCPSession(ctx context.Context, sessionID string) (string, error)
+	DeleteMCPSession(ctx context.Context, sessionID string) error
 }
 
 // RedisSessionStore implements SessionStore with Zero-Knowledge encryption in Redis.
@@ -526,6 +533,52 @@ func (s *RedisSessionStore) GetAndDeleteAuthCode(ctx context.Context, code strin
 // DeleteAuthCode removes an authorization code from Redis.
 func (s *RedisSessionStore) DeleteAuthCode(ctx context.Context, code string) error {
 	redisKey := authCodeKeyPrefix + crypto.HashTokenKey(code, s.masterSecret)
+	return s.client.Del(ctx, redisKey).Err()
+}
+
+// RegisterMCPSession encrypts and stores an active MCP SSE session instance location in Redis with TTL.
+func (s *RedisSessionStore) RegisterMCPSession(ctx context.Context, sessionID string, instanceURL string, ttl time.Duration) error {
+	redisKey := mcpSessionKeyPrefix + crypto.HashTokenKey(sessionID, s.masterSecret)
+	encKey, err := crypto.DeriveKeyHKDF(sessionID, s.masterSecret, []byte(hkdfInfoMCPSession))
+	if err != nil {
+		return fmt.Errorf("failed to derive encryption key for mcp session: %w", err)
+	}
+
+	encrypted, err := crypto.Encrypt([]byte(instanceURL), encKey)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt mcp session instance url: %w", err)
+	}
+
+	return s.client.Set(ctx, redisKey, encrypted, ttl).Err()
+}
+
+// GetMCPSession retrieves and decrypts the owning instance URL for an active MCP SSE session.
+func (s *RedisSessionStore) GetMCPSession(ctx context.Context, sessionID string) (string, error) {
+	redisKey := mcpSessionKeyPrefix + crypto.HashTokenKey(sessionID, s.masterSecret)
+	encrypted, err := s.client.Get(ctx, redisKey).Bytes()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return "", ErrSessionNotFound
+		}
+		return "", err
+	}
+
+	encKey, err := crypto.DeriveKeyHKDF(sessionID, s.masterSecret, []byte(hkdfInfoMCPSession))
+	if err != nil {
+		return "", fmt.Errorf("failed to derive encryption key for mcp session: %w", err)
+	}
+
+	decrypted, err := crypto.Decrypt(encrypted, encKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to decrypt mcp session instance url: %w", err)
+	}
+
+	return string(decrypted), nil
+}
+
+// DeleteMCPSession removes an active MCP SSE session registration from Redis.
+func (s *RedisSessionStore) DeleteMCPSession(ctx context.Context, sessionID string) error {
+	redisKey := mcpSessionKeyPrefix + crypto.HashTokenKey(sessionID, s.masterSecret)
 	return s.client.Del(ctx, redisKey).Err()
 }
 

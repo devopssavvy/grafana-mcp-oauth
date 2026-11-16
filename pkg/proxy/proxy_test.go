@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,15 +15,24 @@ import (
 )
 
 type mockStore struct {
-	sessions map[string]*store.SessionData
+	mu          sync.Mutex
+	sessions    map[string]*store.SessionData
+	mcpSessions map[string]string
 }
 
 func (m *mockStore) SaveSession(ctx context.Context, token string, s *store.SessionData, ttl time.Duration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.sessions == nil {
+		m.sessions = make(map[string]*store.SessionData)
+	}
 	m.sessions[token] = s
 	return nil
 }
 
 func (m *mockStore) GetSession(ctx context.Context, token string) (*store.SessionData, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	s, ok := m.sessions[token]
 	if !ok {
 		return nil, fmt.Errorf("session not found")
@@ -31,11 +41,15 @@ func (m *mockStore) GetSession(ctx context.Context, token string) (*store.Sessio
 }
 
 func (m *mockStore) DeleteSession(ctx context.Context, token string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	delete(m.sessions, token)
 	return nil
 }
 
 func (m *mockStore) UpdateGrafanaSession(ctx context.Context, token string, newGrafanaSession string, ttl time.Duration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if s, ok := m.sessions[token]; ok {
 		s.GrafanaSession = newGrafanaSession
 		return nil
@@ -92,6 +106,38 @@ func (m *mockStore) GetAndDeleteAuthCode(ctx context.Context, code string) (*sto
 }
 
 func (m *mockStore) DeleteAuthCode(ctx context.Context, code string) error {
+	return nil
+}
+
+func (m *mockStore) RegisterMCPSession(ctx context.Context, sessionID string, instanceURL string, ttl time.Duration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.mcpSessions == nil {
+		m.mcpSessions = make(map[string]string)
+	}
+	m.mcpSessions[sessionID] = instanceURL
+	return nil
+}
+
+func (m *mockStore) GetMCPSession(ctx context.Context, sessionID string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.mcpSessions == nil {
+		return "", store.ErrSessionNotFound
+	}
+	url, ok := m.mcpSessions[sessionID]
+	if !ok {
+		return "", store.ErrSessionNotFound
+	}
+	return url, nil
+}
+
+func (m *mockStore) DeleteMCPSession(ctx context.Context, sessionID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.mcpSessions != nil {
+		delete(m.mcpSessions, sessionID)
+	}
 	return nil
 }
 
@@ -345,5 +391,203 @@ func TestProxy_SessionNotFound(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if !strings.Contains(string(body), "session not found") {
 		t.Fatalf("expected body to contain 'session not found', got: %s", string(body))
+	}
+}
+
+func TestProxy_CrossReplicaPeerForwarding(t *testing.T) {
+	// Upstream 1 (Replica 1 owns session "sess-replica-1")
+	upstream1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sessID := r.URL.Query().Get("sessionId")
+		if sessID == "sess-replica-1" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"status":"handled_by_replica_1"}}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte("session not found"))
+	}))
+	defer upstream1.Close()
+
+	// Upstream 2 (Replica 2 does not own session "sess-replica-1")
+	upstream2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte("session not found"))
+	}))
+	defer upstream2.Close()
+
+	sharedStore := &mockStore{
+		sessions: map[string]*store.SessionData{
+			"test-bearer-token": {
+				GrafanaSession: "grafana-cookie-123",
+				Username:       "alice",
+			},
+		},
+		mcpSessions: make(map[string]string),
+	}
+
+	// Create Proxy 1
+	var proxy1Server *httptest.Server
+	p1, err := NewProxy(Config{
+		TargetURL: upstream1.URL,
+		BaseURL:   "http://replica1:8080",
+	}, sharedStore)
+	if err != nil {
+		t.Fatalf("NewProxy 1 failed: %v", err)
+	}
+	proxy1Server = httptest.NewServer(p1)
+	defer proxy1Server.Close()
+	p1.instanceURL = proxy1Server.URL
+
+	// Create Proxy 2
+	p2, err := NewProxy(Config{
+		TargetURL:   upstream2.URL,
+		BaseURL:     "http://replica2:8080",
+		InstanceURL: "http://replica2-internal:8080",
+	}, sharedStore)
+	if err != nil {
+		t.Fatalf("NewProxy 2 failed: %v", err)
+	}
+	proxy2Server := httptest.NewServer(p2)
+	defer proxy2Server.Close()
+
+	// Register session "sess-replica-1" pointing to Proxy 1
+	_ = sharedStore.RegisterMCPSession(context.Background(), "sess-replica-1", proxy1Server.URL, 1*time.Minute)
+
+	// Client sends POST to Proxy 2 for "sess-replica-1"
+	req, _ := http.NewRequest(
+		http.MethodPost,
+		proxy2Server.URL+"/mcp/messages?sessionId=sess-replica-1",
+		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call"}`),
+	)
+	req.Header.Set("Authorization", "Bearer test-bearer-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "handled_by_replica_1") {
+		t.Fatalf("expected body to contain 'handled_by_replica_1', got: %s", string(body))
+	}
+}
+
+func TestProxy_PayloadTooLarge(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	s := &mockStore{
+		sessions: map[string]*store.SessionData{
+			"valid-token": {
+				GrafanaSession: "sess-123",
+				Username:       "alice",
+			},
+		},
+	}
+
+	p, err := NewProxy(Config{
+		TargetURL: upstream.URL,
+		BaseURL:   "http://localhost:8080",
+	}, s)
+	if err != nil {
+		t.Fatalf("NewProxy failed: %v", err)
+	}
+
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	// 5MB payload
+	hugeBody := strings.Repeat("A", 5*1024*1024)
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/mcp/messages", strings.NewReader(hugeBody))
+	req.Header.Set("Authorization", "Bearer valid-token")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Errorf("expected 413 Payload Too Large, got %d", resp.StatusCode)
+	}
+}
+
+func TestProxy_PeerForwarding_DeadSessionPruning(t *testing.T) {
+	// Upstream 1 returns 404 session not found
+	upstream1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"session not found"}`))
+	}))
+	defer upstream1.Close()
+
+	// Upstream 2 also returns 404 session not found
+	upstream2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"session not found"}`))
+	}))
+	defer upstream2.Close()
+
+	sharedStore := &mockStore{
+		sessions: map[string]*store.SessionData{
+			"test-bearer-token": {
+				GrafanaSession: "grafana-cookie-123",
+				Username:       "alice",
+			},
+		},
+		mcpSessions: make(map[string]string),
+	}
+
+	p1, _ := NewProxy(Config{
+		TargetURL: upstream1.URL,
+		BaseURL:   "http://replica1:8080",
+	}, sharedStore)
+	proxy1Server := httptest.NewServer(p1)
+	defer proxy1Server.Close()
+	p1.instanceURL = proxy1Server.URL
+
+	p2, _ := NewProxy(Config{
+		TargetURL:   upstream2.URL,
+		BaseURL:     "http://replica2:8080",
+		InstanceURL: "http://replica2-internal:8080",
+	}, sharedStore)
+	proxy2Server := httptest.NewServer(p2)
+	defer proxy2Server.Close()
+
+	// Register session pointing to Proxy 1
+	deadSessionID := "dead-session-999"
+	_ = sharedStore.RegisterMCPSession(context.Background(), deadSessionID, proxy1Server.URL, 1*time.Minute)
+
+	// Client sends POST to Proxy 2 for deadSessionID
+	req, _ := http.NewRequest(
+		http.MethodPost,
+		proxy2Server.URL+"/mcp/messages?sessionId="+deadSessionID,
+		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call"}`),
+	)
+	req.Header.Set("Authorization", "Bearer test-bearer-token")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", resp.StatusCode)
+	}
+
+	// Verify dead session was pruned from store
+	_, err = sharedStore.GetMCPSession(context.Background(), deadSessionID)
+	if err == nil {
+		t.Errorf("expected dead session to be pruned from store, but it was still present")
 	}
 }

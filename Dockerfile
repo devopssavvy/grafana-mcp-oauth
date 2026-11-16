@@ -9,14 +9,11 @@ ARG TARGETARCH
 
 WORKDIR /app
 
-COPY go.mod go.sum ./
-RUN go mod download
-
 COPY . .
 
 # Compile static binary for target OS and architecture
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
-    go build -ldflags="-w -s" -o /app/grafana-mcp-oauth ./cmd/grafana-mcp-oauth
+    go build -mod=vendor -ldflags="-w -s" -o /app/grafana-mcp-oauth ./cmd/grafana-mcp-oauth
 
 # Production stage: minimal Distroless static runtime
 # Pinned to immutable cryptographic digest for zero-vulnerability static base

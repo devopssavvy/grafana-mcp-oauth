@@ -384,3 +384,60 @@ func TestStore_ZeroConfig_MultiPodSync(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, strings.Contains(rawBytes, "grafana_sess_synced"))
 }
+
+func TestStore_MCPSessionRegistry(t *testing.T) {
+	ctx := context.Background()
+	st, mr := setupTestStore(t)
+
+	sessionID := "sess_01932f7a-8b9c-7def-8012-3456789abcde"
+	instanceURL := "http://mcp-proxy-1:8080"
+
+	// 1. Register MCP session
+	err := st.RegisterMCPSession(ctx, sessionID, instanceURL, 2*time.Minute)
+	require.NoError(t, err)
+
+	// 2. Verify Zero-Knowledge in raw Redis
+	keys := mr.Keys()
+	require.Len(t, keys, 1)
+	redisKey := keys[0]
+	assert.True(t, strings.HasPrefix(redisKey, "mcp:mcp_session:"))
+	assert.False(t, strings.Contains(redisKey, sessionID), "Raw sessionID must not appear in Redis key")
+
+	rawBytes, err := mr.Get(redisKey)
+	require.NoError(t, err)
+	assert.False(t, strings.Contains(rawBytes, instanceURL), "Instance URL must be encrypted in Redis")
+
+	// 3. Retrieve and decrypt
+	retrievedURL, err := st.GetMCPSession(ctx, sessionID)
+	require.NoError(t, err)
+	assert.Equal(t, instanceURL, retrievedURL)
+
+	// 4. Test Multi-Pod Sync across two instances with no master secret
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	pod1Store, err := store.NewRedisSessionStore(rdb, nil)
+	require.NoError(t, err)
+	pod2Store, err := store.NewRedisSessionStore(rdb, nil)
+	require.NoError(t, err)
+
+	multiPodSession := "sess_cross_pod_999"
+	multiPodURL := "http://mcp-proxy-2:8080"
+	err = pod1Store.RegisterMCPSession(ctx, multiPodSession, multiPodURL, 1*time.Minute)
+	require.NoError(t, err)
+
+	syncedURL, err := pod2Store.GetMCPSession(ctx, multiPodSession)
+	require.NoError(t, err)
+	assert.Equal(t, multiPodURL, syncedURL)
+
+	// 5. Test Expiration / Not Found
+	mr.FastForward(3 * time.Minute)
+	_, err = st.GetMCPSession(ctx, sessionID)
+	assert.ErrorIs(t, err, store.ErrSessionNotFound)
+
+	// 6. Test Delete
+	err = pod1Store.RegisterMCPSession(ctx, "to_delete", "http://pod1:8080", 1*time.Minute)
+	require.NoError(t, err)
+	err = pod2Store.DeleteMCPSession(ctx, "to_delete")
+	require.NoError(t, err)
+	_, err = pod1Store.GetMCPSession(ctx, "to_delete")
+	assert.ErrorIs(t, err, store.ErrSessionNotFound)
+}

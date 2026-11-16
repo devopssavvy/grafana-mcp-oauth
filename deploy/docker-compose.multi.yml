@@ -1,0 +1,131 @@
+version: '3.8'
+
+services:
+  # Front Door: Envoy Load Balancer balancing round-robin between 2 proxy replicas
+  envoy:
+    image: envoyproxy/envoy:v1.31-latest
+    container_name: mcp-multi-envoy
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "127.0.0.1:9901:9901"
+    volumes:
+      - ./envoy/envoy.multi.yaml:/etc/envoy/envoy.yaml:ro
+    depends_on:
+      - mcp-proxy-1
+      - mcp-proxy-2
+      - grafana
+    networks:
+      - mcp-multi-network
+
+  # ============================================================================
+  # REPLICA 1: Proxy 1 + Stock Upstream MCP 1
+  # ============================================================================
+  mcp-proxy-1:
+    image: grafana-mcp-oauth:multi-test
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: mcp-proxy-1
+    restart: unless-stopped
+    environment:
+      - MODE=proxy
+      - PORT=8080
+      - BASE_URL=http://localhost:8080
+      - INSTANCE_URL=http://mcp-proxy-1:8080
+      - GRAFANA_URL=http://grafana:3000
+      - GRAFANA_PUBLIC_URL=http://localhost:8080
+      - TARGET_MCP_URL=http://mcp-grafana-1:8000
+      - REDIS_ADDR=redis:6379
+      - CIMD_ALLOW_INSECURE_HTTP=true
+      - CIMD_ENFORCEMENT=permissive
+      - LOG_LEVEL=debug
+    depends_on:
+      - redis
+      - mcp-grafana-1
+      - grafana
+    networks:
+      - mcp-multi-network
+
+  mcp-grafana-1:
+    image: grafana/mcp-grafana:latest
+    container_name: mcp-grafana-1
+    restart: unless-stopped
+    command: ["--base-path", "/mcp", "--sse-keepalive", "15s", "--allowed-hosts", "*"]
+    environment:
+      - GRAFANA_URL=http://grafana:3000
+      - GRAFANA_FORWARD_HEADERS=Cookie
+      - PORT=8000
+    depends_on:
+      - grafana
+    networks:
+      - mcp-multi-network
+
+  # ============================================================================
+  # REPLICA 2: Proxy 2 + Stock Upstream MCP 2
+  # ============================================================================
+  mcp-proxy-2:
+    image: grafana-mcp-oauth:multi-test
+    container_name: mcp-proxy-2
+    restart: unless-stopped
+    environment:
+      - MODE=proxy
+      - PORT=8080
+      - BASE_URL=http://localhost:8080
+      - INSTANCE_URL=http://mcp-proxy-2:8080
+      - GRAFANA_URL=http://grafana:3000
+      - GRAFANA_PUBLIC_URL=http://localhost:8080
+      - TARGET_MCP_URL=http://mcp-grafana-2:8000
+      - REDIS_ADDR=redis:6379
+      - CIMD_ALLOW_INSECURE_HTTP=true
+      - CIMD_ENFORCEMENT=permissive
+      - LOG_LEVEL=debug
+    depends_on:
+      - redis
+      - mcp-grafana-2
+      - grafana
+    networks:
+      - mcp-multi-network
+
+  mcp-grafana-2:
+    image: grafana/mcp-grafana:latest
+    container_name: mcp-grafana-2
+    restart: unless-stopped
+    command: ["--base-path", "/mcp", "--sse-keepalive", "15s", "--allowed-hosts", "*"]
+    environment:
+      - GRAFANA_URL=http://grafana:3000
+      - GRAFANA_FORWARD_HEADERS=Cookie
+      - PORT=8000
+    depends_on:
+      - grafana
+    networks:
+      - mcp-multi-network
+
+  # ============================================================================
+  # SHARED INFRASTRUCTURE: Redis / Valkey + Grafana
+  # ============================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: mcp-multi-redis
+    restart: unless-stopped
+    command: redis-server --save "" --appendonly no
+    networks:
+      - mcp-multi-network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: mcp-multi-grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SERVER_ROOT_URL=http://localhost:8080/
+      - GF_AUTH_GENERIC_OAUTH_ENABLED=true
+      - GF_AUTH_GENERIC_OAUTH_NAME=Enterprise SSO
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+    networks:
+      - mcp-multi-network
+
+networks:
+  mcp-multi-network:
+    driver: bridge

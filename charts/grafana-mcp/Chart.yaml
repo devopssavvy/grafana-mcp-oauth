@@ -2,8 +2,8 @@ apiVersion: v2
 name: grafana-mcp
 description: Model Context Protocol (MCP) server for Grafana with integrated OAuth 2.1 proxy sidecar and secure Valkey session storage.
 type: application
-version: 0.1.6
-appVersion: "v0.2.0-rc4"
+version: 0.1.7
+appVersion: "v0.2.0-rc5"
 kubeVersion: ">=1.25.0-0"
 home: https://github.com/devopssavvy/grafana-mcp-oauth
 icon: https://artifacthub.io/image/b4fed1a7-6c8f-4945-b99d-096efa3e4116
