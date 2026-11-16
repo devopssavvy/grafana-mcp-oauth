@@ -159,7 +159,6 @@ func TestStore_RefreshTokenMapping(t *testing.T) {
 	assert.ErrorIs(t, err, store.ErrInvalidRefreshToken)
 }
 
-
 func TestStore_PendingAuthFlow(t *testing.T) {
 	ctx := context.Background()
 	st, mr := setupTestStore(t)
@@ -242,7 +241,6 @@ func TestStore_AuthCodeFlow(t *testing.T) {
 	_, err = st.GetAuthCode(ctx, code)
 	assert.ErrorIs(t, err, store.ErrAuthCodeNotFound)
 }
-
 
 func TestStore_RefreshTokenSessionFlow(t *testing.T) {
 	ctx := context.Background()

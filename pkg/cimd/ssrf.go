@@ -35,16 +35,16 @@ func init() {
 	}
 
 	ipv6CIDRs := []string{
-		"::/128",        // Unspecified
-		"::1/128",       // Loopback
-		"64:ff9b::/96",  // IPv4/IPv6 translation
+		"::/128",         // Unspecified
+		"::1/128",        // Loopback
+		"64:ff9b::/96",   // IPv4/IPv6 translation
 		"64:ff9b:1::/48", // Local-use IPv4/IPv6 translation (RFC 8215)
-		"100::/64",      // Discard prefix
-		"2001::/23",     // IETF Protocol Assignments
-		"2001:db8::/32", // Documentation
-		"fc00::/7",      // Unique Local Address (ULA)
-		"fe80::/10",     // Link-local unicast
-		"ff00::/8",      // Multicast
+		"100::/64",       // Discard prefix
+		"2001::/23",      // IETF Protocol Assignments
+		"2001:db8::/32",  // Documentation
+		"fc00::/7",       // Unique Local Address (ULA)
+		"fe80::/10",      // Link-local unicast
+		"ff00::/8",       // Multicast
 	}
 
 	for _, c := range ipv4CIDRs {
