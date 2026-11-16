@@ -81,6 +81,9 @@ mcpGrafana:
   # -- Listen address for internal mcp-grafana server (restricted strictly to 127.0.0.1 loopback)
   listenAddress: "127.0.0.1:8000"
 
+  # -- Interval between ping requests sent to SSE clients to prevent idle connection closure (e.g. "15s")
+  sseKeepalive: "15s"
+
   # -- Disable write operations to Grafana
   disableWrite: false
 
