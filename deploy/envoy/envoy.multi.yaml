@@ -1,0 +1,106 @@
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+
+static_resources:
+  listeners:
+  - name: main_listener
+    address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 8080
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: ingress_http
+          codec_type: AUTO
+          normalize_path: true
+          merge_slashes: true
+          route_config:
+            name: main_route
+            virtual_hosts:
+            - name: backend
+              domains: ["*"]
+              routes:
+              # 1. RFC 9728 & RFC 8414 MCP Discovery endpoints
+              - match:
+                  prefix: "/.well-known/"
+                route:
+                  cluster: mcp_proxies
+                  timeout: 10s
+
+              # 2. Public OAuth login, callback, and token endpoints
+              - match:
+                  path: "/mcp/auth"
+                route:
+                  cluster: mcp_proxies
+                  timeout: 30s
+              - match:
+                  prefix: "/mcp/auth/"
+                route:
+                  cluster: mcp_proxies
+                  timeout: 30s
+
+              # 3. Remote MCP endpoint (SSE stream and messages load-balanced round-robin)
+              - match:
+                  path: "/mcp"
+                route:
+                  cluster: mcp_proxies
+                  timeout: 0s # Disabled timeout for long-lived SSE connections
+                  idle_timeout: 300s
+              - match:
+                  prefix: "/mcp/"
+                route:
+                  cluster: mcp_proxies
+                  timeout: 0s # Disabled timeout for long-lived SSE connections
+                  idle_timeout: 300s
+
+              # 4. Regular Grafana Web User Traffic
+              - match:
+                  prefix: "/"
+                route:
+                  cluster: grafana_server
+                  timeout: 60s
+
+          http_filters:
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+  # Multi-replica cluster for mcp-oauth-proxy instances
+  - name: mcp_proxies
+    type: STRICT_DNS
+    lb_policy: ROUND_ROBIN
+    load_assignment:
+      cluster_name: mcp_proxies
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: mcp-proxy-1
+                port_value: 8080
+        - endpoint:
+            address:
+              socket_address:
+                address: mcp-proxy-2
+                port_value: 8080
+
+  # Grafana Server
+  - name: grafana_server
+    type: STRICT_DNS
+    lb_policy: ROUND_ROBIN
+    load_assignment:
+      cluster_name: grafana_server
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: grafana
+                port_value: 3000

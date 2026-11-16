@@ -53,6 +53,9 @@ oauthProxy:
   # -- Public URL for Grafana login (defaults to grafana.url if empty)
   grafanaPublicUrl: ""
 
+  # -- Internal address used for cross-replica peer forwarding (defaults to http://$(POD_IP):8080)
+  instanceUrl: ""
+
   # -- Master encryption secret (minimum 16 bytes).
   # If left empty, runs in Zero-Knowledge Client-Derived Key mode (RFC 5869),
   # requiring zero configuration and maintaining multi-pod synchronization.

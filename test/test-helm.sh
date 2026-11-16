@@ -54,7 +54,7 @@ if echo "${HTTPROUTE_MATCHES}" | grep -E "^\s+value: /$"; then
 fi
 
 echo "=== 4. Ephemeral KinD Mock Cluster Deployment Test ==="
-if command -v kind >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+if command -v kind >/dev/null 2>&1 && docker info >/dev/null 2>&1 && [ -e /dev/kmsg ]; then
   cleanup() {
     echo "--- Cleaning up KinD mock cluster '${CLUSTER_NAME}' ---"
     kind delete cluster --name "${CLUSTER_NAME}" >/dev/null 2>&1 || true

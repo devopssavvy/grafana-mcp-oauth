@@ -82,6 +82,12 @@ spec:
               value: "8080"
             - name: BASE_URL
               value: {{ .Values.oauthProxy.baseUrl | default (printf "http://%s:%d" (include "grafana-mcp.fullname" .) (.Values.service.port | int)) | quote }}
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: INSTANCE_URL
+              value: {{ .Values.oauthProxy.instanceUrl | default "http://$(POD_IP):8080" | quote }}
             - name: GRAFANA_URL
               value: {{ .Values.grafana.url | quote }}
             - name: GRAFANA_PUBLIC_URL
