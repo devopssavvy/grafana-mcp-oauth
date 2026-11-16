@@ -301,3 +301,58 @@ func TestServer_ExtAuthzDefaultPortResolution(t *testing.T) {
 	assert.Equal(t, "8081", cfg.HTTPPort, "ExtAuthz mode must default HTTP port to 8081")
 	assert.Equal(t, server.ModeExtAuthz, srv.Mode())
 }
+
+func TestServer_DefensiveSecurityHeaders(t *testing.T) {
+	_, rdb := setupTestRedis(t)
+
+	httpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	cfg := &config.AppConfig{
+		Mode:         server.ModeProxy,
+		BaseURL:      "http://" + httpLn.Addr().String(),
+		TargetMCPURL: "http://127.0.0.1:9999",
+		MasterSecret: []byte("01234567890123456789012345678901"),
+	}
+
+	srv, err := server.New(server.Options{
+		Config:       cfg,
+		HTTPListener: httpLn,
+		RedisClient:  rdb,
+	})
+	require.NoError(t, err)
+
+	errChan, err := srv.Start()
+	require.NoError(t, err)
+
+	client := testHTTPClient()
+
+	// 1. Check security headers on /healthz
+	respHealth, err := client.Get("http://" + srv.HTTPAddr() + "/healthz")
+	require.NoError(t, err)
+	assert.Equal(t, "nosniff", respHealth.Header.Get("X-Content-Type-Options"))
+	assert.Equal(t, "DENY", respHealth.Header.Get("X-Frame-Options"))
+	assert.Equal(t, "strict-origin-when-cross-origin", respHealth.Header.Get("Referrer-Policy"))
+	assert.Equal(t, "default-src 'none'; style-src 'unsafe-inline'", respHealth.Header.Get("Content-Security-Policy"))
+	_ = respHealth.Body.Close()
+
+	// 2. Check security headers on root /
+	respRoot, err := client.Get("http://" + srv.HTTPAddr() + "/")
+	require.NoError(t, err)
+	assert.Equal(t, "nosniff", respRoot.Header.Get("X-Content-Type-Options"))
+	assert.Equal(t, "DENY", respRoot.Header.Get("X-Frame-Options"))
+	assert.Equal(t, "strict-origin-when-cross-origin", respRoot.Header.Get("Referrer-Policy"))
+	assert.Equal(t, "default-src 'none'; style-src 'unsafe-inline'", respRoot.Header.Get("Content-Security-Policy"))
+	_ = respRoot.Body.Close()
+
+	ctxShut, cancelShut := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelShut()
+	err = srv.Shutdown(ctxShut)
+	require.NoError(t, err)
+
+	select {
+	case srvErr := <-errChan:
+		t.Fatalf("Unexpected server error: %v", srvErr)
+	default:
+	}
+}

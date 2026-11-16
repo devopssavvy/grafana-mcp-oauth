@@ -83,20 +83,46 @@ func NewProxy(cfg Config, s store.SessionStore) (*Proxy, error) {
 			Transport: &http.Transport{
 				Proxy: http.ProxyFromEnvironment,
 				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-					host, _, err := net.SplitHostPort(addr)
-					if err == nil {
-						if ip := net.ParseIP(host); ip != nil {
-							// Block cloud metadata (169.254.169.254 / link-local)
-							if ip.IsLinkLocalUnicast() || ip.String() == "169.254.169.254" {
-								return nil, fmt.Errorf("peer forward to metadata IP blocked: %s", ip)
-							}
-						}
+					host, port, err := net.SplitHostPort(addr)
+					if err != nil {
+						return nil, fmt.Errorf("invalid address %q: %w", addr, err)
 					}
 					dialer := &net.Dialer{
 						Timeout:   5 * time.Second,
 						KeepAlive: 30 * time.Second,
 					}
-					return dialer.DialContext(ctx, network, addr)
+					if ip := net.ParseIP(host); ip != nil {
+						// Block cloud metadata (169.254.169.254 / link-local)
+						if ip.IsLinkLocalUnicast() || ip.String() == "169.254.169.254" {
+							return nil, fmt.Errorf("peer forward to metadata IP blocked: %s", ip)
+						}
+						return dialer.DialContext(ctx, network, addr)
+					}
+					// Pre-resolve DNS hostnames to verify candidate IPs against metadata / link-local addresses (SSRF defense-in-depth)
+					ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+					if err != nil {
+						return nil, fmt.Errorf("DNS lookup failed for peer host %s: %w", host, err)
+					}
+					var safeIPs []net.IP
+					for _, ip := range ips {
+						if ip.IsLinkLocalUnicast() || ip.String() == "169.254.169.254" {
+							return nil, fmt.Errorf("peer host %s resolved to blocked metadata IP %s", host, ip)
+						}
+						safeIPs = append(safeIPs, ip)
+					}
+					if len(safeIPs) == 0 {
+						return nil, fmt.Errorf("no IP addresses resolved for peer host %s", host)
+					}
+					var lastErr error
+					for _, sip := range safeIPs {
+						safeAddr := net.JoinHostPort(sip.String(), port)
+						conn, err := dialer.DialContext(ctx, network, safeAddr)
+						if err == nil {
+							return conn, nil
+						}
+						lastErr = err
+					}
+					return nil, fmt.Errorf("failed to connect to resolved IPs for %s: %w", host, lastErr)
 				},
 				ForceAttemptHTTP2:     true,
 				MaxIdleConns:          100,

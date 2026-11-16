@@ -225,9 +225,20 @@ func New(opts Options) (*Server, error) {
 </html>`, mode, mode)
 	})
 
+	// Global defensive browser security headers middleware enforcing AGENTS.md §2.4 across all HTTP endpoints
+	securityHeadersMiddleware := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			w.Header().Set("X-Frame-Options", "DENY")
+			w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+			w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")
+			next.ServeHTTP(w, r)
+		})
+	}
+
 	s.httpServer = &http.Server{
 		Addr:              ":" + cfg.HTTPPort,
-		Handler:           mux,
+		Handler:           securityHeadersMiddleware(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      0, // 0 for streaming SSE

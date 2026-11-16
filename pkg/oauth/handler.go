@@ -652,9 +652,9 @@ func (h *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 		}
 	}
 
-	// Verify client_id in token request per OAuth 2.1 Section 4.1.3 and CIMD specification
+	// Verify client_id in token request per OAuth 2.1 Section 4.1.3 and CIMD specification (AGENTS.md §2.2)
 	reqClientID := r.FormValue("client_id")
-	if h.cfg.CIMDEnforcement == "required" {
+	if h.cfg.CIMDEnforcement == "required" || authCtx.ClientID != "" {
 		if reqClientID == "" {
 			h.cfg.Logger.Warn("Token exchange rejected: missing client_id parameter", "expected", authCtx.ClientID)
 			sendTokenError(w, http.StatusBadRequest, "invalid_client", "client_id parameter is required")
@@ -668,7 +668,7 @@ func (h *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 			sendTokenError(w, http.StatusBadRequest, "invalid_grant", "client_id mismatch")
 			return
 		}
-	} else if reqClientID != "" && authCtx.ClientID != "" {
+	} else if reqClientID != "" {
 		if subtle.ConstantTimeCompare([]byte(reqClientID), []byte(authCtx.ClientID)) != 1 {
 			h.cfg.Logger.Warn("Token exchange rejected due to client_id mismatch",
 				"expected", authCtx.ClientID,
