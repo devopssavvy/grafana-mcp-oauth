@@ -340,7 +340,8 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 					http.Error(w, "invalid redirect target: must be local loopback", http.StatusBadRequest)
 					return
 				}
-				http.Redirect(w, r, redirectTarget.String(), http.StatusFound)
+				w.Header().Set("Location", redirectTarget.String())
+				w.WriteHeader(http.StatusFound)
 				return
 			}
 			h.cfg.Logger.Debug("Existing grafana_session cookie could not be verified against Grafana; proceeding with SSO login flow", "error", err)
