@@ -165,6 +165,10 @@ spec:
             - "/mcp"
             - "--sse-keepalive"
             - {{ .Values.mcpGrafana.sseKeepalive | default "15s" | quote }}
+            {{- if .Values.mcpGrafana.allowedHosts }}
+            - "--allowed-hosts"
+            - {{ .Values.mcpGrafana.allowedHosts | quote }}
+            {{- end }}
             {{- if .Values.debug }}
             - "--debug"
             {{- end }}
