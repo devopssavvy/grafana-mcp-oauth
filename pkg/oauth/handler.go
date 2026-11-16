@@ -418,9 +418,7 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	)
 
 	h.cfg.Logger.Info("Redirecting user to Grafana SSO login",
-		"internal_state", internalState,
 		"client_redirect_uri", redirectURI,
-		"grafana_login_url", grafanaLoginURL,
 	)
 
 	http.Redirect(w, r, grafanaLoginURL, http.StatusFound)

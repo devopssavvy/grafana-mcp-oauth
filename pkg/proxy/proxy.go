@@ -62,6 +62,12 @@ func NewProxy(cfg Config, s store.SessionStore) (*Proxy, error) {
 		},
 		// FlushInterval: -1 ensures immediate flushing for SSE text/event-stream
 		FlushInterval: -1,
+		ModifyResponse: func(resp *http.Response) error {
+			if strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+				resp.Header.Set("X-Accel-Buffering", "no")
+			}
+			return nil
+		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			p.logger.Error("Upstream proxy error", "error", err, "path", r.URL.Path)
 			http.Error(w, "Bad Gateway: Upstream MCP server unavailable", http.StatusBadGateway)
