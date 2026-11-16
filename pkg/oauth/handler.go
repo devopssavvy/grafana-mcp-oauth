@@ -282,6 +282,72 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		// No CIMD validation
 	}
 
+	// Check if the user already has an active, authenticated Grafana session.
+	// If active and prompt != "login", issue the authorization code directly,
+	// preventing redundant SSO redirects and eliminating the "stuck on Grafana page" loop.
+	if q.Get("prompt") != "login" {
+		var grafanaSession string
+		for _, c := range r.Cookies() {
+			if c.Name == "grafana_session" {
+				grafanaSession = c.Value
+				break
+			}
+		}
+		if grafanaSession != "" && isValidGrafanaSession(grafanaSession) {
+			userInfo, err := h.fetchGrafanaUser(r.Context(), grafanaSession)
+			if err == nil && userInfo != nil {
+				authCode, err := crypto.GenerateRandomToken("mcp_code_", 32)
+				if err != nil {
+					http.Error(w, "failed to generate authorization code", http.StatusInternalServerError)
+					return
+				}
+
+				authCtx := &store.AuthCodeContext{
+					GrafanaSession:      grafanaSession,
+					UserInfo:            userInfo,
+					ClientID:            clientID,
+					RedirectURI:         redirectURI,
+					CodeChallenge:       codeChallenge,
+					CodeChallengeMethod: codeChallengeMethod,
+					ExpiresAt:           time.Now().Add(h.cfg.AuthCodeTTL),
+				}
+
+				if err := h.store.SaveAuthCode(r.Context(), authCode, authCtx, h.cfg.AuthCodeTTL); err != nil {
+					h.cfg.Logger.Error("Failed to store authorization code in Redis", "error", err)
+					http.Error(w, "failed to save authorization code", http.StatusInternalServerError)
+					return
+				}
+
+				redirectTarget, err := url.Parse(redirectURI)
+				if err != nil {
+					http.Error(w, "invalid redirect target", http.StatusBadRequest)
+					return
+				}
+
+				tq := redirectTarget.Query()
+				tq.Set("code", authCode)
+				if clientState != "" {
+					tq.Set("state", clientState)
+				}
+				redirectTarget.RawQuery = tq.Encode()
+
+				h.cfg.Logger.Info("Authenticated Grafana session detected: redirecting browser back to MCP client with authorization code",
+					"redirect_uri", redirectURI,
+					"username", userInfo.Login,
+				)
+
+				if !isAllowedRedirectURI(redirectTarget.String()) {
+					http.Error(w, "invalid redirect target: must be local loopback", http.StatusBadRequest)
+					return
+				}
+				w.Header().Set("Location", redirectTarget.String())
+				w.WriteHeader(http.StatusFound)
+				return
+			}
+			h.cfg.Logger.Debug("Existing grafana_session cookie could not be verified against Grafana; proceeding with SSO login flow", "error", err)
+		}
+	}
+
 	// Generate internal state to track this flow
 	internalState, err := crypto.GenerateRandomToken("mcp_st_", 16)
 	if err != nil {
@@ -316,13 +382,39 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   int(h.cfg.PendingAuthTTL.Seconds()),
 	})
 
-	// Construct callback URL with internal state
-	callbackURL := fmt.Sprintf("%s?mcp_state=%s", h.cfg.CallbackBaseURL, internalState)
+	// Derive the relative callback path required by Grafana's ValidateRedirectTo
+	callbackPath := "/mcp/auth/callback?mcp_state=" + internalState
+	if cbURL, err := url.Parse(h.cfg.CallbackBaseURL); err == nil && cbURL.Path != "" {
+		callbackPath = cbURL.Path + "?mcp_state=" + internalState
+	}
+
+	// Set Grafana post-login redirect cookies so Grafana redirects to callback upon completing login
+	// #nosec G124 -- Secure flag dynamically matches CookieSecure configuration
+	http.SetCookie(w, &http.Cookie{
+		Name:     "redirect_to",
+		Value:    url.QueryEscape(callbackPath),
+		Path:     "/",
+		SameSite: http.SameSiteLaxMode,
+		Secure:   h.cfg.CookieSecure,
+		MaxAge:   int(h.cfg.PendingAuthTTL.Seconds()),
+	})
+	// #nosec G124 -- Secure flag dynamically matches CookieSecure configuration
+	http.SetCookie(w, &http.Cookie{
+		Name:     "redirectTo",
+		Value:    url.QueryEscape(callbackPath),
+		Path:     "/",
+		SameSite: http.SameSiteLaxMode,
+		Secure:   h.cfg.CookieSecure,
+		MaxAge:   int(h.cfg.PendingAuthTTL.Seconds()),
+	})
 
 	// Redirect browser to Grafana generic OAuth via public URL
-	grafanaLoginURL := fmt.Sprintf("%s/login/generic_oauth?redirect=%s",
+	// Provide redirect, redirectTo, and redirect_to parameters for maximum compatibility with Grafana
+	grafanaLoginURL := fmt.Sprintf("%s/login/generic_oauth?redirect=%s&redirectTo=%s&redirect_to=%s",
 		strings.TrimRight(h.cfg.GrafanaPublicURL, "/"),
-		url.QueryEscape(callbackURL),
+		url.QueryEscape(callbackPath),
+		url.QueryEscape(callbackPath),
+		url.QueryEscape(callbackPath),
 	)
 
 	h.cfg.Logger.Info("Redirecting user to Grafana SSO login",
@@ -352,13 +444,31 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Clear the state cookie
+	// Clear the state and redirect cookies
 	// #nosec G124 -- Secure flag dynamically matches CookieSecure configuration (true in HTTPS production, configurable for local dev)
 	http.SetCookie(w, &http.Cookie{
 		Name:     "mcp_auth_state",
 		Value:    "",
 		Path:     "/mcp/auth",
 		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   h.cfg.CookieSecure,
+		MaxAge:   -1,
+	})
+	// #nosec G124 -- Secure flag dynamically matches CookieSecure configuration
+	http.SetCookie(w, &http.Cookie{
+		Name:     "redirect_to",
+		Value:    "",
+		Path:     "/",
+		SameSite: http.SameSiteLaxMode,
+		Secure:   h.cfg.CookieSecure,
+		MaxAge:   -1,
+	})
+	// #nosec G124 -- Secure flag dynamically matches CookieSecure configuration
+	http.SetCookie(w, &http.Cookie{
+		Name:     "redirectTo",
+		Value:    "",
+		Path:     "/",
 		SameSite: http.SameSiteLaxMode,
 		Secure:   h.cfg.CookieSecure,
 		MaxAge:   -1,

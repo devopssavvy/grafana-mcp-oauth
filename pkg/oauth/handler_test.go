@@ -1219,3 +1219,104 @@ func TestHandler_RateLimiter_ForwardedHeaders_UntrustedPeer(t *testing.T) {
 	h.HandleLogin(recBlocked, reqBlocked)
 	assert.Equal(t, http.StatusTooManyRequests, recBlocked.Code)
 }
+
+func TestHandler_Login_GrafanaRedirectionParametersAndCookies(t *testing.T) {
+	h, _, mockGrafana := setupOAuthTestEnv(t)
+	defer mockGrafana.Close()
+
+	_, challenge := generateTestPKCE()
+
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/mcp/auth/login?redirect_uri=http://localhost:54321/callback&state=state_test&code_challenge=%s&code_challenge_method=S256", challenge), nil)
+	rec := httptest.NewRecorder()
+	h.HandleLogin(rec, req)
+
+	assert.Equal(t, http.StatusFound, rec.Code)
+	location := rec.Header().Get("Location")
+	locURL, err := url.Parse(location)
+	require.NoError(t, err)
+
+	// Grafana expects redirectTo or redirect_to query parameters
+	redirectToParam := locURL.Query().Get("redirectTo")
+	redirect_toParam := locURL.Query().Get("redirect_to")
+	assert.NotEmpty(t, redirectToParam, "redirectTo parameter must be set for Grafana compatibility")
+	assert.NotEmpty(t, redirect_toParam, "redirect_to parameter must be set for Grafana compatibility")
+
+	// Grafana's ValidateRedirectTo requires relative path (starts with /), not absolute URL
+	assert.True(t, strings.HasPrefix(redirectToParam, "/mcp/auth/callback"), "redirectTo must be a relative path for Grafana ValidateRedirectTo")
+	assert.True(t, strings.HasPrefix(redirect_toParam, "/mcp/auth/callback"), "redirect_to must be a relative path for Grafana ValidateRedirectTo")
+
+	// Verify redirect_to and redirectTo cookies are set with Path: "/"
+	cookies := rec.Result().Cookies()
+	var redirectToCookie, redirect_toCookie *http.Cookie
+	for _, c := range cookies {
+		if c.Name == "redirectTo" {
+			redirectToCookie = c
+		}
+		if c.Name == "redirect_to" {
+			redirect_toCookie = c
+		}
+	}
+	require.NotNil(t, redirectToCookie, "redirectTo cookie must be set for Grafana")
+	require.NotNil(t, redirect_toCookie, "redirect_to cookie must be set for Grafana")
+	assert.Equal(t, "/", redirectToCookie.Path)
+	assert.Equal(t, "/", redirect_toCookie.Path)
+}
+
+func TestHandler_Login_ActiveGrafanaSession_ImmediateAuthorization(t *testing.T) {
+	h, _, mockGrafana := setupOAuthTestEnv(t)
+	defer mockGrafana.Close()
+
+	verifier, challenge := generateTestPKCE()
+
+	// 1. When an active, valid grafana_session is present, HandleLogin must directly issue authorization code
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/mcp/auth/login?redirect_uri=http://127.0.0.1:54321/callback&state=state_active_session&code_challenge=%s&code_challenge_method=S256", challenge), nil)
+	req.AddCookie(&http.Cookie{
+		Name:  "grafana_session",
+		Value: "valid_grafana_session_123",
+	})
+	rec := httptest.NewRecorder()
+	h.HandleLogin(rec, req)
+
+	assert.Equal(t, http.StatusFound, rec.Code)
+	location := rec.Header().Get("Location")
+	locURL, err := url.Parse(location)
+	require.NoError(t, err)
+
+	// Must redirect directly to agent loopback, NOT to Grafana!
+	assert.Equal(t, "127.0.0.1:54321", locURL.Host)
+	assert.Equal(t, "/callback", locURL.Path)
+	assert.Equal(t, "state_active_session", locURL.Query().Get("state"))
+	code := locURL.Query().Get("code")
+	require.NotEmpty(t, code, "Authorization code must be provided in callback redirect")
+
+	// 2. Token exchange with the issued code must succeed
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("code", code)
+	form.Set("code_verifier", verifier)
+	form.Set("redirect_uri", "http://127.0.0.1:54321/callback")
+
+	tokenReq := httptest.NewRequest(http.MethodPost, "/mcp/auth/token", strings.NewReader(form.Encode()))
+	tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	tokenRec := httptest.NewRecorder()
+	h.HandleToken(tokenRec, tokenReq)
+
+	assert.Equal(t, http.StatusOK, tokenRec.Code)
+	var resp oauth.TokenResponse
+	err = json.NewDecoder(tokenRec.Body).Decode(&resp)
+	require.NoError(t, err)
+	assert.NotEmpty(t, resp.AccessToken)
+
+	// 3. When prompt=login is passed, it forces Grafana SSO login even if session is present
+	reqPrompt := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/mcp/auth/login?prompt=login&redirect_uri=http://127.0.0.1:54321/callback&state=state_prompt&code_challenge=%s&code_challenge_method=S256", challenge), nil)
+	reqPrompt.AddCookie(&http.Cookie{
+		Name:  "grafana_session",
+		Value: "valid_grafana_session_123",
+	})
+	recPrompt := httptest.NewRecorder()
+	h.HandleLogin(recPrompt, reqPrompt)
+
+	assert.Equal(t, http.StatusFound, recPrompt.Code)
+	promptLoc := recPrompt.Header().Get("Location")
+	assert.Contains(t, promptLoc, "/login/generic_oauth")
+}

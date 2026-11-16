@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -57,7 +58,23 @@ func main() {
 		_, _ = w.Write([]byte("<html><body><h1>Grafana 11 Enterprise</h1><p>Web User View</p></body></html>"))
 	})
 	grafanaMux.HandleFunc("GET /login/generic_oauth", func(w http.ResponseWriter, r *http.Request) {
-		redirectTarget := r.URL.Query().Get("redirect")
+		redirectTarget := r.URL.Query().Get("redirectTo")
+		if redirectTarget == "" {
+			redirectTarget = r.URL.Query().Get("redirect_to")
+		}
+		if redirectTarget == "" {
+			redirectTarget = r.URL.Query().Get("redirect")
+		}
+		if redirectTarget == "" {
+			if c, err := r.Cookie("redirect_to"); err == nil && c.Value != "" {
+				redirectTarget, _ = url.QueryUnescape(c.Value)
+			}
+		}
+		if redirectTarget == "" {
+			if c, err := r.Cookie("redirectTo"); err == nil && c.Value != "" {
+				redirectTarget, _ = url.QueryUnescape(c.Value)
+			}
+		}
 		if redirectTarget == "" {
 			redirectTarget = "/"
 		}
