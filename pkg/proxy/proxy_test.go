@@ -633,7 +633,7 @@ func TestProxy_PathRewrite_MCPToSSE(t *testing.T) {
 		t.Errorf("expected upstream path /mcp/sse, got %s", receivedPath)
 	}
 
-	// 2. POST /mcp/ -> rewrites to /mcp/sse
+	// 2. POST /mcp/ -> normalizes to /mcp for Streamable HTTP
 	req, _ = http.NewRequest(http.MethodPost, server.URL+"/mcp/", strings.NewReader(`{"jsonrpc":"2.0"}`))
 	req.Header.Set("Authorization", "Bearer valid-token")
 	resp, err = http.DefaultClient.Do(req)
@@ -641,11 +641,23 @@ func TestProxy_PathRewrite_MCPToSSE(t *testing.T) {
 		t.Fatalf("request failed: %v", err)
 	}
 	_ = resp.Body.Close()
-	if receivedPath != "/mcp/sse" {
-		t.Errorf("expected upstream path /mcp/sse, got %s", receivedPath)
+	if receivedPath != "/mcp" {
+		t.Errorf("expected upstream path /mcp, got %s", receivedPath)
 	}
 
-	// 3. GET /mcp/sse -> stays /mcp/sse
+	// 3. POST /mcp -> stays /mcp for Streamable HTTP
+	req, _ = http.NewRequest(http.MethodPost, server.URL+"/mcp", strings.NewReader(`{"jsonrpc":"2.0"}`))
+	req.Header.Set("Authorization", "Bearer valid-token")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	_ = resp.Body.Close()
+	if receivedPath != "/mcp" {
+		t.Errorf("expected upstream path /mcp, got %s", receivedPath)
+	}
+
+	// 4. GET /mcp/sse -> stays /mcp/sse
 	req, _ = http.NewRequest(http.MethodGet, server.URL+"/mcp/sse", nil)
 	req.Header.Set("Authorization", "Bearer valid-token")
 	resp, err = http.DefaultClient.Do(req)
@@ -655,6 +667,53 @@ func TestProxy_PathRewrite_MCPToSSE(t *testing.T) {
 	_ = resp.Body.Close()
 	if receivedPath != "/mcp/sse" {
 		t.Errorf("expected upstream path /mcp/sse, got %s", receivedPath)
+	}
+}
+
+func TestProxy_TransparentPathAdaptation(t *testing.T) {
+	// Upstream only has /mcp (Streamable HTTP)
+	upstreamStreamable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/mcp" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"result":"streamable_ok"}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte("not found"))
+	}))
+	defer upstreamStreamable.Close()
+
+	s := &mockStore{
+		sessions: map[string]*store.SessionData{
+			"valid-token": {GrafanaSession: "sess-123", Username: "alice"},
+		},
+	}
+
+	p, err := NewProxy(Config{
+		TargetURL: upstreamStreamable.URL,
+		BaseURL:   "http://localhost:8080",
+	}, s)
+	if err != nil {
+		t.Fatalf("NewProxy failed: %v", err)
+	}
+
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	// Client sends POST /mcp/sse (e.g. legacy configured client), proxy transparently adapts to /mcp
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/mcp/sse", strings.NewReader(`{"jsonrpc":"2.0"}`))
+	req.Header.Set("Authorization", "Bearer valid-token")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK after path adaptation, got %d: %s", resp.StatusCode, string(body))
+	}
+	if !strings.Contains(string(body), "streamable_ok") {
+		t.Errorf("expected streamable_ok in response, got %s", string(body))
 	}
 }
 

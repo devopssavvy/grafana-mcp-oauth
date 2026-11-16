@@ -167,10 +167,17 @@ spec:
           args:
             - "--address"
             - {{ .Values.mcpGrafana.listenAddress | default "127.0.0.1:8000" | quote }}
+            - "--transport"
+            - {{ .Values.mcpGrafana.transport | default "streamable-http" | quote }}
+            {{- if eq (.Values.mcpGrafana.transport | default "streamable-http") "streamable-http" }}
+            - "--endpoint-path"
+            - "/mcp"
+            {{- else }}
             - "--base-path"
             - "/mcp"
             - "--sse-keepalive"
             - {{ .Values.mcpGrafana.sseKeepalive | default "15s" | quote }}
+            {{- end }}
             {{- if .Values.mcpGrafana.allowedHosts }}
             - "--allowed-hosts"
             - {{ .Values.mcpGrafana.allowedHosts | quote }}
