@@ -197,17 +197,44 @@ docker compose -f docker-compose.sidecar.yml up -d
 Service Ports:
 * **`:8080`**: Front-door Proxy port for Coding Agents.
 
-### 3.4. Production Kubernetes Deployment (Helm Chart & Gateway API)
+### 3.4. Production Kubernetes Deployment (Helm Chart)
 
-For enterprise production deployments, use the production-ready Helm chart in `charts/grafana-mcp`:
+For production deployments on a standard Kubernetes system, use the official Helm chart:
+
+#### Option A: Install from OCI Registry (Standard Production System)
 
 ```bash
-# Add Valkey repository
+# Install via OCI registry with standard Ingress and bundled secure Valkey
+helm install grafana-mcp oci://ghcr.io/devopssavvy/charts/grafana-mcp \
+  --namespace monitoring --create-namespace \
+  --set oauthProxy.baseUrl="https://mcp.company.com" \
+  --set grafana.url="http://grafana.monitoring.svc:3000" \
+  --set ingress.enabled=true \
+  --set ingress.hosts[0].host="mcp.company.com"
+```
+
+#### Option B: Install from Local Chart Source
+
+```bash
+# 1. Add Valkey repository and build chart dependencies
 helm repo add valkey https://valkey.io/valkey-helm/
 helm repo update
+helm dependency build charts/grafana-mcp
 
-# Install chart with Kubernetes Gateway API HTTPRoute
+# 2. Install chart on a standard Kubernetes system with Ingress
 helm install grafana-mcp charts/grafana-mcp \
+  --namespace monitoring --create-namespace \
+  --set oauthProxy.baseUrl="https://mcp.company.com" \
+  --set grafana.url="http://grafana.monitoring.svc:3000" \
+  --set ingress.enabled=true \
+  --set ingress.hosts[0].host="mcp.company.com"
+```
+
+#### Option C: Install with Kubernetes Gateway API (`HTTPRoute` v1)
+
+```bash
+helm install grafana-mcp oci://ghcr.io/devopssavvy/charts/grafana-mcp \
+  --namespace monitoring --create-namespace \
   --set oauthProxy.baseUrl="https://mcp.company.com" \
   --set grafana.url="http://grafana.monitoring.svc:3000" \
   --set httpRoute.enabled=true
