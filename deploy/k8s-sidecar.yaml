@@ -74,6 +74,8 @@ spec:
             - "/mcp"
             - "--sse-keepalive"
             - "15s"
+            - "--allowed-hosts"
+            - "*"
           env:
             - name: GRAFANA_URL
               value: "http://grafana.monitoring.svc:3000"

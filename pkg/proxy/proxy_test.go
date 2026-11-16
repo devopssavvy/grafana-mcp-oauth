@@ -300,3 +300,50 @@ func TestProxy_RetryOnSessionInitialization(t *testing.T) {
 		t.Errorf("expected 2 attempts, got %d", attempts)
 	}
 }
+
+func TestProxy_SessionNotFound(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte("session not found"))
+	}))
+	defer upstream.Close()
+
+	s := &mockStore{
+		sessions: map[string]*store.SessionData{
+			"valid-token": {
+				GrafanaSession: "sess-999",
+				Username:       "bob",
+			},
+		},
+	}
+
+	p, err := NewProxy(Config{
+		TargetURL: upstream.URL,
+		BaseURL:   "http://localhost:8080",
+	}, s)
+	if err != nil {
+		t.Fatalf("NewProxy failed: %v", err)
+	}
+
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/mcp/sse?sessionid=stale-id", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize"}`))
+	req.Header.Set("Authorization", "Bearer valid-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected status 404, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "session not found") {
+		t.Fatalf("expected body to contain 'session not found', got: %s", string(body))
+	}
+}

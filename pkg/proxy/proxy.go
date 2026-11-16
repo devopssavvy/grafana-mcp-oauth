@@ -117,6 +117,11 @@ func NewProxy(cfg Config, s store.SessionStore) (*Proxy, error) {
 									}
 								}
 							}
+						} else if resp.StatusCode == http.StatusNotFound && bytes.Contains(respBytes, []byte("session not found")) {
+							p.logger.Warn("Upstream MCP session not found; client is using a stale session ID or server restarted",
+								"path", resp.Request.URL.Path,
+								"query", resp.Request.URL.RawQuery,
+							)
 						}
 						resp.Body = io.NopCloser(bytes.NewReader(respBytes))
 					}

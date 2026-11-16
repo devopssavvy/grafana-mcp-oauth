@@ -84,6 +84,9 @@ mcpGrafana:
   # -- Interval between ping requests sent to SSE clients to prevent idle connection closure (e.g. "15s")
   sseKeepalive: "15s"
 
+  # -- Allowed hosts for stock mcp-grafana HTTP/SSE host header validation ("*" allows proxying from sidecar)
+  allowedHosts: "*"
+
   # -- Disable write operations to Grafana
   disableWrite: false
 
@@ -216,6 +219,11 @@ networkPolicy:
 service:
   type: ClusterIP
   port: 80
+  # -- Enable ClientIP session affinity so SSE stream and message POSTs route to the same pod instance
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800
   labels: {}
   annotations: {}
   extraPorts: []
