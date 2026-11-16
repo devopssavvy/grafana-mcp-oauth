@@ -254,6 +254,7 @@ func TestHandler_FullPKCE_AuthorizationCodeGrant(t *testing.T) {
 	formBadURI.Set("grant_type", "authorization_code")
 	formBadURI.Set("code", authCode)
 	formBadURI.Set("code_verifier", verifier)
+	formBadURI.Set("client_id", "cursor")
 	formBadURI.Set("redirect_uri", "http://127.0.0.1:9999/callback") // mismatch!
 
 	tokenReqBad := httptest.NewRequest(http.MethodPost, "/mcp/auth/token", strings.NewReader(formBadURI.Encode()))
@@ -286,11 +287,12 @@ func TestHandler_FullPKCE_AuthorizationCodeGrant(t *testing.T) {
 	agentTarget2, _ := url.Parse(cbRec2.Header().Get("Location"))
 	authCode2 := agentTarget2.Query().Get("code")
 
-	// 3c. Valid token exchange via POST /mcp/auth/token
+	// 3c. Valid token exchange via POST /mcp/auth/token with matching client_id
 	form := url.Values{}
 	form.Set("grant_type", "authorization_code")
 	form.Set("code", authCode2)
 	form.Set("code_verifier", verifier)
+	form.Set("client_id", "cursor")
 	form.Set("redirect_uri", "http://127.0.0.1:45678/callback")
 
 	tokenReq := httptest.NewRequest(http.MethodPost, "/mcp/auth/token", strings.NewReader(form.Encode()))
@@ -315,6 +317,80 @@ func TestHandler_FullPKCE_AuthorizationCodeGrant(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "bob", sess.Username)
 	assert.Equal(t, "valid_grafana_session_123", sess.GrafanaSession)
+}
+
+func TestHandler_AuthCodeGrant_ClientIDBinding_StrictEnforcement(t *testing.T) {
+	h, st, mockGrafana := setupOAuthTestEnv(t)
+	defer mockGrafana.Close()
+
+	verifier, challenge := generateTestPKCE()
+
+	// 1. Issue authorization code bound to client_id "bound-agent-client"
+	authCode := "mcp_code_bound_test_123"
+	authCtx := &store.AuthCodeContext{
+		GrafanaSession:      "valid_grafana_session_123",
+		UserInfo:            &store.GrafanaUser{ID: 10, Login: "alice", Email: "alice@example.com"},
+		ClientID:            "bound-agent-client",
+		RedirectURI:         "http://127.0.0.1:54321/callback",
+		CodeChallenge:       challenge,
+		CodeChallengeMethod: "S256",
+		ExpiresAt:           time.Now().Add(time.Minute),
+	}
+	err := st.SaveAuthCode(t.Context(), authCode, authCtx, time.Minute)
+	require.NoError(t, err)
+
+	// Case A: Missing client_id on code exchange must be rejected with 400 invalid_client
+	formMissing := url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {authCode},
+		"code_verifier": {verifier},
+		"redirect_uri":  {"http://127.0.0.1:54321/callback"},
+	}
+	reqMissing := httptest.NewRequest(http.MethodPost, "/mcp/auth/token", strings.NewReader(formMissing.Encode()))
+	reqMissing.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	recMissing := httptest.NewRecorder()
+	h.HandleToken(recMissing, reqMissing)
+	assert.Equal(t, http.StatusBadRequest, recMissing.Code)
+	assert.Contains(t, recMissing.Body.String(), "invalid_client")
+	assert.Contains(t, recMissing.Body.String(), "client_id parameter is required")
+
+	// Re-save code for next case (since code is consumed atomically on attempt)
+	err = st.SaveAuthCode(t.Context(), authCode, authCtx, time.Minute)
+	require.NoError(t, err)
+
+	// Case B: Mismatched client_id on code exchange must be rejected with 400 invalid_grant
+	formMismatch := url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {authCode},
+		"code_verifier": {verifier},
+		"client_id":     {"attacker-client"},
+		"redirect_uri":  {"http://127.0.0.1:54321/callback"},
+	}
+	reqMismatch := httptest.NewRequest(http.MethodPost, "/mcp/auth/token", strings.NewReader(formMismatch.Encode()))
+	reqMismatch.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	recMismatch := httptest.NewRecorder()
+	h.HandleToken(recMismatch, reqMismatch)
+	assert.Equal(t, http.StatusBadRequest, recMismatch.Code)
+	assert.Contains(t, recMismatch.Body.String(), "invalid_grant")
+	assert.Contains(t, recMismatch.Body.String(), "client_id mismatch")
+
+	// Re-save code for successful case
+	err = st.SaveAuthCode(t.Context(), authCode, authCtx, time.Minute)
+	require.NoError(t, err)
+
+	// Case C: Matching client_id succeeds
+	formValid := url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {authCode},
+		"code_verifier": {verifier},
+		"client_id":     {"bound-agent-client"},
+		"redirect_uri":  {"http://127.0.0.1:54321/callback"},
+	}
+	reqValid := httptest.NewRequest(http.MethodPost, "/mcp/auth/token", strings.NewReader(formValid.Encode()))
+	reqValid.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	recValid := httptest.NewRecorder()
+	h.HandleToken(recValid, reqValid)
+	assert.Equal(t, http.StatusOK, recValid.Code)
 }
 
 func TestHandler_RefreshTokenGrant(t *testing.T) {

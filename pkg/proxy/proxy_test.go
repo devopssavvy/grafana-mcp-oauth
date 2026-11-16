@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -834,5 +835,55 @@ func TestProxy_SSEDisconnect_SessionRetainedInStore(t *testing.T) {
 	loc, err := s.GetMCPSession(context.Background(), "retain-test-session")
 	if err != nil || loc == "" {
 		t.Fatalf("expected session to be retained in store after disconnect, but got error: %v", err)
+	}
+}
+
+func TestProxy_PeerForwarding_BlockedMetadataIPs(t *testing.T) {
+	s := &mockStore{
+		sessions: map[string]*store.SessionData{
+			"valid-token": {
+				GrafanaSession: "sess-999",
+				Username:       "bob",
+			},
+		},
+		mcpSessions: map[string]string{
+			// Point session to cloud metadata IP
+			"metadata-attack-session": "http://169.254.169.254:80",
+		},
+	}
+
+	// Upstream that returns 404 session not found to trigger peer forwarding
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte("session not found"))
+	}))
+	defer upstream.Close()
+
+	p, err := NewProxy(Config{
+		TargetURL:   upstream.URL,
+		BaseURL:     "http://localhost:8080",
+		InstanceURL: "http://localhost:8080",
+	}, s)
+	if err != nil {
+		t.Fatalf("failed to create proxy: %v", err)
+	}
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	body := []byte(`{"jsonrpc":"2.0","method":"tools/list","id":1}`)
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/mcp?sessionId=metadata-attack-session", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer valid-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Peer forward to metadata IP must be blocked, returning 404
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected 404 when peer forwarding to metadata IP is blocked, got %d", resp.StatusCode)
 	}
 }
