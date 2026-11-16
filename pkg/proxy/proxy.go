@@ -22,7 +22,8 @@ type contextKey string
 
 const (
 	requestBodyContextKey contextKey = "mcp_request_body"
-	bearerTokenContextKey contextKey = "mcp_bearer_token"
+	// #nosec G101 -- context key for internal request context, not a hardcoded credential
+	bearerTokenContextKey contextKey = "mcp_internal_auth"
 )
 
 var sessionIDRegex = regexp.MustCompile(`(?i)[?&]session_?id=([a-zA-Z0-9_\-\.]+)`)
