@@ -121,10 +121,35 @@ func NewProxy(cfg Config, s store.SessionStore) (*Proxy, error) {
 			req.URL.Scheme = target.Scheme
 			req.URL.Host = target.Host
 			req.Host = target.Host
+			// If caller accesses /mcp or /mcp/ directly, route to /mcp/sse where stock mcp-grafana listens
+			if req.URL.Path == "/mcp" || req.URL.Path == "/mcp/" {
+				req.URL.Path = "/mcp/sse"
+			}
+			// If request carries Mcp-Session-Id or X-Session-Id header but no query param,
+			// populate query parameter sessionid so upstream go-sdk SSE handler accepts it seamlessly.
+			if q := req.URL.Query(); q.Get("sessionid") == "" && q.Get("sessionId") == "" && q.Get("session_id") == "" {
+				if sid := extractSessionID(req); sid != "" {
+					q.Set("sessionid", sid)
+					req.URL.RawQuery = q.Encode()
+				}
+			}
 		},
 		// FlushInterval: -1 ensures immediate flushing for SSE text/event-stream
 		FlushInterval: -1,
 		ModifyResponse: func(resp *http.Response) error {
+			// Register Streamable HTTP session if Mcp-Session-Id header is returned by upstream
+			if resp != nil {
+				if sid := resp.Header.Get("Mcp-Session-Id"); sid != "" {
+					regCtx, regCancel := context.WithTimeout(context.Background(), 5*time.Second)
+					if regErr := p.store.RegisterMCPSession(regCtx, sid, p.instanceURL, 120*time.Second); regErr != nil {
+						p.logger.Warn("Failed to register Streamable HTTP session in Redis", "session_id", sid, "error", regErr)
+					} else {
+						p.logger.Info("Registered active MCP Streamable HTTP session in Redis", "session_id", sid, "instance", p.instanceURL)
+					}
+					regCancel()
+				}
+			}
+
 			if strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
 				resp.Header.Set("X-Accel-Buffering", "no")
 				if resp.Request != nil && resp.Body != nil {
@@ -179,7 +204,7 @@ func NewProxy(cfg Config, s store.SessionStore) (*Proxy, error) {
 								}
 							}
 						} else if resp.StatusCode == http.StatusNotFound && bytes.Contains(respBytes, []byte("session not found")) {
-							sessID := extractSessionIDFromURL(resp.Request.URL)
+							sessID := extractSessionID(resp.Request)
 							isPeerHop := resp.Request.Header.Get("X-MCP-Peer-Hop") == "true"
 							if sessID != "" && !isPeerHop {
 								ownerURL, err := p.store.GetMCPSession(resp.Request.Context(), sessID)
@@ -223,6 +248,11 @@ func NewProxy(cfg Config, s store.SessionStore) (*Proxy, error) {
 															"peer", ownerURL,
 															"status", peerResp.StatusCode,
 														)
+														// Renew session TTL in Redis on successful forward
+														renewCtx, renewCancel := context.WithTimeout(context.Background(), 2*time.Second)
+														_ = p.store.RegisterMCPSession(renewCtx, sessID, ownerURL, 120*time.Second)
+														renewCancel()
+
 														peerResp.Body = io.NopCloser(bytes.NewReader(peerRespBytes))
 														*resp = *peerResp
 														return nil
@@ -240,6 +270,7 @@ func NewProxy(cfg Config, s store.SessionStore) (*Proxy, error) {
 								}
 							}
 							p.logger.Warn("Upstream MCP session not found; client is using a stale session ID or server restarted",
+								"session_id", sessID,
 								"path", resp.Request.URL.Path,
 								"query", resp.Request.URL.RawQuery,
 							)
@@ -383,26 +414,36 @@ func (w *sseBodyWrapper) Close() error {
 	w.cancel()
 	w.mu.Unlock()
 
+	// Never delete the session from Redis immediately on SSE stream closure.
+	// Preserving the session in Redis for its TTL (120s sliding window) allows:
+	// 1. Reconnection & token-refresh flows where the client closes the SSE stream
+	//    and subsequently sends POST requests to an alternate replica.
+	// 2. High-availability peer forwarding to continue routing to the session owner.
+	// Truly dead sessions are cleaned up automatically via Redis TTL or pruned
+	// upon receiving an explicit 404 from the peer replica.
 	if sessID != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		if delErr := w.proxy.store.DeleteMCPSession(ctx, sessID); delErr != nil {
-			w.proxy.logger.Debug("Cleaned up MCP session on SSE disconnect", "session_id", sessID, "error", delErr)
-		} else {
-			w.proxy.logger.Info("Removed MCP SSE session on disconnect", "session_id", sessID)
-		}
+		w.proxy.logger.Debug("SSE stream closed for MCP session (retained in Redis for TTL)", "session_id", sessID)
 	}
 	return w.ReadCloser.Close()
 }
 
-func extractSessionIDFromURL(u *url.URL) string {
-	if u == nil {
+func extractSessionID(req *http.Request) string {
+	if req == nil {
 		return ""
 	}
-	q := u.Query()
-	for _, k := range []string{"sessionId", "sessionid", "session_id"} {
-		if val := q.Get(k); val != "" {
+	// 1. Check MCP standard headers (Streamable HTTP & SSE)
+	for _, h := range []string{"Mcp-Session-Id", "X-Session-Id", "Session-Id"} {
+		if val := strings.TrimSpace(req.Header.Get(h)); val != "" {
 			return val
+		}
+	}
+	// 2. Check URL query parameters
+	if req.URL != nil {
+		q := req.URL.Query()
+		for _, k := range []string{"sessionId", "sessionid", "session_id"} {
+			if val := strings.TrimSpace(q.Get(k)); val != "" {
+				return val
+			}
 		}
 	}
 	return ""

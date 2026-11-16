@@ -37,15 +37,15 @@ type Config struct {
 	RefreshTTL            time.Duration
 	PendingAuthTTL        time.Duration
 	AuthCodeTTL           time.Duration
-	RateLimitLoginRPM     int           // Max requests per minute per IP for /mcp/auth/login (default: 60)
-	RateLimitTokenRPM     int           // Max requests per minute per IP for /mcp/auth/token (default: 120)
-	TrustedProxies        []*net.IPNet  // Parsed CIDRs/IPs allowed to supply X-Forwarded-For headers
+	RateLimitLoginRPM     int                   // Max requests per minute per IP for /mcp/auth/login (default: 60)
+	RateLimitTokenRPM     int                   // Max requests per minute per IP for /mcp/auth/token (default: 120)
+	TrustedProxies        []*net.IPNet          // Parsed CIDRs/IPs allowed to supply X-Forwarded-For headers
 	RedisClient           redis.UniversalClient // Redis client for distributed rate limiting
-	CIMDEnforcement       string        // "required", "permissive", "disabled" (default: "required")
-	CIMDAllowInsecureHTTP bool          // Allow http:// and loopback IPs for testing/dev
-	CIMDCacheTTL          time.Duration // Cache TTL for CIMD metadata
-	CIMDCache             cimd.Cache    // Custom or distributed CIMD cache (optional)
-	CIMDFetcher           *cimd.Fetcher // Custom or mock CIMD fetcher (optional)
+	CIMDEnforcement       string                // "required", "permissive", "disabled" (default: "required")
+	CIMDAllowInsecureHTTP bool                  // Allow http:// and loopback IPs for testing/dev
+	CIMDCacheTTL          time.Duration         // Cache TTL for CIMD metadata
+	CIMDCache             cimd.Cache            // Custom or distributed CIMD cache (optional)
+	CIMDFetcher           *cimd.Fetcher         // Custom or mock CIMD fetcher (optional)
 	HTTPClient            *http.Client
 	Logger                *slog.Logger
 }

@@ -591,3 +591,189 @@ func TestProxy_PeerForwarding_DeadSessionPruning(t *testing.T) {
 		t.Errorf("expected dead session to be pruned from store, but it was still present")
 	}
 }
+
+func TestProxy_PathRewrite_MCPToSSE(t *testing.T) {
+	var receivedPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+
+	s := &mockStore{
+		sessions: map[string]*store.SessionData{
+			"valid-token": {
+				GrafanaSession: "sess-123",
+				Username:       "alice",
+			},
+		},
+	}
+
+	p, err := NewProxy(Config{
+		TargetURL: upstream.URL,
+		BaseURL:   "http://localhost:8080",
+	}, s)
+	if err != nil {
+		t.Fatalf("NewProxy failed: %v", err)
+	}
+
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	// 1. GET /mcp -> rewrites to /mcp/sse
+	req, _ := http.NewRequest(http.MethodGet, server.URL+"/mcp", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	_ = resp.Body.Close()
+	if receivedPath != "/mcp/sse" {
+		t.Errorf("expected upstream path /mcp/sse, got %s", receivedPath)
+	}
+
+	// 2. POST /mcp/ -> rewrites to /mcp/sse
+	req, _ = http.NewRequest(http.MethodPost, server.URL+"/mcp/", strings.NewReader(`{"jsonrpc":"2.0"}`))
+	req.Header.Set("Authorization", "Bearer valid-token")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	_ = resp.Body.Close()
+	if receivedPath != "/mcp/sse" {
+		t.Errorf("expected upstream path /mcp/sse, got %s", receivedPath)
+	}
+
+	// 3. GET /mcp/sse -> stays /mcp/sse
+	req, _ = http.NewRequest(http.MethodGet, server.URL+"/mcp/sse", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	_ = resp.Body.Close()
+	if receivedPath != "/mcp/sse" {
+		t.Errorf("expected upstream path /mcp/sse, got %s", receivedPath)
+	}
+}
+
+func TestProxy_CrossReplicaPeerForwarding_StreamableHTTPHeader(t *testing.T) {
+	upstream1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":"handled_by_replica_1_streamable"}`))
+	}))
+	defer upstream1.Close()
+
+	upstream2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"session not found"}`))
+	}))
+	defer upstream2.Close()
+
+	sharedStore := &mockStore{
+		sessions: map[string]*store.SessionData{
+			"test-bearer-token": {
+				GrafanaSession: "grafana-cookie-123",
+				Username:       "alice",
+			},
+		},
+		mcpSessions: make(map[string]string),
+	}
+
+	p1, _ := NewProxy(Config{
+		TargetURL: upstream1.URL,
+		BaseURL:   "http://replica1:8080",
+	}, sharedStore)
+	proxy1Server := httptest.NewServer(p1)
+	defer proxy1Server.Close()
+	p1.instanceURL = proxy1Server.URL
+
+	p2, _ := NewProxy(Config{
+		TargetURL:   upstream2.URL,
+		BaseURL:     "http://replica2:8080",
+		InstanceURL: "http://replica2-internal:8080",
+	}, sharedStore)
+	proxy2Server := httptest.NewServer(p2)
+	defer proxy2Server.Close()
+
+	streamSessID := "stream-session-xyz-456"
+	_ = sharedStore.RegisterMCPSession(context.Background(), streamSessID, proxy1Server.URL, 1*time.Minute)
+
+	// Client sends POST to Proxy 2 using Mcp-Session-Id header (no query parameters)
+	req, _ := http.NewRequest(
+		http.MethodPost,
+		proxy2Server.URL+"/mcp/messages",
+		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call"}`),
+	)
+	req.Header.Set("Authorization", "Bearer test-bearer-token")
+	req.Header.Set("Mcp-Session-Id", streamSessID)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "handled_by_replica_1_streamable") {
+		t.Fatalf("expected body to contain 'handled_by_replica_1_streamable', got: %s", string(body))
+	}
+}
+
+func TestProxy_SSEDisconnect_SessionRetainedInStore(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if ok {
+			_, _ = w.Write([]byte("event: endpoint\ndata: /mcp/sse?sessionid=retain-test-session\n\n"))
+			flusher.Flush()
+		}
+	}))
+	defer upstream.Close()
+
+	s := &mockStore{
+		sessions: map[string]*store.SessionData{
+			"valid-token": {
+				GrafanaSession: "sess-999",
+				Username:       "bob",
+			},
+		},
+		mcpSessions: make(map[string]string),
+	}
+
+	p, _ := NewProxy(Config{
+		TargetURL:   upstream.URL,
+		BaseURL:     "http://localhost:8080",
+		InstanceURL: "http://localhost:8080",
+	}, s)
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, server.URL+"/mcp/sse", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	req.Header.Set("Accept", "text/event-stream")
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	// Read event so session is registered
+	buf := make([]byte, 256)
+	_, _ = resp.Body.Read(buf)
+
+	// Close the connection explicitly
+	_ = resp.Body.Close()
+
+	// Verify that the session is STILL retained in store (NOT deleted on disconnect)
+	loc, err := s.GetMCPSession(context.Background(), "retain-test-session")
+	if err != nil || loc == "" {
+		t.Fatalf("expected session to be retained in store after disconnect, but got error: %v", err)
+	}
+}

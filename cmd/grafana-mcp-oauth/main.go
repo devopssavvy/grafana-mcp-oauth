@@ -24,12 +24,12 @@ var (
 func main() {
 	// Define command-line flags
 	var (
-		flagMode         = flag.String("mode", "", "Server mode: 'proxy' (default), 'extauthz', or 'all' [env: MODE]")
-		flagHost         = flag.String("http-host", "", "HTTP host/interface to listen on [env: HTTP_HOST or BIND_HOST]")
-		flagPort         = flag.String("port", "", "HTTP port to listen on [env: PORT or HTTP_PORT]")
-		flagGRPCHost     = flag.String("grpc-host", "", "gRPC host/interface to listen on [env: GRPC_HOST or BIND_HOST]")
-		flagGRPCPort     = flag.String("grpc-port", "", "gRPC port to listen on for Envoy ext_authz [env: GRPC_PORT]")
-		flagCookieSecure = flag.String("cookie-secure", "", "Force Secure flag on cookies ('true' or 'false') [env: COOKIE_SECURE]")
+		flagMode            = flag.String("mode", "", "Server mode: 'proxy' (default), 'extauthz', or 'all' [env: MODE]")
+		flagHost            = flag.String("http-host", "", "HTTP host/interface to listen on [env: HTTP_HOST or BIND_HOST]")
+		flagPort            = flag.String("port", "", "HTTP port to listen on [env: PORT or HTTP_PORT]")
+		flagGRPCHost        = flag.String("grpc-host", "", "gRPC host/interface to listen on [env: GRPC_HOST or BIND_HOST]")
+		flagGRPCPort        = flag.String("grpc-port", "", "gRPC port to listen on for Envoy ext_authz [env: GRPC_PORT]")
+		flagCookieSecure    = flag.String("cookie-secure", "", "Force Secure flag on cookies ('true' or 'false') [env: COOKIE_SECURE]")
 		flagTargetMCPURL    = flag.String("target-mcp-url", "", "Upstream stock MCP Server URL for proxying [env: TARGET_MCP_URL]")
 		flagCIMDEnforcement = flag.String("cimd-enforcement", "", "CIMD enforcement mode: 'required' (default), 'permissive', or 'disabled' [env: CIMD_ENFORCEMENT]")
 		flagTrustedProxies  = flag.String("trusted-proxies", "", "Comma-separated list of trusted proxy IPs/CIDRs for X-Forwarded-For [env: TRUSTED_PROXIES]")
