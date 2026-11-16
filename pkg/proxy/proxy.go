@@ -1,14 +1,24 @@
 package proxy
 
 import (
+	"bytes"
+	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"time"
 
 	"grafana-mcp-oauth/pkg/store"
+)
+
+type contextKey string
+
+const (
+	requestBodyContextKey contextKey = "mcp_request_body"
 )
 
 // Config configures the MCP authenticated reverse proxy.
@@ -65,6 +75,52 @@ func NewProxy(cfg Config, s store.SessionStore) (*Proxy, error) {
 		ModifyResponse: func(resp *http.Response) error {
 			if strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
 				resp.Header.Set("X-Accel-Buffering", "no")
+				return nil
+			}
+
+			// If upstream returned an error about session initialization being in progress,
+			// retry transparently after a short backoff because notifications/initialized arrives
+			// within milliseconds.
+			if resp.Request != nil && resp.Body != nil {
+				if bodyBytes, ok := resp.Request.Context().Value(requestBodyContextKey).([]byte); ok && len(bodyBytes) > 0 {
+					respBytes, err := io.ReadAll(resp.Body)
+					if err == nil {
+						_ = resp.Body.Close()
+						if bytes.Contains(respBytes, []byte("is invalid during session initialization")) {
+							p.logger.Info("Upstream MCP session is still initializing; retrying message request after brief backoff",
+								"path", resp.Request.URL.Path,
+							)
+							backoffs := []time.Duration{150 * time.Millisecond, 250 * time.Millisecond, 400 * time.Millisecond}
+							for _, backoff := range backoffs {
+								time.Sleep(backoff)
+								retryReq, err := http.NewRequestWithContext(
+									resp.Request.Context(),
+									resp.Request.Method,
+									resp.Request.URL.String(),
+									bytes.NewReader(bodyBytes),
+								)
+								if err != nil {
+									break
+								}
+								retryReq.Header = resp.Request.Header.Clone()
+								retryResp, err := http.DefaultTransport.RoundTrip(retryReq)
+								if err == nil {
+									newRespBytes, err := io.ReadAll(retryResp.Body)
+									_ = retryResp.Body.Close()
+									if err == nil && !bytes.Contains(newRespBytes, []byte("is invalid during session initialization")) {
+										p.logger.Info("Transparent retry succeeded: MCP session initialized",
+											"path", resp.Request.URL.Path,
+										)
+										retryResp.Body = io.NopCloser(bytes.NewReader(newRespBytes))
+										*resp = *retryResp
+										return nil
+									}
+								}
+							}
+						}
+						resp.Body = io.NopCloser(bytes.NewReader(respBytes))
+					}
+				}
 			}
 			return nil
 		},
@@ -113,6 +169,19 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"path", r.URL.Path,
 		"method", r.Method,
 	)
+
+	// Buffer POST request bodies to support transparent retry on session initialization
+	if r.Method == http.MethodPost && r.Body != nil {
+		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 4*1024*1024))
+		if err == nil {
+			_ = r.Body.Close()
+			outReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			outReq.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(bodyBytes)), nil
+			}
+			outReq = outReq.WithContext(context.WithValue(outReq.Context(), requestBodyContextKey, bodyBytes))
+		}
+	}
 
 	p.rp.ServeHTTP(w, outReq)
 }

@@ -163,6 +163,8 @@ spec:
             - {{ .Values.mcpGrafana.listenAddress | default "127.0.0.1:8000" | quote }}
             - "--base-path"
             - "/mcp"
+            - "--sse-keepalive"
+            - {{ .Values.mcpGrafana.sseKeepalive | default "15s" | quote }}
             {{- if .Values.debug }}
             - "--debug"
             {{- end }}

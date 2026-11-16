@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -240,5 +241,62 @@ func TestProxy_SSEStreaming(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if string(body) != "event: endpoint\ndata: /mcp/messages?sessionId=s1\n\n" {
 		t.Errorf("unexpected body: %s", string(body))
+	}
+}
+
+func TestProxy_RetryOnSessionInitialization(t *testing.T) {
+	attempts := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts == 1 {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"method \"tools/call\" is invalid during session initialization"}}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"user_info"}]}}`))
+	}))
+	defer upstream.Close()
+
+	s := &mockStore{
+		sessions: map[string]*store.SessionData{
+			"valid-token": {
+				GrafanaSession: "sess-999",
+				Username:       "bob",
+			},
+		},
+	}
+
+	p, err := NewProxy(Config{
+		TargetURL: upstream.URL,
+		BaseURL:   "http://localhost:8080",
+	}, s)
+	if err != nil {
+		t.Fatalf("NewProxy failed: %v", err)
+	}
+
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/mcp/messages?sessionId=test-sess", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call"}`))
+	req.Header.Set("Authorization", "Bearer valid-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), `"user_info"`) {
+		t.Fatalf("expected retry response to contain user_info, got: %s", string(body))
+	}
+	if attempts != 2 {
+		t.Errorf("expected 2 attempts, got %d", attempts)
 	}
 }

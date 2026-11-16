@@ -72,6 +72,8 @@ spec:
           args:
             - "--base-path"
             - "/mcp"
+            - "--sse-keepalive"
+            - "15s"
           env:
             - name: GRAFANA_URL
               value: "http://grafana.monitoring.svc:3000"
