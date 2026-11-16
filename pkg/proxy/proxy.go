@@ -121,9 +121,12 @@ func NewProxy(cfg Config, s store.SessionStore) (*Proxy, error) {
 			req.URL.Scheme = target.Scheme
 			req.URL.Host = target.Host
 			req.Host = target.Host
-			// If caller accesses /mcp or /mcp/ directly, route to /mcp/sse where stock mcp-grafana listens
-			if req.URL.Path == "/mcp" || req.URL.Path == "/mcp/" {
+			// For GET requests (e.g. SSE stream), route /mcp and /mcp/ to /mcp/sse for SSE compatibility.
+			// For POST requests, keep /mcp (normalizing /mcp/ to /mcp) for Streamable HTTP compatibility.
+			if req.Method == http.MethodGet && (req.URL.Path == "/mcp" || req.URL.Path == "/mcp/") {
 				req.URL.Path = "/mcp/sse"
+			} else if req.URL.Path == "/mcp/" {
+				req.URL.Path = "/mcp"
 			}
 			// If request carries Mcp-Session-Id or X-Session-Id header but no query param,
 			// populate query parameter sessionid so upstream go-sdk SSE handler accepts it seamlessly.
@@ -203,77 +206,111 @@ func NewProxy(cfg Config, s store.SessionStore) (*Proxy, error) {
 									}
 								}
 							}
-						} else if resp.StatusCode == http.StatusNotFound && bytes.Contains(respBytes, []byte("session not found")) {
-							sessID := extractSessionID(resp.Request)
-							isPeerHop := resp.Request.Header.Get("X-MCP-Peer-Hop") == "true"
-							if sessID != "" && !isPeerHop {
-								ownerURL, err := p.store.GetMCPSession(resp.Request.Context(), sessID)
-								if err == nil && ownerURL != "" && !isSelf(ownerURL, p.instanceURL) {
-									p.logger.Info("Upstream MCP session not found locally; forwarding to peer replica",
-										"session_id", sessID,
-										"peer", ownerURL,
-										"path", resp.Request.URL.Path,
-									)
-									targetURL, err := url.Parse(ownerURL)
-									if err == nil && (targetURL.Scheme == "http" || targetURL.Scheme == "https") {
-										peerReqURL := *resp.Request.URL
-										peerReqURL.Scheme = targetURL.Scheme
-										peerReqURL.Host = targetURL.Host
-										peerReq, err := http.NewRequestWithContext(
-											resp.Request.Context(),
-											resp.Request.Method,
-											peerReqURL.String(),
-											bytes.NewReader(bodyBytes),
-										)
-										if err == nil {
-											peerReq.Header = resp.Request.Header.Clone()
-											peerReq.Header.Set("X-MCP-Peer-Hop", "true")
-											if token, ok := resp.Request.Context().Value(bearerTokenContextKey).(string); ok && token != "" {
-												peerReq.Header.Set("Authorization", "Bearer "+token)
-											}
-											peerResp, err := p.peerClient.Do(peerReq)
-											if err != nil {
-												p.logger.Warn("Cross-replica peer forwarding network error",
-													"session_id", sessID,
-													"peer", ownerURL,
-													"error", err,
-												)
-											} else {
-												peerRespBytes, err := io.ReadAll(peerResp.Body)
-												_ = peerResp.Body.Close()
-												if err == nil {
-													if peerResp.StatusCode != http.StatusNotFound {
-														p.logger.Info("Cross-replica peer forwarding succeeded",
-															"session_id", sessID,
-															"peer", ownerURL,
-															"status", peerResp.StatusCode,
-														)
-														// Renew session TTL in Redis on successful forward
-														renewCtx, renewCancel := context.WithTimeout(context.Background(), 2*time.Second)
-														_ = p.store.RegisterMCPSession(renewCtx, sessID, ownerURL, 120*time.Second)
-														renewCancel()
+						} else if resp.StatusCode == http.StatusNotFound && len(bodyBytes) > 0 {
+							// If upstream returned 404, check for path adaptation between /mcp (Streamable HTTP) and /mcp/sse (SSE transport)
+							var altPath string
+							if resp.Request.URL.Path == "/mcp" {
+								altPath = "/mcp/sse"
+							} else if resp.Request.URL.Path == "/mcp/sse" {
+								altPath = "/mcp"
+							}
+							if altPath != "" {
+								retryURL := *resp.Request.URL
+								retryURL.Path = altPath
+								retryReq, rErr := http.NewRequestWithContext(resp.Request.Context(), resp.Request.Method, retryURL.String(), bytes.NewReader(bodyBytes))
+								if rErr == nil {
+									retryReq.Header = resp.Request.Header.Clone()
+									retryResp, doErr := p.peerClient.Do(retryReq)
+									if doErr == nil {
+										retryRespBytes, err := io.ReadAll(retryResp.Body)
+										_ = retryResp.Body.Close()
+										if err == nil && retryResp.StatusCode != http.StatusNotFound {
+											p.logger.Info("Transparent path adaptation succeeded",
+												"original_path", resp.Request.URL.Path,
+												"adapted_path", altPath,
+												"status", retryResp.StatusCode,
+											)
+											retryResp.Body = io.NopCloser(bytes.NewReader(retryRespBytes))
+											*resp = *retryResp
+											return nil
+										}
+									}
+								}
+							}
 
-														peerResp.Body = io.NopCloser(bytes.NewReader(peerRespBytes))
-														*resp = *peerResp
-														return nil
-													}
-													// Peer returned 404; prune dead session from Redis immediately
-													_ = p.store.DeleteMCPSession(resp.Request.Context(), sessID)
-													p.logger.Info("Pruned dead MCP session from Redis following peer 404",
+							// If still not found and indicates missing session, attempt cross-replica peer forwarding
+							if bytes.Contains(respBytes, []byte("session not found")) {
+								sessID := extractSessionID(resp.Request)
+								isPeerHop := resp.Request.Header.Get("X-MCP-Peer-Hop") == "true"
+								if sessID != "" && !isPeerHop {
+									ownerURL, err := p.store.GetMCPSession(resp.Request.Context(), sessID)
+									if err == nil && ownerURL != "" && !isSelf(ownerURL, p.instanceURL) {
+										p.logger.Info("Upstream MCP session not found locally; forwarding to peer replica",
+											"session_id", sessID,
+											"peer", ownerURL,
+											"path", resp.Request.URL.Path,
+										)
+										targetURL, err := url.Parse(ownerURL)
+										if err == nil && (targetURL.Scheme == "http" || targetURL.Scheme == "https") {
+											peerReqURL := *resp.Request.URL
+											peerReqURL.Scheme = targetURL.Scheme
+											peerReqURL.Host = targetURL.Host
+											peerReq, err := http.NewRequestWithContext(
+												resp.Request.Context(),
+												resp.Request.Method,
+												peerReqURL.String(),
+												bytes.NewReader(bodyBytes),
+											)
+											if err == nil {
+												peerReq.Header = resp.Request.Header.Clone()
+												peerReq.Header.Set("X-MCP-Peer-Hop", "true")
+												if token, ok := resp.Request.Context().Value(bearerTokenContextKey).(string); ok && token != "" {
+													peerReq.Header.Set("Authorization", "Bearer "+token)
+												}
+												peerResp, err := p.peerClient.Do(peerReq)
+												if err != nil {
+													p.logger.Warn("Cross-replica peer forwarding network error",
 														"session_id", sessID,
 														"peer", ownerURL,
+														"error", err,
 													)
+												} else {
+													peerRespBytes, err := io.ReadAll(peerResp.Body)
+													_ = peerResp.Body.Close()
+													if err == nil {
+														if peerResp.StatusCode != http.StatusNotFound {
+															p.logger.Info("Cross-replica peer forwarding succeeded",
+																"session_id", sessID,
+																"peer", ownerURL,
+																"status", peerResp.StatusCode,
+															)
+															// Renew session TTL in Redis on successful forward
+															renewCtx, renewCancel := context.WithTimeout(context.Background(), 2*time.Second)
+															_ = p.store.RegisterMCPSession(renewCtx, sessID, ownerURL, 120*time.Second)
+															renewCancel()
+
+															peerResp.Body = io.NopCloser(bytes.NewReader(peerRespBytes))
+															*resp = *peerResp
+															return nil
+														}
+														// Peer returned 404; prune dead session from Redis immediately
+														_ = p.store.DeleteMCPSession(resp.Request.Context(), sessID)
+														p.logger.Info("Pruned dead MCP session from Redis following peer 404",
+															"session_id", sessID,
+															"peer", ownerURL,
+														)
+													}
 												}
 											}
 										}
 									}
 								}
+								p.logger.Warn("Upstream MCP session not found; client is using a stale session ID or server restarted",
+									"session_id", sessID,
+									"path", resp.Request.URL.Path,
+									"query", resp.Request.URL.RawQuery,
+								)
 							}
-							p.logger.Warn("Upstream MCP session not found; client is using a stale session ID or server restarted",
-								"session_id", sessID,
-								"path", resp.Request.URL.Path,
-								"query", resp.Request.URL.RawQuery,
-							)
 						}
 						resp.Body = io.NopCloser(bytes.NewReader(respBytes))
 					}

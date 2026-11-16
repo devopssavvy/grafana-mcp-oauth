@@ -51,7 +51,7 @@ services:
     image: grafana/mcp-grafana:latest
     container_name: mcp-grafana-1
     restart: unless-stopped
-    command: ["--base-path", "/mcp", "--sse-keepalive", "15s", "--allowed-hosts", "*"]
+    command: ["--transport", "streamable-http", "--address", "0.0.0.0:8000", "--endpoint-path", "/mcp", "--allowed-hosts", "*"]
     environment:
       - GRAFANA_URL=http://grafana:3000
       - GRAFANA_FORWARD_HEADERS=Cookie
@@ -91,7 +91,7 @@ services:
     image: grafana/mcp-grafana:latest
     container_name: mcp-grafana-2
     restart: unless-stopped
-    command: ["--base-path", "/mcp", "--sse-keepalive", "15s", "--allowed-hosts", "*"]
+    command: ["--transport", "streamable-http", "--address", "0.0.0.0:8000", "--endpoint-path", "/mcp", "--allowed-hosts", "*"]
     environment:
       - GRAFANA_URL=http://grafana:3000
       - GRAFANA_FORWARD_HEADERS=Cookie

@@ -81,6 +81,9 @@ mcpGrafana:
     # -- Image pull policy
     pullPolicy: IfNotPresent
 
+  # -- Transport type for stock mcp-grafana: "streamable-http" (recommended, required for SSO Cookie forwarding & HA) or "sse"
+  transport: "streamable-http"
+
   # -- Listen address for internal mcp-grafana server (restricted strictly to 127.0.0.1 loopback)
   listenAddress: "127.0.0.1:8000"
 
