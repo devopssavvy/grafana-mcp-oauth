@@ -729,7 +729,6 @@ func (h *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 
 	h.cfg.Logger.Info("Issued MCP access token via Authorization Code Grant with PKCE",
 		"username", authCtx.UserInfo.Login,
-		"token_prefix", accessToken[:10]+"...",
 	)
 
 	// Set required RFC 6749 Section 5.1 anti-caching headers
