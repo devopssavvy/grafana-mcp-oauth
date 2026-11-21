@@ -193,10 +193,12 @@ func New(opts Options) (*Server, error) {
 	// In proxy or all mode: setup Authenticated Reverse Proxy to upstream MCP
 	if mode == ModeProxy || mode == ModeAll {
 		mcpProxy, err := proxy.NewProxy(proxy.Config{
-			TargetURL:   cfg.TargetMCPURL,
-			BaseURL:     cfg.BaseURL,
-			InstanceURL: cfg.InstanceURL,
-			Logger:      logger,
+			TargetURL:        cfg.TargetMCPURL,
+			BaseURL:          cfg.BaseURL,
+			InstanceURL:      cfg.InstanceURL,
+			GrafanaURL:       cfg.GrafanaURL,
+			RotationInterval: cfg.GrafanaRotationInterval,
+			Logger:           logger,
 		}, sessionStore)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize reverse proxy: %w", err)

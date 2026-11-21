@@ -39,6 +39,7 @@ func TestLoadFromEnv_Defaults(t *testing.T) {
 	assert.Equal(t, "required", cfg.CIMDEnforcement)
 	assert.False(t, cfg.CIMDAllowInsecureHTTP)
 	assert.Equal(t, 1*time.Hour, cfg.CIMDCacheTTL)
+	assert.Equal(t, 5*time.Minute, cfg.GrafanaRotationInterval)
 }
 
 func TestLoadFromEnv_ProductionWithoutMasterSecret(t *testing.T) {
@@ -80,6 +81,7 @@ func TestLoadFromEnv_CustomOverrides(t *testing.T) {
 	t.Setenv("TARGET_MCP_URL", "http://mcp:8080")
 	t.Setenv("PENDING_AUTH_TTL_MINUTES", "3")
 	t.Setenv("AUTH_CODE_TTL_SECONDS", "30")
+	t.Setenv("GRAFANA_ROTATION_INTERVAL_MINUTES", "10")
 
 	cfg := config.LoadFromEnv()
 	assert.Equal(t, "all", cfg.Mode)
@@ -91,6 +93,7 @@ func TestLoadFromEnv_CustomOverrides(t *testing.T) {
 	assert.Equal(t, "http://mcp:8080", cfg.TargetMCPURL)
 	assert.Equal(t, 3*time.Minute, cfg.PendingAuthTTL)
 	assert.Equal(t, 30*time.Second, cfg.AuthCodeTTL)
+	assert.Equal(t, 10*time.Minute, cfg.GrafanaRotationInterval)
 }
 
 func TestLoadFromEnv_RedisTLS(t *testing.T) {

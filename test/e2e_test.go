@@ -47,7 +47,7 @@ func TestE2E_FullSystemIntegration(t *testing.T) {
 			_, _ = w.Write([]byte("<html><body>Grafana Web UI Dashboard</body></html>"))
 
 		case "/api/user":
-			if cookie == nil || cookie.Value != "valid_user_grafana_session_456" {
+			if cookie == nil || (cookie.Value != "valid_user_grafana_session_456" && cookie.Value != "valid_rotated_grafana_session_789") {
 				w.WriteHeader(http.StatusUnauthorized)
 				return
 			}
@@ -60,9 +60,23 @@ func TestE2E_FullSystemIntegration(t *testing.T) {
 				OrgID: 1,
 			})
 
+		case "/api/user/auth-tokens/rotate":
+			if cookie == nil || (cookie.Value != "valid_user_grafana_session_456" && cookie.Value != "valid_rotated_grafana_session_789") {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			http.SetCookie(w, &http.Cookie{
+				Name:     "grafana_session",
+				Value:    "valid_rotated_grafana_session_789",
+				Path:     "/",
+				HttpOnly: true,
+			})
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{}`))
+
 		case "/api/ds/query":
 			// Simulates Datasource Query with OAuth Passthru
-			if cookie == nil || cookie.Value != "valid_user_grafana_session_456" {
+			if cookie == nil || (cookie.Value != "valid_user_grafana_session_456" && cookie.Value != "valid_rotated_grafana_session_789") {
 				w.WriteHeader(http.StatusUnauthorized)
 				_, _ = w.Write([]byte(`{"message":"Unauthorized: Datasource OAuth passthru missing user token"}`))
 				return

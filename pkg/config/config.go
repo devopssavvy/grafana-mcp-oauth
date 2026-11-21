@@ -46,6 +46,7 @@ type AppConfig struct {
 	CIMDAllowInsecureHTTP      bool          // Allow http:// and loopback IPs for testing/dev (default false)
 	CIMDCacheTTL               time.Duration // Cache TTL for fetched CIMD metadata (default 1 hour)
 	InstanceURL                string        // Reachable URL for this proxy instance used for cross-replica peer forwarding (e.g. "http://mcp-proxy-1:8080")
+	GrafanaRotationInterval    time.Duration // Sliding keep-alive rotation interval for Grafana session cookie (default 5m)
 	LogLevel                   slog.Level
 }
 
@@ -163,6 +164,19 @@ func LoadFromEnv() *AppConfig {
 		}
 	}
 
+	grafanaRotationMinutes := 5
+	if grmStr := os.Getenv("GRAFANA_ROTATION_INTERVAL_MINUTES"); grmStr != "" {
+		if grm, err := strconv.Atoi(grmStr); err == nil {
+			grafanaRotationMinutes = grm
+		}
+	}
+	var grafanaRotationInterval time.Duration
+	if grafanaRotationMinutes <= 0 {
+		grafanaRotationInterval = -1 // Explicitly disabled
+	} else {
+		grafanaRotationInterval = time.Duration(grafanaRotationMinutes) * time.Minute
+	}
+
 	rateLimitLoginRPM := 60
 	if loginRpmStr := os.Getenv("RATE_LIMIT_LOGIN_RPM"); loginRpmStr != "" {
 		if rpm, err := strconv.Atoi(loginRpmStr); err == nil && rpm > 0 {
@@ -243,6 +257,7 @@ func LoadFromEnv() *AppConfig {
 		CIMDAllowInsecureHTTP:      cimdAllowInsecureHTTP,
 		CIMDCacheTTL:               cimdCacheTTL,
 		InstanceURL:                instanceURL,
+		GrafanaRotationInterval:    grafanaRotationInterval,
 		LogLevel:                   logLevel,
 	}
 }

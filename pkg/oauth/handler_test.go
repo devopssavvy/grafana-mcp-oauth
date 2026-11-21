@@ -1396,3 +1396,91 @@ func TestHandler_Login_ActiveGrafanaSession_ImmediateAuthorization(t *testing.T)
 	promptLoc := recPrompt.Header().Get("Location")
 	assert.Contains(t, promptLoc, "/login/generic_oauth")
 }
+
+func TestHandler_RefreshTokenGrant_WithGrafanaRotation(t *testing.T) {
+	// Setup Grafana server with rotation support
+	mockGrafana := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/user/auth-tokens/rotate" {
+			cookie, err := r.Cookie("grafana_session")
+			if err != nil || cookie.Value != "valid_grafana_session_123" {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"message":"Unauthorized"}`))
+				return
+			}
+			http.SetCookie(w, &http.Cookie{
+				Name:     "grafana_session",
+				Value:    "rotated_grafana_session_888",
+				Path:     "/",
+				HttpOnly: true,
+			})
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{}`))
+			return
+		}
+		if r.URL.Path == "/api/user" {
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(oauth.GrafanaUser{
+				ID:    42,
+				Email: "bob@company.com",
+				Name:  "Bob Developer",
+				Login: "bob",
+				OrgID: 1,
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer mockGrafana.Close()
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st, err := store.NewRedisSessionStore(rdb, []byte("test-master-secret-32-bytes-long!"))
+	require.NoError(t, err)
+
+	h := oauth.NewHandler(oauth.Config{
+		BaseURL:         "http://localhost:8080",
+		GrafanaURL:      mockGrafana.URL,
+		CIMDEnforcement: "disabled",
+	}, st)
+
+	ctx := t.Context()
+	oldAT := "at_pre_rot"
+	oldRT := "rt_pre_rot"
+
+	sess := &store.SessionData{
+		UserID:         "42",
+		Username:       "bob",
+		GrafanaSession: "valid_grafana_session_123",
+		RefreshToken:   oldRT,
+		ExpiresAt:      time.Now().Add(1 * time.Hour),
+	}
+	require.NoError(t, st.SaveSession(ctx, oldAT, sess, 1*time.Hour))
+	require.NoError(t, st.SaveRefreshTokenSession(ctx, oldRT, sess, 24*time.Hour))
+
+	form := url.Values{}
+	form.Set("grant_type", "refresh_token")
+	form.Set("refresh_token", oldRT)
+
+	tokenReq := httptest.NewRequest(http.MethodPost, "/mcp/auth/token", strings.NewReader(form.Encode()))
+	tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	tokenRec := httptest.NewRecorder()
+
+	h.HandleToken(tokenRec, tokenReq)
+	assert.Equal(t, http.StatusOK, tokenRec.Code)
+
+	var resp oauth.TokenResponse
+	require.NoError(t, json.NewDecoder(tokenRec.Body).Decode(&resp))
+	assert.NotEmpty(t, resp.AccessToken)
+	assert.NotEmpty(t, resp.RefreshToken)
+
+	// Verify that the new access token session has the rotated Grafana session cookie
+	newSess, err := st.GetSession(ctx, resp.AccessToken)
+	require.NoError(t, err)
+	assert.Equal(t, "rotated_grafana_session_888", newSess.GrafanaSession, "Access token session must store rotated Grafana cookie")
+	assert.False(t, newSess.LastRotatedAt.IsZero(), "LastRotatedAt must be updated on rotation")
+
+	// Verify that the new refresh token session also has the rotated Grafana session cookie
+	refSess, err := st.GetAndDeleteRefreshSession(ctx, resp.RefreshToken)
+	require.NoError(t, err)
+	assert.Equal(t, "rotated_grafana_session_888", refSess.GrafanaSession, "Refresh token session must store rotated Grafana cookie")
+}

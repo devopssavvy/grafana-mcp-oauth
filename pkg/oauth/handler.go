@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -786,12 +787,23 @@ func (h *Handler) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	// Active upstream session verification: Verify that the Grafana session is still alive in Grafana
-	_, err = h.fetchGrafanaUser(r.Context(), session.GrafanaSession)
-	if err != nil {
-		h.cfg.Logger.Warn("Refresh token rejected: upstream Grafana session expired or revoked", "error", err)
-		sendTokenError(w, http.StatusUnauthorized, "invalid_grant", "associated Grafana session has expired or was revoked")
-		return
+	// Active upstream session verification & rotation: Attempt to rotate the Grafana session to extend its inactive lifetime
+	rotatedSession, rotErr := RotateGrafanaSession(r.Context(), h.cfg.GrafanaURL, session.GrafanaSession, h.cfg.HTTPClient)
+	if rotErr != nil {
+		if errors.Is(rotErr, ErrGrafanaSessionInvalid) {
+			h.cfg.Logger.Warn("Refresh token rejected: upstream Grafana session expired or revoked", "error", rotErr)
+			sendTokenError(w, http.StatusUnauthorized, "invalid_grant", "associated Grafana session has expired or was revoked")
+			return
+		}
+		// If rotation encountered an unexpected error (e.g. endpoint not found on older Grafana), fall back to verifying user
+		if _, uErr := h.fetchGrafanaUser(r.Context(), session.GrafanaSession); uErr != nil {
+			h.cfg.Logger.Warn("Refresh token rejected: upstream Grafana session expired or revoked", "error", uErr)
+			sendTokenError(w, http.StatusUnauthorized, "invalid_grant", "associated Grafana session has expired or was revoked")
+			return
+		}
+	} else if rotatedSession != "" {
+		session.GrafanaSession = rotatedSession
+		session.LastRotatedAt = time.Now()
 	}
 
 	newAccessToken, err := crypto.GenerateRandomToken("mcp_at_", 32)

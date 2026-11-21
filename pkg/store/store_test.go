@@ -119,22 +119,81 @@ func TestStore_UpdateGrafanaSession(t *testing.T) {
 	ctx := context.Background()
 	st, _ := setupTestStore(t)
 
-	token := "mcp_at_updatable"
+	tok := "tok_updatable"
+	refSessionID := "ref_bound_test"
 	sessionData := &store.SessionData{
 		UserID:         "user_04",
 		GrafanaSession: "old_session_1",
+		RefreshToken:   refSessionID,
 		ExpiresAt:      time.Now().Add(1 * time.Hour),
 	}
-	err := st.SaveSession(ctx, token, sessionData, 1*time.Hour)
+	err := st.SaveSession(ctx, tok, sessionData, 1*time.Hour)
+	require.NoError(t, err)
+	err = st.SaveRefreshTokenSession(ctx, refSessionID, sessionData, 30*24*time.Hour)
 	require.NoError(t, err)
 
 	// Update Grafana session cookie
-	err = st.UpdateGrafanaSession(ctx, token, "new_session_refreshed_2", 2*time.Hour)
+	err = st.UpdateGrafanaSession(ctx, tok, "new_session_refreshed_2", 2*time.Hour)
 	require.NoError(t, err)
 
-	updated, err := st.GetSession(ctx, token)
+	updated, err := st.GetSession(ctx, tok)
 	require.NoError(t, err)
 	assert.Equal(t, "new_session_refreshed_2", updated.GrafanaSession)
+	assert.False(t, updated.LastRotatedAt.IsZero(), "LastRotatedAt must be populated on update")
+
+	// Verify refresh token session was also updated in Redis
+	refSession, err := st.GetAndDeleteRefreshSession(ctx, refSessionID)
+	require.NoError(t, err)
+	assert.Equal(t, "new_session_refreshed_2", refSession.GrafanaSession, "Refresh token session must receive updated Grafana session")
+
+	// Verify that if refresh token does not exist in Redis, it is NOT resurrected (Single-Use invariant)
+	tokNoResurrect := "tok_no_resurrect"
+	sessionData2 := &store.SessionData{
+		UserID:         "user_05",
+		GrafanaSession: "old_session",
+		RefreshToken:   "ref_consumed_test",
+		ExpiresAt:      time.Now().Add(1 * time.Hour),
+	}
+	require.NoError(t, st.SaveSession(ctx, tokNoResurrect, sessionData2, 1*time.Hour))
+	// Do NOT save refresh token session (simulates already consumed)
+
+	require.NoError(t, st.UpdateGrafanaSession(ctx, tokNoResurrect, "new_rotated_session", 1*time.Hour))
+	_, err = st.GetAndDeleteRefreshSession(ctx, "ref_consumed_test")
+	assert.ErrorIs(t, err, store.ErrInvalidRefreshToken, "Consumed refresh token must NOT be resurrected")
+}
+
+func TestStore_RotationLock(t *testing.T) {
+	ctx := context.Background()
+	st, _ := setupTestStore(t)
+
+	lockKey := "key_for_lock"
+	// 1. First acquisition succeeds
+	acquired, err := st.AcquireRotationLock(ctx, lockKey, "owner-1", 5*time.Second)
+	require.NoError(t, err)
+	assert.True(t, acquired)
+
+	// 2. Second concurrent acquisition fails (already locked)
+	acquired2, err := st.AcquireRotationLock(ctx, lockKey, "owner-2", 5*time.Second)
+	require.NoError(t, err)
+	assert.False(t, acquired2)
+
+	// 3. Releasing with wrong owner ID does not release lock
+	err = st.ReleaseRotationLock(ctx, lockKey, "owner-wrong")
+	require.NoError(t, err)
+
+	// Still locked by owner-1
+	acquired3, err := st.AcquireRotationLock(ctx, lockKey, "owner-2", 5*time.Second)
+	require.NoError(t, err)
+	assert.False(t, acquired3)
+
+	// 4. Release lock with correct owner ID
+	err = st.ReleaseRotationLock(ctx, lockKey, "owner-1")
+	require.NoError(t, err)
+
+	// 5. Acquisition succeeds again after release
+	acquired4, err := st.AcquireRotationLock(ctx, lockKey, "owner-2", 5*time.Second)
+	require.NoError(t, err)
+	assert.True(t, acquired4)
 }
 
 func TestStore_RefreshTokenMapping(t *testing.T) {

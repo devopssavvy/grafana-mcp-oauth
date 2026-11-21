@@ -81,7 +81,7 @@ helm install grafana-mcp charts/grafana-mcp \
 
 ```bash
 helm install grafana-mcp oci://ghcr.io/devopssavvy/charts/grafana-mcp \
-  --version 0.2.0 \
+  --version 0.2.1 \
   --set oauthProxy.baseUrl="https://mcp.company.com" \
   --set grafana.url="http://grafana.monitoring.svc:3000"
 ```

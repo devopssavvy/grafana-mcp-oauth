@@ -91,9 +91,29 @@ func main() {
 		// #nosec G710 -- demo runner mock redirecting to callback URL
 		http.Redirect(w, r, redirectTarget, http.StatusFound)
 	})
+	grafanaMux.HandleFunc("POST /api/user/auth-tokens/rotate", func(w http.ResponseWriter, r *http.Request) {
+		cookie, err := r.Cookie("grafana_session")
+		if err != nil || cookie.Value == "" {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"message":"Unauthorized: missing session"}`))
+			return
+		}
+		newCookie := "live_demo_grafana_session_secret_rotated"
+		// #nosec G124 -- demo runner mock cookie
+		http.SetCookie(w, &http.Cookie{
+			Name:     "grafana_session",
+			Value:    newCookie,
+			Path:     "/",
+			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+			Secure:   false,
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	})
 	grafanaMux.HandleFunc("GET /api/user", func(w http.ResponseWriter, r *http.Request) {
 		cookie, err := r.Cookie("grafana_session")
-		if err != nil || cookie.Value != "live_demo_grafana_session_secret_999" {
+		if err != nil || (cookie.Value != "live_demo_grafana_session_secret_999" && cookie.Value != "live_demo_grafana_session_secret_rotated") {
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = w.Write([]byte(`{"message":"Unauthorized: invalid session"}`))
 			return
@@ -116,7 +136,7 @@ func main() {
 		}
 		cookieMu.Unlock()
 
-		if cookie == nil || cookie.Value != "live_demo_grafana_session_secret_999" {
+		if cookie == nil || (cookie.Value != "live_demo_grafana_session_secret_999" && cookie.Value != "live_demo_grafana_session_secret_rotated") {
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = w.Write([]byte(`{"message":"Unauthorized: Missing or invalid Grafana session for OAuth passthru"}`))
 			return
