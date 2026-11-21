@@ -84,11 +84,11 @@ jobs:
       - name: Build & Load Container Images into KinD
         run: |
           docker build -t ghcr.io/devopssavvy/grafana-mcp-oauth:ci-test -f ./Dockerfile .
-          docker pull grafana/mcp-grafana:2.3.0
-          docker pull valkey/valkey:9.1.3
           kind load docker-image ghcr.io/devopssavvy/grafana-mcp-oauth:ci-test --name kind-mock-k8s
-          kind load docker-image grafana/mcp-grafana:2.3.0 --name kind-mock-k8s
-          kind load docker-image valkey/valkey:9.1.3 --name kind-mock-k8s
+          docker pull --platform linux/amd64 grafana/mcp-grafana:2.3.0
+          docker pull --platform linux/amd64 valkey/valkey:9.1.3
+          kind load docker-image grafana/mcp-grafana:2.3.0 --name kind-mock-k8s || docker exec kind-mock-k8s-control-plane crictl pull grafana/mcp-grafana:2.3.0
+          kind load docker-image valkey/valkey:9.1.3 --name kind-mock-k8s || docker exec kind-mock-k8s-control-plane crictl pull valkey/valkey:9.1.3
 
       - name: Deploy Chart to Mock Cluster
         run: |

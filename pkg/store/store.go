@@ -32,6 +32,7 @@ const (
 	pendingAuthKeyPrefix   = "mcp:pending_auth:"
 	authCodeKeyPrefix      = "mcp:auth_code:"
 	mcpSessionKeyPrefix    = "mcp:mcp_session:"
+	rotationLockKeyPrefix  = "mcp:rotating:"
 
 	hkdfInfoSession     = "mcp-session-encryption"
 	hkdfInfoRefresh     = "mcp-refresh-encryption"
@@ -52,6 +53,7 @@ type SessionData struct {
 	UserClaims     map[string]interface{} `json:"user_claims,omitempty"`
 	CreatedAt      time.Time              `json:"created_at"`
 	ExpiresAt      time.Time              `json:"expires_at"`
+	LastRotatedAt  time.Time              `json:"last_rotated_at,omitempty"`
 }
 
 // GrafanaUser represents user info returned by Grafana /api/user.
@@ -112,6 +114,10 @@ type SessionStore interface {
 	RegisterMCPSession(ctx context.Context, sessionID string, instanceURL string, ttl time.Duration) error
 	GetMCPSession(ctx context.Context, sessionID string) (string, error)
 	DeleteMCPSession(ctx context.Context, sessionID string) error
+
+	// Distributed session rotation locking
+	AcquireRotationLock(ctx context.Context, token string, ttl time.Duration) (bool, error)
+	ReleaseRotationLock(ctx context.Context, token string) error
 }
 
 // RedisSessionStore implements SessionStore with Zero-Knowledge encryption in Redis.
@@ -211,6 +217,7 @@ func (s *RedisSessionStore) UpdateGrafanaSession(ctx context.Context, token stri
 		return err
 	}
 	session.GrafanaSession = newGrafanaSession
+	session.LastRotatedAt = time.Now()
 	if ttl <= 0 {
 		ttl = s.client.TTL(ctx, sessionKeyPrefix+crypto.HashTokenKey(token, s.masterSecret)).Val()
 		if ttl <= 0 {
@@ -218,7 +225,20 @@ func (s *RedisSessionStore) UpdateGrafanaSession(ctx context.Context, token stri
 		}
 	}
 	session.ExpiresAt = time.Now().Add(ttl)
-	return s.SaveSession(ctx, token, session, ttl)
+	if err := s.SaveSession(ctx, token, session, ttl); err != nil {
+		return err
+	}
+
+	// Keep refresh token session in sync if bound and still active in Redis
+	if session.RefreshToken != "" {
+		refKey := refreshKeyPrefix + crypto.HashTokenKey(session.RefreshToken, s.masterSecret)
+		refTTL := s.client.TTL(ctx, refKey).Val()
+		if refTTL > 0 {
+			_ = s.SaveRefreshTokenSession(ctx, session.RefreshToken, session, refTTL)
+		}
+	}
+
+	return nil
 }
 
 // SaveRefreshTokenSession stores the full session encrypted under the refresh token with RefreshTTL (e.g. 30 days).
@@ -582,8 +602,23 @@ func (s *RedisSessionStore) DeleteMCPSession(ctx context.Context, sessionID stri
 	return s.client.Del(ctx, redisKey).Err()
 }
 
+// AcquireRotationLock attempts to atomically acquire a distributed rotation lease for the given token in Redis.
+func (s *RedisSessionStore) AcquireRotationLock(ctx context.Context, token string, ttl time.Duration) (bool, error) {
+	if ttl <= 0 {
+		ttl = 15 * time.Second
+	}
+	redisKey := rotationLockKeyPrefix + crypto.HashTokenKey(token, s.masterSecret)
+	return s.client.SetNX(ctx, redisKey, 1, ttl).Result()
+}
+
+// ReleaseRotationLock removes the distributed rotation lease for the given token from Redis.
+func (s *RedisSessionStore) ReleaseRotationLock(ctx context.Context, token string) error {
+	redisKey := rotationLockKeyPrefix + crypto.HashTokenKey(token, s.masterSecret)
+	return s.client.Del(ctx, redisKey).Err()
+}
+
 func sessionToMap(s *SessionData) map[string]any {
-	return map[string]any{
+	m := map[string]any{
 		"user_id":         s.UserID,
 		"username":        s.Username,
 		"email":           s.Email,
@@ -595,4 +630,8 @@ func sessionToMap(s *SessionData) map[string]any {
 		"created_at":      s.CreatedAt,
 		"expires_at":      s.ExpiresAt,
 	}
+	if !s.LastRotatedAt.IsZero() {
+		m["last_rotated_at"] = s.LastRotatedAt
+	}
+	return m
 }

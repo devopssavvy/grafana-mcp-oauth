@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,7 +28,8 @@ func (m *mockStore) SaveSession(ctx context.Context, token string, s *store.Sess
 	if m.sessions == nil {
 		m.sessions = make(map[string]*store.SessionData)
 	}
-	m.sessions[token] = s
+	cp := *s
+	m.sessions[token] = &cp
 	return nil
 }
 
@@ -38,7 +40,8 @@ func (m *mockStore) GetSession(ctx context.Context, token string) (*store.Sessio
 	if !ok {
 		return nil, fmt.Errorf("session not found")
 	}
-	return s, nil
+	cp := *s
+	return &cp, nil
 }
 
 func (m *mockStore) DeleteSession(ctx context.Context, token string) error {
@@ -52,7 +55,10 @@ func (m *mockStore) UpdateGrafanaSession(ctx context.Context, token string, newG
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if s, ok := m.sessions[token]; ok {
-		s.GrafanaSession = newGrafanaSession
+		cp := *s
+		cp.GrafanaSession = newGrafanaSession
+		cp.LastRotatedAt = time.Now()
+		m.sessions[token] = &cp
 		return nil
 	}
 	return fmt.Errorf("not found")
@@ -139,6 +145,14 @@ func (m *mockStore) DeleteMCPSession(ctx context.Context, sessionID string) erro
 	if m.mcpSessions != nil {
 		delete(m.mcpSessions, sessionID)
 	}
+	return nil
+}
+
+func (m *mockStore) AcquireRotationLock(ctx context.Context, token string, ttl time.Duration) (bool, error) {
+	return true, nil
+}
+
+func (m *mockStore) ReleaseRotationLock(ctx context.Context, token string) error {
 	return nil
 }
 
@@ -885,5 +899,258 @@ func TestProxy_PeerForwarding_BlockedMetadataIPs(t *testing.T) {
 	// Peer forward to metadata IP must be blocked, returning 404
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("expected 404 when peer forwarding to metadata IP is blocked, got %d", resp.StatusCode)
+	}
+}
+
+func TestProxy_SlidingKeepAlive_GrafanaSessionRotation(t *testing.T) {
+	var receivedCookie string
+	var cookieMu sync.Mutex
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cookieMu.Lock()
+		receivedCookie = r.Header.Get("Cookie")
+		cookieMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":{"tools":[]},"id":1}`))
+	}))
+	defer upstream.Close()
+
+	s := &mockStore{
+		sessions: map[string]*store.SessionData{
+			"valid-token": {
+				UserID:         "user-1",
+				Username:       "alice",
+				GrafanaSession: "initial-cookie-111",
+				CreatedAt:      time.Now().Add(-15 * time.Minute),
+				LastRotatedAt:  time.Now().Add(-10 * time.Minute),
+			},
+		},
+	}
+
+	rotationCalled := make(chan string, 5)
+	p, err := NewProxy(Config{
+		TargetURL:        upstream.URL,
+		BaseURL:          "http://localhost:8080",
+		InstanceURL:      "http://localhost:8080",
+		GrafanaURL:       "http://grafana:3000",
+		RotationInterval: 5 * time.Minute,
+		RotateFunc: func(ctx context.Context, grafanaURL string, currentSession string) (string, error) {
+			rotationCalled <- currentSession
+			return "rotated-cookie-222", nil
+		},
+	}, s)
+	if err != nil {
+		t.Fatalf("failed to create proxy: %v", err)
+	}
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	// 1. First request triggers async rotation, but forwards immediately with initial cookie
+	body := []byte(`{"jsonrpc":"2.0","method":"tools/list","id":1}`)
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/mcp", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer valid-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request 1 failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	cookieMu.Lock()
+	firstSentCookie := receivedCookie
+	cookieMu.Unlock()
+	if !strings.Contains(firstSentCookie, "grafana_session=initial-cookie-111") {
+		t.Errorf("first request should carry initial cookie, got: %s", firstSentCookie)
+	}
+
+	// 2. Wait for background rotation to complete
+	select {
+	case oldSess := <-rotationCalled:
+		if oldSess != "initial-cookie-111" {
+			t.Errorf("expected rotator called with initial-cookie-111, got: %s", oldSess)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("background rotation was not triggered")
+	}
+
+	// Allow store update to persist
+	time.Sleep(50 * time.Millisecond)
+
+	// Verify store was updated with rotated cookie
+	sess, err := s.GetSession(context.Background(), "valid-token")
+	if err != nil {
+		t.Fatalf("failed to get session: %v", err)
+	}
+	if sess.GrafanaSession != "rotated-cookie-222" {
+		t.Errorf("expected store updated to rotated-cookie-222, got %s", sess.GrafanaSession)
+	}
+
+	// 3. Second request must now forward with the newly rotated cookie
+	req2, _ := http.NewRequest(http.MethodPost, server.URL+"/mcp", bytes.NewReader(body))
+	req2.Header.Set("Authorization", "Bearer valid-token")
+	req2.Header.Set("Content-Type", "application/json")
+	resp2, err := client.Do(req2)
+	if err != nil {
+		t.Fatalf("request 2 failed: %v", err)
+	}
+	resp2.Body.Close()
+
+	cookieMu.Lock()
+	secondSentCookie := receivedCookie
+	cookieMu.Unlock()
+	if !strings.Contains(secondSentCookie, "grafana_session=rotated-cookie-222") {
+		t.Errorf("second request should carry rotated cookie, got: %s", secondSentCookie)
+	}
+}
+
+func TestProxy_SlidingKeepAlive_InFlightDeduplication(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":{"tools":[]},"id":1}`))
+	}))
+	defer upstream.Close()
+
+	s := &mockStore{
+		sessions: map[string]*store.SessionData{
+			"dedup-token": {
+				UserID:         "user-1",
+				Username:       "alice",
+				GrafanaSession: "cookie-before-dedup",
+				CreatedAt:      time.Now().Add(-10 * time.Minute),
+				LastRotatedAt:  time.Now().Add(-10 * time.Minute),
+			},
+		},
+	}
+
+	var rotateCalls int32
+	rotateStarted := make(chan struct{}, 1)
+	rotateRelease := make(chan struct{})
+
+	p, err := NewProxy(Config{
+		TargetURL:        upstream.URL,
+		BaseURL:          "http://localhost:8080",
+		InstanceURL:      "http://localhost:8080",
+		GrafanaURL:       "http://grafana:3000",
+		RotationInterval: 1 * time.Minute,
+		RotateFunc: func(ctx context.Context, grafanaURL string, currentSession string) (string, error) {
+			atomic.AddInt32(&rotateCalls, 1)
+			select {
+			case rotateStarted <- struct{}{}:
+			default:
+			}
+			<-rotateRelease
+			return "cookie-after-dedup", nil
+		},
+	}, s)
+	if err != nil {
+		t.Fatalf("failed to create proxy: %v", err)
+	}
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	body := []byte(`{"jsonrpc":"2.0","method":"tools/list","id":1}`)
+
+	// Send first request which starts the in-flight rotation
+	req1, _ := http.NewRequest(http.MethodPost, server.URL+"/mcp", bytes.NewReader(body))
+	req1.Header.Set("Authorization", "Bearer dedup-token")
+	req1.Header.Set("Content-Type", "application/json")
+	resp1, err := client.Do(req1)
+	if err != nil {
+		t.Fatalf("request 1 failed: %v", err)
+	}
+	resp1.Body.Close()
+
+	select {
+	case <-rotateStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("rotate was not started within 2s")
+	}
+
+	// Send concurrent requests while rotation is still in flight
+	for i := 0; i < 5; i++ {
+		req, _ := http.NewRequest(http.MethodPost, server.URL+"/mcp", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer dedup-token")
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("concurrent request failed: %v", err)
+		}
+		resp.Body.Close()
+	}
+
+	// Release the in-flight rotation
+	close(rotateRelease)
+	time.Sleep(50 * time.Millisecond)
+
+	// Verify only exactly 1 rotation occurred despite 6 total requests
+	if calls := atomic.LoadInt32(&rotateCalls); calls != 1 {
+		t.Errorf("expected exactly 1 rotation call, got %d", calls)
+	}
+}
+
+func TestProxy_SlidingKeepAlive_ErrorResilience(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":{"tools":[]},"id":1}`))
+	}))
+	defer upstream.Close()
+
+	s := &mockStore{
+		sessions: map[string]*store.SessionData{
+			"error-token": {
+				UserID:         "user-1",
+				Username:       "alice",
+				GrafanaSession: "resilient-cookie",
+				CreatedAt:      time.Now().Add(-10 * time.Minute),
+				LastRotatedAt:  time.Now().Add(-10 * time.Minute),
+			},
+		},
+	}
+
+	p, err := NewProxy(Config{
+		TargetURL:        upstream.URL,
+		BaseURL:          "http://localhost:8080",
+		InstanceURL:      "http://localhost:8080",
+		GrafanaURL:       "http://grafana:3000",
+		RotationInterval: 1 * time.Minute,
+		RotateFunc: func(ctx context.Context, grafanaURL string, currentSession string) (string, error) {
+			return "", fmt.Errorf("simulated network error to Grafana")
+		},
+	}, s)
+	if err != nil {
+		t.Fatalf("failed to create proxy: %v", err)
+	}
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	// MCP request must still succeed even when background rotation fails
+	body := []byte(`{"jsonrpc":"2.0","method":"tools/list","id":1}`)
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/mcp", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer error-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK despite background rotation failure, got %d", resp.StatusCode)
+	}
+
+	// Verify original cookie remains intact
+	sess, _ := s.GetSession(context.Background(), "error-token")
+	if sess.GrafanaSession != "resilient-cookie" {
+		t.Errorf("cookie should remain resilient-cookie, got: %s", sess.GrafanaSession)
 	}
 }

@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"grafana-mcp-oauth/pkg/oauth"
 	"grafana-mcp-oauth/pkg/store"
 )
 
@@ -28,25 +29,37 @@ const (
 
 var sessionIDRegex = regexp.MustCompile(`(?i)[?&]session_?id=([a-zA-Z0-9_\-\.]+)`)
 
+// RotateFunc defines the function signature for rotating a Grafana session token.
+type RotateFunc func(ctx context.Context, grafanaURL string, currentSession string) (string, error)
+
 // Config configures the MCP authenticated reverse proxy.
 type Config struct {
-	TargetURL   string
-	BaseURL     string
-	InstanceURL string
-	Logger      *slog.Logger
-	PeerClient  *http.Client
+	TargetURL        string
+	BaseURL          string
+	InstanceURL      string
+	GrafanaURL       string        // Backend Grafana API URL (e.g. http://grafana:3000)
+	RotationInterval time.Duration // Interval to trigger sliding keep-alive rotation (default 5m)
+	Logger           *slog.Logger
+	PeerClient       *http.Client
+	GrafanaClient    *http.Client
+	RotateFunc       RotateFunc // Optional custom rotator for testing
 }
 
 // Proxy is a reverse proxy that authenticates incoming MCP requests via Bearer token,
 // translates the token into a grafana_session cookie, and forwards to stock mcp-grafana.
 type Proxy struct {
-	targetURL   *url.URL
-	baseURL     string
-	instanceURL string
-	store       store.SessionStore
-	logger      *slog.Logger
-	peerClient  *http.Client
-	rp          *httputil.ReverseProxy
+	targetURL        *url.URL
+	baseURL          string
+	instanceURL      string
+	grafanaURL       string
+	rotationInterval time.Duration
+	store            store.SessionStore
+	logger           *slog.Logger
+	peerClient       *http.Client
+	grafanaClient    *http.Client
+	rotateFunc       RotateFunc
+	rp               *httputil.ReverseProxy
+	inFlightRotation sync.Map
 }
 
 // NewProxy creates a new authenticated MCP reverse proxy.
@@ -133,13 +146,36 @@ func NewProxy(cfg Config, s store.SessionStore) (*Proxy, error) {
 		}
 	}
 
+	grafanaClient := cfg.GrafanaClient
+	if grafanaClient == nil {
+		grafanaClient = &http.Client{Timeout: 5 * time.Second}
+	}
+
+	rotationInterval := cfg.RotationInterval
+	if rotationInterval < 0 {
+		rotationInterval = 0 // explicitly disabled
+	} else if rotationInterval == 0 && cfg.GrafanaURL != "" {
+		rotationInterval = 5 * time.Minute
+	}
+
+	rotateFunc := cfg.RotateFunc
+	if rotateFunc == nil {
+		rotateFunc = func(ctx context.Context, gURL, curSess string) (string, error) {
+			return oauth.RotateGrafanaSession(ctx, gURL, curSess, grafanaClient)
+		}
+	}
+
 	p := &Proxy{
-		targetURL:   target,
-		baseURL:     cfg.BaseURL,
-		instanceURL: cfg.InstanceURL,
-		store:       s,
-		logger:      cfg.Logger,
-		peerClient:  peerClient,
+		targetURL:        target,
+		baseURL:          cfg.BaseURL,
+		instanceURL:      cfg.InstanceURL,
+		grafanaURL:       strings.TrimRight(cfg.GrafanaURL, "/"),
+		rotationInterval: rotationInterval,
+		store:            s,
+		logger:           cfg.Logger,
+		peerClient:       peerClient,
+		grafanaClient:    grafanaClient,
+		rotateFunc:       rotateFunc,
 	}
 
 	rp := &httputil.ReverseProxy{
@@ -373,6 +409,20 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	grafanaSession := session.GrafanaSession
+	username := session.Username
+
+	// Trigger proactive sliding keep-alive rotation of Grafana session if due
+	if p.grafanaURL != "" && p.rotationInterval > 0 && grafanaSession != "" {
+		lastRotated := session.LastRotatedAt
+		if lastRotated.IsZero() {
+			lastRotated = session.CreatedAt
+		}
+		if time.Since(lastRotated) >= p.rotationInterval {
+			p.triggerAsyncGrafanaRotation(token, grafanaSession)
+		}
+	}
+
 	// Clone request and mutate headers for upstream forwarding
 	outReq := r.Clone(r.Context())
 
@@ -381,11 +431,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Inject grafana_session cookie
 	existingCookie := r.Header.Get("Cookie")
-	outReq.Header.Set("Cookie", buildCookieHeader(existingCookie, session.GrafanaSession))
-	outReq.Header.Set("X-Forwarded-User", session.Username)
+	outReq.Header.Set("Cookie", buildCookieHeader(existingCookie, grafanaSession))
+	outReq.Header.Set("X-Forwarded-User", username)
 
 	p.logger.Debug("Forwarding authenticated MCP request",
-		"username", session.Username,
+		"username", username,
 		"path", r.URL.Path,
 		"method", r.Method,
 	)
@@ -522,6 +572,59 @@ func isSelf(a, b string) bool {
 		return strings.EqualFold(uA.Host, uB.Host)
 	}
 	return false
+}
+
+func (p *Proxy) triggerAsyncGrafanaRotation(token, currentSession string) {
+	if _, loaded := p.inFlightRotation.LoadOrStore(token, true); loaded {
+		return // Rotation already in-flight for this session
+	}
+
+	go func() {
+		defer p.inFlightRotation.Delete(token)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		if p.store != nil {
+			acquired, err := p.store.AcquireRotationLock(ctx, token, 15*time.Second)
+			if err != nil {
+				p.logger.Debug("Failed to acquire distributed rotation lock", "error", err)
+			}
+			if !acquired {
+				return // Another replica/pod is already rotating this session
+			}
+			defer func() {
+				_ = p.store.ReleaseRotationLock(ctx, token)
+			}()
+		}
+
+		newSession, err := p.rotateFunc(ctx, p.grafanaURL, currentSession)
+		if err != nil {
+			p.logger.Warn("Failed to rotate Grafana session cookie in background", "error", err)
+			return
+		}
+
+		if newSession == "" {
+			newSession = currentSession
+		}
+
+		if p.store != nil {
+			if err := p.store.UpdateGrafanaSession(ctx, token, newSession, 0); err != nil {
+				p.logger.Warn("Failed to persist rotated Grafana session cookie in store", "error", err)
+				return
+			}
+		}
+
+		if newSession != currentSession {
+			p.logger.Info("Successfully rotated and persisted Grafana session cookie in background",
+				"token_prefix", token[:min(10, len(token))]+"...",
+			)
+		} else {
+			p.logger.Debug("Grafana session kept active without cookie change (SkipRotation threshold)",
+				"token_prefix", token[:min(10, len(token))]+"...",
+			)
+		}
+	}()
 }
 
 func (p *Proxy) send401(w http.ResponseWriter, challenge string, message string) {
