@@ -168,23 +168,32 @@ func TestStore_RotationLock(t *testing.T) {
 
 	lockKey := "key_for_lock"
 	// 1. First acquisition succeeds
-	acquired, err := st.AcquireRotationLock(ctx, lockKey, 5*time.Second)
+	acquired, err := st.AcquireRotationLock(ctx, lockKey, "owner-1", 5*time.Second)
 	require.NoError(t, err)
 	assert.True(t, acquired)
 
 	// 2. Second concurrent acquisition fails (already locked)
-	acquired2, err := st.AcquireRotationLock(ctx, lockKey, 5*time.Second)
+	acquired2, err := st.AcquireRotationLock(ctx, lockKey, "owner-2", 5*time.Second)
 	require.NoError(t, err)
 	assert.False(t, acquired2)
 
-	// 3. Release lock
-	err = st.ReleaseRotationLock(ctx, lockKey)
+	// 3. Releasing with wrong owner ID does not release lock
+	err = st.ReleaseRotationLock(ctx, lockKey, "owner-wrong")
 	require.NoError(t, err)
 
-	// 4. Acquisition succeeds again after release
-	acquired3, err := st.AcquireRotationLock(ctx, lockKey, 5*time.Second)
+	// Still locked by owner-1
+	acquired3, err := st.AcquireRotationLock(ctx, lockKey, "owner-2", 5*time.Second)
 	require.NoError(t, err)
-	assert.True(t, acquired3)
+	assert.False(t, acquired3)
+
+	// 4. Release lock with correct owner ID
+	err = st.ReleaseRotationLock(ctx, lockKey, "owner-1")
+	require.NoError(t, err)
+
+	// 5. Acquisition succeeds again after release
+	acquired4, err := st.AcquireRotationLock(ctx, lockKey, "owner-2", 5*time.Second)
+	require.NoError(t, err)
+	assert.True(t, acquired4)
 }
 
 func TestStore_RefreshTokenMapping(t *testing.T) {

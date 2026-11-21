@@ -116,8 +116,8 @@ type SessionStore interface {
 	DeleteMCPSession(ctx context.Context, sessionID string) error
 
 	// Distributed session rotation locking
-	AcquireRotationLock(ctx context.Context, token string, ttl time.Duration) (bool, error)
-	ReleaseRotationLock(ctx context.Context, token string) error
+	AcquireRotationLock(ctx context.Context, token string, lockID string, ttl time.Duration) (bool, error)
+	ReleaseRotationLock(ctx context.Context, token string, lockID string) error
 }
 
 // RedisSessionStore implements SessionStore with Zero-Knowledge encryption in Redis.
@@ -234,7 +234,9 @@ func (s *RedisSessionStore) UpdateGrafanaSession(ctx context.Context, token stri
 		refKey := refreshKeyPrefix + crypto.HashTokenKey(session.RefreshToken, s.masterSecret)
 		refTTL := s.client.TTL(ctx, refKey).Val()
 		if refTTL > 0 {
-			_ = s.SaveRefreshTokenSession(ctx, session.RefreshToken, session, refTTL)
+			refSession := *session
+			refSession.ExpiresAt = time.Now().Add(refTTL)
+			_ = s.SaveRefreshTokenSession(ctx, session.RefreshToken, &refSession, refTTL)
 		}
 	}
 
@@ -603,18 +605,31 @@ func (s *RedisSessionStore) DeleteMCPSession(ctx context.Context, sessionID stri
 }
 
 // AcquireRotationLock attempts to atomically acquire a distributed rotation lease for the given token in Redis.
-func (s *RedisSessionStore) AcquireRotationLock(ctx context.Context, token string, ttl time.Duration) (bool, error) {
+func (s *RedisSessionStore) AcquireRotationLock(ctx context.Context, token string, lockID string, ttl time.Duration) (bool, error) {
 	if ttl <= 0 {
 		ttl = 15 * time.Second
 	}
+	if lockID == "" {
+		lockID = "1"
+	}
 	redisKey := rotationLockKeyPrefix + crypto.HashTokenKey(token, s.masterSecret)
-	return s.client.SetNX(ctx, redisKey, 1, ttl).Result()
+	return s.client.SetNX(ctx, redisKey, lockID, ttl).Result()
 }
 
-// ReleaseRotationLock removes the distributed rotation lease for the given token from Redis.
-func (s *RedisSessionStore) ReleaseRotationLock(ctx context.Context, token string) error {
+// ReleaseRotationLock removes the distributed rotation lease for the given token from Redis if owned by lockID.
+func (s *RedisSessionStore) ReleaseRotationLock(ctx context.Context, token string, lockID string) error {
 	redisKey := rotationLockKeyPrefix + crypto.HashTokenKey(token, s.masterSecret)
-	return s.client.Del(ctx, redisKey).Err()
+	if lockID == "" {
+		return s.client.Del(ctx, redisKey).Err()
+	}
+	luaScript := redis.NewScript(`
+		if redis.call('GET', KEYS[1]) == ARGV[1] then
+			return redis.call('DEL', KEYS[1])
+		else
+			return 0
+		end
+	`)
+	return luaScript.Run(ctx, s.client, []string{redisKey}, lockID).Err()
 }
 
 func sessionToMap(s *SessionData) map[string]any {

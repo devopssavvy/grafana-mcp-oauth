@@ -99,11 +99,14 @@ func main() {
 			return
 		}
 		newCookie := "live_demo_grafana_session_secret_rotated"
+		// #nosec G124 -- demo runner mock cookie
 		http.SetCookie(w, &http.Cookie{
 			Name:     "grafana_session",
 			Value:    newCookie,
 			Path:     "/",
 			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+			Secure:   false,
 		})
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{}`))

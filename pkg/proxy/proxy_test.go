@@ -148,11 +148,11 @@ func (m *mockStore) DeleteMCPSession(ctx context.Context, sessionID string) erro
 	return nil
 }
 
-func (m *mockStore) AcquireRotationLock(ctx context.Context, token string, ttl time.Duration) (bool, error) {
+func (m *mockStore) AcquireRotationLock(ctx context.Context, token, lockID string, ttl time.Duration) (bool, error) {
 	return true, nil
 }
 
-func (m *mockStore) ReleaseRotationLock(ctx context.Context, token string) error {
+func (m *mockStore) ReleaseRotationLock(ctx context.Context, token, lockID string) error {
 	return nil
 }
 
@@ -1116,6 +1116,7 @@ func TestProxy_SlidingKeepAlive_ErrorResilience(t *testing.T) {
 		},
 	}
 
+	var rotateCalls int32
 	p, err := NewProxy(Config{
 		TargetURL:        upstream.URL,
 		BaseURL:          "http://localhost:8080",
@@ -1123,6 +1124,7 @@ func TestProxy_SlidingKeepAlive_ErrorResilience(t *testing.T) {
 		GrafanaURL:       "http://grafana:3000",
 		RotationInterval: 1 * time.Minute,
 		RotateFunc: func(ctx context.Context, grafanaURL string, currentSession string) (string, error) {
+			atomic.AddInt32(&rotateCalls, 1)
 			return "", fmt.Errorf("simulated network error to Grafana")
 		},
 	}, s)
@@ -1132,7 +1134,7 @@ func TestProxy_SlidingKeepAlive_ErrorResilience(t *testing.T) {
 	server := httptest.NewServer(p)
 	defer server.Close()
 
-	// MCP request must still succeed even when background rotation fails
+	// 1. First request triggers async rotation which fails
 	body := []byte(`{"jsonrpc":"2.0","method":"tools/list","id":1}`)
 	req, _ := http.NewRequest(http.MethodPost, server.URL+"/mcp", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer error-token")
@@ -1146,6 +1148,27 @@ func TestProxy_SlidingKeepAlive_ErrorResilience(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 OK despite background rotation failure, got %d", resp.StatusCode)
+	}
+
+	// Wait for background rotation goroutine to complete and set failure cooldown
+	time.Sleep(50 * time.Millisecond)
+
+	// 2. Second request arrives immediately: must NOT trigger rotateFunc again due to failure cooldown
+	req2, _ := http.NewRequest(http.MethodPost, server.URL+"/mcp", bytes.NewReader(body))
+	req2.Header.Set("Authorization", "Bearer error-token")
+	req2.Header.Set("Content-Type", "application/json")
+	resp2, err := client.Do(req2)
+	if err != nil {
+		t.Fatalf("second request failed: %v", err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK on second request, got %d", resp2.StatusCode)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	if calls := atomic.LoadInt32(&rotateCalls); calls != 1 {
+		t.Errorf("expected exactly 1 rotate call due to cooldown backoff, got %d", calls)
 	}
 
 	// Verify original cookie remains intact

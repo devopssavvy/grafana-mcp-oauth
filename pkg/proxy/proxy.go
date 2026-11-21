@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"grafana-mcp-oauth/pkg/crypto"
 	"grafana-mcp-oauth/pkg/oauth"
 	"grafana-mcp-oauth/pkg/store"
 )
@@ -60,6 +61,7 @@ type Proxy struct {
 	rotateFunc       RotateFunc
 	rp               *httputil.ReverseProxy
 	inFlightRotation sync.Map
+	rotationCooldown sync.Map
 }
 
 // NewProxy creates a new authenticated MCP reverse proxy.
@@ -419,7 +421,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			lastRotated = session.CreatedAt
 		}
 		if time.Since(lastRotated) >= p.rotationInterval {
-			p.triggerAsyncGrafanaRotation(token, grafanaSession)
+			p.triggerAsyncGrafanaRotation(token, grafanaSession, username)
 		}
 	}
 
@@ -574,7 +576,14 @@ func isSelf(a, b string) bool {
 	return false
 }
 
-func (p *Proxy) triggerAsyncGrafanaRotation(token, currentSession string) {
+func (p *Proxy) triggerAsyncGrafanaRotation(token, currentSession, username string) {
+	if nextRetry, ok := p.rotationCooldown.Load(token); ok {
+		if time.Now().Before(nextRetry.(time.Time)) {
+			return // Cooldown active after previous rotation failure to prevent upstream stampede
+		}
+		p.rotationCooldown.Delete(token)
+	}
+
 	if _, loaded := p.inFlightRotation.LoadOrStore(token, true); loaded {
 		return // Rotation already in-flight for this session
 	}
@@ -585,8 +594,13 @@ func (p *Proxy) triggerAsyncGrafanaRotation(token, currentSession string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
+		lockID, err := crypto.GenerateRandomToken("lock_", 16)
+		if err != nil {
+			lockID = fmt.Sprintf("lock_%d", time.Now().UnixNano())
+		}
+
 		if p.store != nil {
-			acquired, err := p.store.AcquireRotationLock(ctx, token, 15*time.Second)
+			acquired, err := p.store.AcquireRotationLock(ctx, token, lockID, 15*time.Second)
 			if err != nil {
 				p.logger.Debug("Failed to acquire distributed rotation lock", "error", err)
 			}
@@ -594,15 +608,19 @@ func (p *Proxy) triggerAsyncGrafanaRotation(token, currentSession string) {
 				return // Another replica/pod is already rotating this session
 			}
 			defer func() {
-				_ = p.store.ReleaseRotationLock(ctx, token)
+				_ = p.store.ReleaseRotationLock(ctx, token, lockID)
 			}()
 		}
 
 		newSession, err := p.rotateFunc(ctx, p.grafanaURL, currentSession)
 		if err != nil {
-			p.logger.Warn("Failed to rotate Grafana session cookie in background", "error", err)
+			// Enforce a 1-minute cooldown so failure does not stampede Grafana on subsequent requests
+			p.rotationCooldown.Store(token, time.Now().Add(1*time.Minute))
+			p.logger.Warn("Failed to rotate Grafana session cookie in background", "error", err, "username", username)
 			return
 		}
+
+		p.rotationCooldown.Delete(token)
 
 		if newSession == "" {
 			newSession = currentSession
@@ -610,18 +628,18 @@ func (p *Proxy) triggerAsyncGrafanaRotation(token, currentSession string) {
 
 		if p.store != nil {
 			if err := p.store.UpdateGrafanaSession(ctx, token, newSession, 0); err != nil {
-				p.logger.Warn("Failed to persist rotated Grafana session cookie in store", "error", err)
+				p.logger.Warn("Failed to persist rotated Grafana session cookie in store", "error", err, "username", username)
 				return
 			}
 		}
 
 		if newSession != currentSession {
 			p.logger.Info("Successfully rotated and persisted Grafana session cookie in background",
-				"token_prefix", token[:min(10, len(token))]+"...",
+				"username", username,
 			)
 		} else {
 			p.logger.Debug("Grafana session kept active without cookie change (SkipRotation threshold)",
-				"token_prefix", token[:min(10, len(token))]+"...",
+				"username", username,
 			)
 		}
 	}()
