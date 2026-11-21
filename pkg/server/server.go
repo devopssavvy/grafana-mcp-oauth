@@ -38,6 +38,7 @@ type Server struct {
 	rdb          *redis.Client
 	sessionStore *store.RedisSessionStore
 	oauthHandler *oauth.Handler
+	mcpProxy     *proxy.Proxy
 
 	httpServer   *http.Server
 	grpcServer   *grpc.Server
@@ -198,11 +199,13 @@ func New(opts Options) (*Server, error) {
 			InstanceURL:      cfg.InstanceURL,
 			GrafanaURL:       cfg.GrafanaURL,
 			RotationInterval: cfg.GrafanaRotationInterval,
+			SessionTTL:       cfg.SessionTTL,
 			Logger:           logger,
 		}, sessionStore)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize reverse proxy: %w", err)
 		}
+		s.mcpProxy = mcpProxy
 		mux.Handle("/mcp", mcpProxy)
 		mux.Handle("/mcp/", mcpProxy)
 	}
@@ -372,6 +375,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 
 	wg.Wait()
+
+	if s.mcpProxy != nil {
+		s.mcpProxy.Close()
+	}
 
 	if s.oauthHandler != nil {
 		s.oauthHandler.Close()

@@ -136,11 +136,20 @@ func LoadFromEnv() *AppConfig {
 		slog.Info("MCP_MASTER_SECRET not set; running in Zero-Knowledge Client-Derived Key mode (zero-config multi-pod sync)")
 	}
 
-	sessionHours := 2
-	if shStr := os.Getenv("SESSION_TTL_HOURS"); shStr != "" {
-		if sh, err := strconv.Atoi(shStr); err == nil && sh > 0 {
-			sessionHours = sh
+	var sessionTTL time.Duration
+	if stStr := os.Getenv("SESSION_TTL"); stStr != "" {
+		if d, err := time.ParseDuration(stStr); err == nil && d > 0 {
+			sessionTTL = d
 		}
+	}
+	if sessionTTL == 0 {
+		sessionHours := 2
+		if shStr := os.Getenv("SESSION_TTL_HOURS"); shStr != "" {
+			if sh, err := strconv.Atoi(shStr); err == nil && sh > 0 {
+				sessionHours = sh
+			}
+		}
+		sessionTTL = time.Duration(sessionHours) * time.Hour
 	}
 
 	refreshDays := 30
@@ -164,17 +173,28 @@ func LoadFromEnv() *AppConfig {
 		}
 	}
 
-	grafanaRotationMinutes := 5
-	if grmStr := os.Getenv("GRAFANA_ROTATION_INTERVAL_MINUTES"); grmStr != "" {
-		if grm, err := strconv.Atoi(grmStr); err == nil {
-			grafanaRotationMinutes = grm
+	var grafanaRotationInterval time.Duration
+	if griStr := os.Getenv("GRAFANA_ROTATION_INTERVAL"); griStr != "" {
+		if d, err := time.ParseDuration(griStr); err == nil {
+			if d <= 0 {
+				grafanaRotationInterval = -1
+			} else {
+				grafanaRotationInterval = d
+			}
 		}
 	}
-	var grafanaRotationInterval time.Duration
-	if grafanaRotationMinutes <= 0 {
-		grafanaRotationInterval = -1 // Explicitly disabled
-	} else {
-		grafanaRotationInterval = time.Duration(grafanaRotationMinutes) * time.Minute
+	if grafanaRotationInterval == 0 {
+		grafanaRotationMinutes := 5
+		if grmStr := os.Getenv("GRAFANA_ROTATION_INTERVAL_MINUTES"); grmStr != "" {
+			if grm, err := strconv.Atoi(grmStr); err == nil {
+				grafanaRotationMinutes = grm
+			}
+		}
+		if grafanaRotationMinutes <= 0 {
+			grafanaRotationInterval = -1 // Explicitly disabled
+		} else {
+			grafanaRotationInterval = time.Duration(grafanaRotationMinutes) * time.Minute
+		}
 	}
 
 	rateLimitLoginRPM := 60
@@ -245,7 +265,7 @@ func LoadFromEnv() *AppConfig {
 		RedisTLSInsecureSkipVerify: redisTLSInsecureSkipVerify,
 		RedisTLSServerName:         redisTLSServerName,
 		MasterSecret:               masterSecret,
-		SessionTTL:                 time.Duration(sessionHours) * time.Hour,
+		SessionTTL:                 sessionTTL,
 		RefreshTTL:                 time.Duration(refreshDays) * 24 * time.Hour,
 		PendingAuthTTL:             time.Duration(pendingAuthMinutes) * time.Minute,
 		AuthCodeTTL:                time.Duration(authCodeSeconds) * time.Second,
