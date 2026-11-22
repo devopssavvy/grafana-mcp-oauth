@@ -1355,3 +1355,76 @@ func TestProxy_SlidingKeepAlive_SkipRotationThreshold(t *testing.T) {
 		t.Errorf("expected ExpiresAt slid forward to ~2h, got: %v", sess.ExpiresAt)
 	}
 }
+
+func TestProxy_BackgroundKeepalive_RemainingTTLOnIdleSession(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":{"tools":[]},"id":1}`))
+	}))
+	defer upstream.Close()
+
+	s := &mockStore{
+		sessions: map[string]*store.SessionData{
+			"idle-token": {
+				UserID:         "user-idle",
+				Username:       "dave",
+				GrafanaSession: "cookie-before-idle-rot",
+				CreatedAt:      time.Now().Add(-50 * time.Minute),
+				LastRotatedAt:  time.Now().Add(-50 * time.Minute),
+				ExpiresAt:      time.Now().Add(10 * time.Minute),
+			},
+		},
+	}
+
+	rotated := make(chan struct{}, 1)
+	p, err := NewProxy(Config{
+		TargetURL:        upstream.URL,
+		BaseURL:          "http://localhost:8080",
+		InstanceURL:      "http://localhost:8080",
+		GrafanaURL:       "http://grafana:3000",
+		RotationInterval: 30 * time.Millisecond,
+		SessionTTL:       1 * time.Hour,
+		RotateFunc: func(ctx context.Context, grafanaURL string, currentSession string) (string, error) {
+			rotated <- struct{}{}
+			return "cookie-after-idle-rot", nil
+		},
+	}, s)
+	if err != nil {
+		t.Fatalf("failed to create proxy: %v", err)
+	}
+	defer p.Close()
+
+	// Simulate an active session whose lastActivity was 45 minutes ago (15 minutes remaining on 1h TTL)
+	p.activeSessions.Store("idle-token", &activeSessionInfo{
+		token:        "idle-token",
+		username:     "dave",
+		lastActivity: time.Now().Add(-45 * time.Minute),
+	})
+
+	select {
+	case <-rotated:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected background rotation for idle session")
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	sess, err := s.GetSession(context.Background(), "idle-token")
+	if err != nil {
+		t.Fatalf("failed to get updated session: %v", err)
+	}
+	if sess.GrafanaSession != "cookie-after-idle-rot" {
+		t.Errorf("expected rotated cookie, got: %s", sess.GrafanaSession)
+	}
+
+	// The session expiration must be bounded to ~15 minutes (lastActivity + sessionTTL), NOT extended to a full 1h from now
+	maxExpectedExpiry := time.Now().Add(20 * time.Minute)
+	minExpectedExpiry := time.Now().Add(10 * time.Minute)
+	if sess.ExpiresAt.After(maxExpectedExpiry) {
+		t.Errorf("expected ExpiresAt bounded by remaining idle TTL (~15m), but got: %v (more than %v)", sess.ExpiresAt, maxExpectedExpiry)
+	}
+	if sess.ExpiresAt.Before(minExpectedExpiry) {
+		t.Errorf("expected ExpiresAt at least %v, but got: %v", minExpectedExpiry, sess.ExpiresAt)
+	}
+}

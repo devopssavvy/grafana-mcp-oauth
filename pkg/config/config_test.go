@@ -265,6 +265,22 @@ func TestLoadFromEnv_CookiePath(t *testing.T) {
 		cfg := config.LoadFromEnv()
 		assert.Equal(t, "/grafana/subpath", cfg.CookiePath)
 	})
+
+	t.Run("invalid characters in path fallback to slash", func(t *testing.T) {
+		t.Setenv("COOKIE_PATH", "/grafana; Secure; SameSite=None")
+		cfg := config.LoadFromEnv()
+		assert.Equal(t, "/", cfg.CookiePath)
+	})
+}
+
+func TestIsValidCookiePath(t *testing.T) {
+	assert.True(t, config.IsValidCookiePath("/"))
+	assert.True(t, config.IsValidCookiePath("/grafana"))
+	assert.True(t, config.IsValidCookiePath("/grafana/sub-path_1.0/"))
+	assert.False(t, config.IsValidCookiePath(""))
+	assert.False(t, config.IsValidCookiePath("/grafana; evil"))
+	assert.False(t, config.IsValidCookiePath("/grafana\r\n"))
+	assert.False(t, config.IsValidCookiePath("/grafana?query=1"))
 }
 
 

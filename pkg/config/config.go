@@ -245,6 +245,10 @@ func LoadFromEnv() *AppConfig {
 	} else if !strings.HasPrefix(cookiePath, "/") {
 		cookiePath = "/" + cookiePath
 	}
+	if !IsValidCookiePath(cookiePath) {
+		slog.Warn("Invalid characters in COOKIE_PATH; falling back to '/'", "cookie_path", cookiePath)
+		cookiePath = "/"
+	}
 
 	logLevel := slog.LevelInfo
 	switch strings.ToLower(os.Getenv("LOG_LEVEL")) {
@@ -352,4 +356,18 @@ func ParseTrustedProxies(raw string) []*net.IPNet {
 		}
 	}
 	return list
+}
+
+// IsValidCookiePath validates that a cookie path string conforms to safe URL path characters.
+func IsValidCookiePath(p string) bool {
+	if len(p) == 0 || len(p) > 256 {
+		return false
+	}
+	for i := 0; i < len(p); i++ {
+		c := p[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '/' || c == '_' || c == '-' || c == '.') {
+			return false
+		}
+	}
+	return true
 }

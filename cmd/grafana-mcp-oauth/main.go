@@ -108,7 +108,15 @@ func main() {
 		}
 	}
 	if *flagCookiePath != "" {
-		cfg.CookiePath = *flagCookiePath
+		cp := strings.TrimSpace(*flagCookiePath)
+		if !strings.HasPrefix(cp, "/") {
+			cp = "/" + cp
+		}
+		if config.IsValidCookiePath(cp) {
+			cfg.CookiePath = cp
+		} else {
+			slog.Warn("Invalid characters in -cookie-path flag; ignoring", "cookie_path", cp)
+		}
 	}
 	if *flagTargetMCPURL != "" {
 		cfg.TargetMCPURL = *flagTargetMCPURL

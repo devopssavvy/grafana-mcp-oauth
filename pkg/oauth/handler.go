@@ -300,7 +300,7 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	for _, c := range r.Cookies() {
 		if c.Name == "grafana_session" && isValidGrafanaSession(c.Value) {
 			origBrowserSession = c.Value
-		} else if c.Name == "grafana_session_expiry" {
+		} else if c.Name == "grafana_session_expiry" && isValidGrafanaExpiry(c.Value) {
 			origBrowserSessionExpiry = c.Value
 		}
 	}
@@ -579,16 +579,16 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		// This keeps the user's web dashboards active on their original session while the MCP proxy operates
 		// on its dedicated Grafana session stored in Redis.
 		if req.OriginalBrowserSession != "" && req.OriginalBrowserSession != grafanaSession {
-			http.SetCookie(w, &http.Cookie{
+			sessCookie := &http.Cookie{
 				Name:     "grafana_session",
 				Value:    req.OriginalBrowserSession,
 				Path:     h.cookiePath(),
 				HttpOnly: true,
 				SameSite: http.SameSiteLaxMode,
 				Secure:   h.cfg.CookieSecure,
-				MaxAge:   2592000,
-			})
+			}
 			if req.OriginalBrowserSessionExpiry != "" {
+				sessCookie.MaxAge = 2592000
 				http.SetCookie(w, &http.Cookie{
 					Name:     "grafana_session_expiry",
 					Value:    req.OriginalBrowserSessionExpiry,
@@ -598,6 +598,7 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 					MaxAge:   2592000,
 				})
 			}
+			http.SetCookie(w, sessCookie)
 			h.cfg.Logger.Info("Restored original web session cookie to browser", "username", userInfo.Login)
 		}
 
@@ -608,16 +609,16 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 
 	// Restore original web session cookie for direct browser confirmation if applicable
 	if req.OriginalBrowserSession != "" && req.OriginalBrowserSession != grafanaSession {
-		http.SetCookie(w, &http.Cookie{
+		sessCookie := &http.Cookie{
 			Name:     "grafana_session",
 			Value:    req.OriginalBrowserSession,
 			Path:     h.cookiePath(),
 			HttpOnly: true,
 			SameSite: http.SameSiteLaxMode,
 			Secure:   h.cfg.CookieSecure,
-			MaxAge:   2592000,
-		})
+		}
 		if req.OriginalBrowserSessionExpiry != "" {
+			sessCookie.MaxAge = 2592000
 			http.SetCookie(w, &http.Cookie{
 				Name:     "grafana_session_expiry",
 				Value:    req.OriginalBrowserSessionExpiry,
@@ -627,6 +628,7 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 				MaxAge:   2592000,
 			})
 		}
+		http.SetCookie(w, sessCookie)
 	}
 
 	// Direct browser confirmation fallback (XSS sanitized & anti-cache)
@@ -1017,6 +1019,20 @@ func isValidGrafanaSession(s string) bool {
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_' || c == '.' || c == '=') {
+			return false
+		}
+	}
+	return true
+}
+
+// isValidGrafanaExpiry verifies that the Grafana session expiry token conforms to a numeric timestamp.
+func isValidGrafanaExpiry(s string) bool {
+	if len(s) == 0 || len(s) > 16 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < '0' || c > '9' {
 			return false
 		}
 	}

@@ -1721,4 +1721,87 @@ func TestHandler_CookiePath_Custom(t *testing.T) {
 	assert.True(t, foundExpiry, "Restored grafana_session_expiry must use custom CookiePath")
 }
 
+func TestHandleLogin_RejectsMalformedSessionExpiry(t *testing.T) {
+	h, st, mockGrafana := setupOAuthTestEnv(t)
+	defer h.Close()
+	defer mockGrafana.Close()
+
+	ctx := context.Background()
+	_, challenge := generateTestPKCE()
+
+	loginReq := httptest.NewRequest(
+		http.MethodGet,
+		"/mcp/auth/login?prompt=login&redirect_uri=http://127.0.0.1:54321/callback&code_challenge="+challenge+"&code_challenge_method=S256&client_id=test-client",
+		nil,
+	)
+	loginReq.AddCookie(&http.Cookie{Name: "grafana_session", Value: "original_web_cookie_111"})
+	loginReq.AddCookie(&http.Cookie{Name: "grafana_session_expiry", Value: "malicious_expiry_value; path=/"})
+
+	loginRec := httptest.NewRecorder()
+	h.HandleLogin(loginRec, loginReq)
+
+	assert.Equal(t, http.StatusFound, loginRec.Code)
+
+	var stateCookie string
+	for _, c := range loginRec.Result().Cookies() {
+		if c.Name == "mcp_auth_state" {
+			stateCookie = c.Value
+			break
+		}
+	}
+	require.NotEmpty(t, stateCookie)
+
+	pending, err := st.GetPendingAuth(ctx, stateCookie)
+	require.NoError(t, err)
+	assert.Equal(t, "original_web_cookie_111", pending.OriginalBrowserSession)
+	assert.Empty(t, pending.OriginalBrowserSessionExpiry, "Malformed session expiry must be rejected and omitted")
+}
+
+func TestHandleCallback_RestoresTransientSessionCookieWithoutExpiry(t *testing.T) {
+	h, st, mockGrafana := setupOAuthTestEnv(t)
+	defer h.Close()
+	defer mockGrafana.Close()
+
+	ctx := context.Background()
+	state := "mcp_st_restore_transient_999"
+
+	pendingReq := &store.PendingAuthRequest{
+		ClientID:               "test-client",
+		RedirectURI:            "http://127.0.0.1:54321/callback",
+		ClientState:            "custom-state",
+		CodeChallenge:          "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+		CodeChallengeMethod:    "S256",
+		OriginalBrowserSession: "original_transient_cookie_222",
+		// OriginalBrowserSessionExpiry is empty (browser-session-only)
+		CreatedAt: time.Now(),
+	}
+	require.NoError(t, st.SavePendingAuth(ctx, state, pendingReq, 15*time.Minute))
+
+	callbackReq := httptest.NewRequest(
+		http.MethodGet,
+		"/mcp/auth/callback?mcp_state="+state,
+		nil,
+	)
+	callbackReq.AddCookie(&http.Cookie{Name: "mcp_auth_state", Value: state})
+	callbackReq.AddCookie(&http.Cookie{Name: "grafana_session", Value: "valid_grafana_session_123"})
+
+	callbackRec := httptest.NewRecorder()
+	h.HandleCallback(callbackRec, callbackReq)
+
+	assert.Equal(t, http.StatusFound, callbackRec.Code)
+
+	var restoredSessionCookie *http.Cookie
+	var foundExpiry bool
+	for _, c := range callbackRec.Result().Cookies() {
+		if c.Name == "grafana_session" && c.Value == "original_transient_cookie_222" {
+			restoredSessionCookie = c
+		} else if c.Name == "grafana_session_expiry" {
+			foundExpiry = true
+		}
+	}
+	require.NotNil(t, restoredSessionCookie)
+	assert.Equal(t, 0, restoredSessionCookie.MaxAge, "Transient browser session cookie must not have MaxAge set")
+	assert.False(t, foundExpiry, "No expiry cookie should be set when OriginalBrowserSessionExpiry was absent")
+}
+
 

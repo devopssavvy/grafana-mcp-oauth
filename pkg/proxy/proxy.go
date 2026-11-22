@@ -449,7 +449,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			lastRotated = session.CreatedAt
 		}
 		if time.Since(lastRotated) >= p.rotationInterval {
-			p.triggerAsyncGrafanaRotation(token, grafanaSession, username)
+			p.triggerAsyncGrafanaRotation(token, grafanaSession, username, p.sessionTTL)
 		}
 	}
 
@@ -656,7 +656,8 @@ func (p *Proxy) startKeepaliveWorker(ctx context.Context) {
 				}
 
 				// If session has been inactive longer than sessionTTL, prune it
-				if time.Since(info.lastActivity) > p.sessionTTL {
+				remainingTTL := p.sessionTTL - time.Since(info.lastActivity)
+				if remainingTTL <= 0 {
 					p.activeSessions.Delete(key)
 					return true
 				}
@@ -684,7 +685,10 @@ func (p *Proxy) startKeepaliveWorker(ctx context.Context) {
 				}
 
 				if time.Since(lastRotated) >= p.rotationInterval {
-					p.triggerAsyncGrafanaRotation(info.token, sess.GrafanaSession, info.username)
+					if remainingTTL > p.sessionTTL {
+						remainingTTL = p.sessionTTL
+					}
+					p.triggerAsyncGrafanaRotation(info.token, sess.GrafanaSession, info.username, remainingTTL)
 				}
 				return true
 			})
@@ -699,7 +703,7 @@ func (p *Proxy) Close() {
 	}
 }
 
-func (p *Proxy) triggerAsyncGrafanaRotation(token, currentSession, username string) {
+func (p *Proxy) triggerAsyncGrafanaRotation(token, currentSession, username string, slidingTTL time.Duration) {
 	if nextRetry, ok := p.rotationCooldown.Load(token); ok {
 		if time.Now().Before(nextRetry.(time.Time)) {
 			return // Cooldown active after previous rotation failure to prevent upstream stampede
@@ -769,8 +773,12 @@ func (p *Proxy) triggerAsyncGrafanaRotation(token, currentSession, username stri
 			newSession = currentSession
 		}
 
+		if slidingTTL <= 0 {
+			slidingTTL = p.sessionTTL
+		}
+
 		if p.store != nil {
-			if err := p.store.UpdateGrafanaSession(ctx, token, newSession, p.sessionTTL); err != nil {
+			if err := p.store.UpdateGrafanaSession(ctx, token, newSession, slidingTTL); err != nil {
 				p.logger.Warn("Failed to persist rotated Grafana session cookie in store", "error", err, "username", username)
 				return
 			}
