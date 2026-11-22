@@ -1048,6 +1048,7 @@ func (h *Handler) restoreOriginalBrowserSession(w http.ResponseWriter, r *http.R
 		}
 	}
 
+	// #nosec G124 -- Secure flag dynamically matches CookieSecure configuration
 	sessCookie := &http.Cookie{
 		Name:     "grafana_session",
 		Value:    req.OriginalBrowserSession,
@@ -1058,6 +1059,7 @@ func (h *Handler) restoreOriginalBrowserSession(w http.ResponseWriter, r *http.R
 		MaxAge:   maxAge,
 	}
 	if maxAge > 0 {
+		// #nosec G124 -- Secure flag dynamically matches CookieSecure configuration
 		http.SetCookie(w, &http.Cookie{
 			Name:     "grafana_session_expiry",
 			Value:    req.OriginalBrowserSessionExpiry,
