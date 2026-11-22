@@ -1582,3 +1582,58 @@ func TestHandleCallback_RestoresOriginalBrowserSession(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "valid_grafana_session_123", authCtx.GrafanaSession, "MCP client must receive the newly minted dedicated Grafana session")
 }
+
+func TestHandleLogin_ForceDedicatedSession_PreservesOriginalBrowserSessionWithoutPromptLogin(t *testing.T) {
+	_, st, mockGrafana := setupOAuthTestEnv(t)
+	defer mockGrafana.Close()
+
+	cfg := oauth.Config{
+		BaseURL:               "http://localhost:8080",
+		GrafanaURL:            mockGrafana.URL,
+		GrafanaPublicURL:      mockGrafana.URL,
+		CallbackBaseURL:       "http://localhost:8080/mcp/auth/callback",
+		SessionTTL:            1 * time.Hour,
+		RefreshTTL:            24 * time.Hour,
+		HTTPClient:            mockGrafana.Client(),
+		CIMDEnforcement:       "disabled",
+		ForceDedicatedSession: true,
+	}
+	h := oauth.NewHandler(cfg, st)
+	defer h.Close()
+
+	ctx := context.Background()
+	_, challenge := generateTestPKCE()
+
+	// Request has an active grafana_session cookie and does NOT have prompt=login
+	loginReq := httptest.NewRequest(
+		http.MethodGet,
+		"/mcp/auth/login?redirect_uri=http://127.0.0.1:54321/callback&code_challenge="+challenge+"&code_challenge_method=S256&client_id=test-client",
+		nil,
+	)
+	loginReq.AddCookie(&http.Cookie{Name: "grafana_session", Value: "original_web_cookie_default"})
+	loginReq.AddCookie(&http.Cookie{Name: "grafana_session_expiry", Value: "1795317999"})
+
+	loginRec := httptest.NewRecorder()
+	h.HandleLogin(loginRec, loginReq)
+
+	// In ForceDedicatedSession mode, it must redirect to Grafana login even without prompt=login
+	assert.Equal(t, http.StatusFound, loginRec.Code)
+	assert.Contains(t, loginRec.Header().Get("Location"), "/login/generic_oauth")
+
+	// Verify state cookie was set
+	var stateCookie string
+	for _, c := range loginRec.Result().Cookies() {
+		if c.Name == "mcp_auth_state" {
+			stateCookie = c.Value
+			break
+		}
+	}
+	require.NotEmpty(t, stateCookie)
+
+	// Verify that PendingAuthRequest preserved the original browser session
+	pending, err := st.GetPendingAuth(ctx, stateCookie)
+	require.NoError(t, err)
+	assert.Equal(t, "original_web_cookie_default", pending.OriginalBrowserSession)
+	assert.Equal(t, "1795317999", pending.OriginalBrowserSessionExpiry)
+}
+

@@ -31,8 +31,9 @@ func main() {
 		flagGRPCPort        = flag.String("grpc-port", "", "gRPC port to listen on for Envoy ext_authz [env: GRPC_PORT]")
 		flagCookieSecure    = flag.String("cookie-secure", "", "Force Secure flag on cookies ('true' or 'false') [env: COOKIE_SECURE]")
 		flagTargetMCPURL    = flag.String("target-mcp-url", "", "Upstream stock MCP Server URL for proxying [env: TARGET_MCP_URL]")
-		flagCIMDEnforcement = flag.String("cimd-enforcement", "", "CIMD enforcement mode: 'required' (default), 'permissive', or 'disabled' [env: CIMD_ENFORCEMENT]")
-		flagTrustedProxies  = flag.String("trusted-proxies", "", "Comma-separated list of trusted proxy IPs/CIDRs for X-Forwarded-For [env: TRUSTED_PROXIES]")
+		flagCIMDEnforcement        = flag.String("cimd-enforcement", "", "CIMD enforcement mode: 'required' (default), 'permissive', or 'disabled' [env: CIMD_ENFORCEMENT]")
+		flagForceDedicatedSession  = flag.String("force-dedicated-session", "", "Enforce dedicated Grafana session creation and browser cookie restoration ('true' or 'false') [env: FORCE_DEDICATED_SESSION]")
+		flagTrustedProxies         = flag.String("trusted-proxies", "", "Comma-separated list of trusted proxy IPs/CIDRs for X-Forwarded-For [env: TRUSTED_PROXIES]")
 		flagVersion         = flag.Bool("version", false, "Print version and exit")
 	)
 
@@ -63,6 +64,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  CIMD_ENFORCEMENT     CIMD enforcement mode: required (default), permissive, disabled\n")
 		fmt.Fprintf(os.Stderr, "  CIMD_ALLOW_INSECURE_HTTP Allow insecure HTTP and loopback for CIMD in dev (default false)\n")
 		fmt.Fprintf(os.Stderr, "  CIMD_CACHE_TTL       Cache TTL for CIMD metadata (default 1h)\n")
+		fmt.Fprintf(os.Stderr, "  FORCE_DEDICATED_SESSION Enforce dedicated Grafana session creation and browser cookie restoration (default true)\n")
 		fmt.Fprintf(os.Stderr, "  TRUSTED_PROXIES      Comma-separated list of trusted proxy IPs/CIDRs for X-Forwarded-For\n")
 	}
 
@@ -109,6 +111,11 @@ func main() {
 	if *flagCIMDEnforcement != "" {
 		cfg.CIMDEnforcement = strings.ToLower(strings.TrimSpace(*flagCIMDEnforcement))
 	}
+	if *flagForceDedicatedSession != "" {
+		if fds, err := strconv.ParseBool(*flagForceDedicatedSession); err == nil {
+			cfg.ForceDedicatedSession = fds
+		}
+	}
 	if *flagTrustedProxies != "" {
 		cfg.TrustedProxiesRaw = *flagTrustedProxies
 		cfg.TrustedProxies = config.ParseTrustedProxies(*flagTrustedProxies)
@@ -128,6 +135,7 @@ func main() {
 		"target_mcp_url", cfg.TargetMCPURL,
 		"base_url", cfg.BaseURL,
 		"grafana_url", cfg.GrafanaURL,
+		"force_dedicated_session", cfg.ForceDedicatedSession,
 		"redis_addr", cfg.RedisAddr,
 		"redis_tls_enabled", cfg.RedisTLSEnabled,
 		"redis_mtls_enabled", (cfg.RedisCertPath != "" && cfg.RedisKeyPath != ""),
