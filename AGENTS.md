@@ -48,8 +48,8 @@ This file provides architectural conventions, security invariants, and coding st
 
 ### 2.5 Grafana Session Lifecycle & Dedicated Session Isolation
 - **Dedicated Sessions (`FORCE_DEDICATED_SESSION`)**:
-  - When `FORCE_DEDICATED_SESSION=true`, MCP logins trigger a separate dedicated Grafana session and restore the user's original browser session cookie upon callback completion. The restored cookie is validated for user ID match (`origUser.ID == userInfo.ID`) and future expiry with dynamic Max-Age.
-  - When `FORCE_DEDICATED_SESSION=false` (default), MCP client authorization directly uses the browser's existing Grafana session without forcing re-authentication. Note that if background sliding keepalive rotation is enabled (`ROTATION_INTERVAL > 0`), rotating the session upstream revokes the prior token in Grafana. When sharing a single session between web and MCP, set `FORCE_DEDICATED_SESSION=true` in environments where Grafana token rotation is strictly enforced to prevent web UI logout.
+  - When `FORCE_DEDICATED_SESSION=true` (default), MCP client logins trigger a separate dedicated Grafana session and restore the user's original browser session cookie upon callback completion. The restored cookie is validated for user ID match (`origUser.ID == userInfo.ID`) and future expiry with dynamic Max-Age. This ensures MCP session rotations never revoke the user's active browser dashboards.
+  - When `FORCE_DEDICATED_SESSION=false`, MCP client authorization directly uses the browser's existing Grafana session without forcing re-authentication. Note that if background sliding keepalive rotation is enabled (`ROTATION_INTERVAL > 0`), rotating the session upstream revokes the prior token in Grafana. When sharing a single session between web and MCP, set `FORCE_DEDICATED_SESSION=true` in environments where Grafana token rotation is strictly enforced to prevent web UI logout.
 
 ---
 

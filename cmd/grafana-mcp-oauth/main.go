@@ -66,7 +66,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  CIMD_ALLOW_INSECURE_HTTP Allow insecure HTTP and loopback for CIMD in dev (default false)\n")
 		fmt.Fprintf(os.Stderr, "  CIMD_CACHE_TTL       Cache TTL for CIMD metadata (default 1h)\n")
 		fmt.Fprintf(os.Stderr, "  COOKIE_PATH          Cookie path for Grafana session and redirect cookies (default /)\n")
-		fmt.Fprintf(os.Stderr, "  FORCE_DEDICATED_SESSION Enforce dedicated Grafana session creation and browser cookie restoration (default false)\n")
+		fmt.Fprintf(os.Stderr, "  FORCE_DEDICATED_SESSION Enforce dedicated Grafana session creation and browser cookie restoration (default true)\n")
 		fmt.Fprintf(os.Stderr, "  TRUSTED_PROXIES      Comma-separated list of trusted proxy IPs/CIDRs for X-Forwarded-For\n")
 	}
 

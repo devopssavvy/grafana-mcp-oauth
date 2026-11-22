@@ -48,7 +48,7 @@ type AppConfig struct {
 	CIMDCacheTTL               time.Duration // Cache TTL for fetched CIMD metadata (default 1 hour)
 	InstanceURL                string        // Reachable URL for this proxy instance used for cross-replica peer forwarding (e.g. "http://mcp-proxy-1:8080")
 	GrafanaRotationInterval    time.Duration // Sliding keep-alive rotation interval for Grafana session cookie (default 5m)
-	ForceDedicatedSession      bool          // Enforce creating a separate, dedicated Grafana session for MCP and restoring web cookie (default false)
+	ForceDedicatedSession      bool          // Enforce creating a separate, dedicated Grafana session for MCP and restoring web cookie (default true)
 	LogLevel                   slog.Level
 }
 
@@ -232,7 +232,7 @@ func LoadFromEnv() *AppConfig {
 		}
 	}
 
-	forceDedicatedSession := false
+	forceDedicatedSession := true
 	if v := os.Getenv("FORCE_DEDICATED_SESSION"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			forceDedicatedSession = b
