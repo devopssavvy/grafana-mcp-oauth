@@ -1484,3 +1484,101 @@ func TestHandler_RefreshTokenGrant_WithGrafanaRotation(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "rotated_grafana_session_888", refSess.GrafanaSession, "Refresh token session must store rotated Grafana cookie")
 }
+
+func TestHandleLogin_PreservesOriginalBrowserSessionWithPromptLogin(t *testing.T) {
+	h, st, mockGrafana := setupOAuthTestEnv(t)
+	defer h.Close()
+	defer mockGrafana.Close()
+
+	ctx := context.Background()
+	_, challenge := generateTestPKCE()
+
+	loginReq := httptest.NewRequest(
+		http.MethodGet,
+		"/mcp/auth/login?prompt=login&redirect_uri=http://127.0.0.1:54321/callback&code_challenge="+challenge+"&code_challenge_method=S256&client_id=test-client",
+		nil,
+	)
+	loginReq.AddCookie(&http.Cookie{Name: "grafana_session", Value: "original_web_cookie_111"})
+	loginReq.AddCookie(&http.Cookie{Name: "grafana_session_expiry", Value: "1795317550"})
+
+	loginRec := httptest.NewRecorder()
+	h.HandleLogin(loginRec, loginReq)
+
+	assert.Equal(t, http.StatusFound, loginRec.Code)
+	assert.Contains(t, loginRec.Header().Get("Location"), "/login/generic_oauth")
+
+	// Verify state cookie was set
+	var stateCookie string
+	for _, c := range loginRec.Result().Cookies() {
+		if c.Name == "mcp_auth_state" {
+			stateCookie = c.Value
+			break
+		}
+	}
+	require.NotEmpty(t, stateCookie)
+
+	// Verify that PendingAuthRequest preserved the original browser session
+	pending, err := st.GetPendingAuth(ctx, stateCookie)
+	require.NoError(t, err)
+	assert.Equal(t, "original_web_cookie_111", pending.OriginalBrowserSession)
+	assert.Equal(t, "1795317550", pending.OriginalBrowserSessionExpiry)
+}
+
+func TestHandleCallback_RestoresOriginalBrowserSession(t *testing.T) {
+	h, st, mockGrafana := setupOAuthTestEnv(t)
+	defer h.Close()
+	defer mockGrafana.Close()
+
+	ctx := context.Background()
+	state := "mcp_st_restore_test_999"
+
+	pendingReq := &store.PendingAuthRequest{
+		ClientID:                     "test-client",
+		RedirectURI:                  "http://127.0.0.1:54321/callback",
+		ClientState:                  "custom-state",
+		CodeChallenge:                "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+		CodeChallengeMethod:          "S256",
+		OriginalBrowserSession:       "original_web_cookie_111",
+		OriginalBrowserSessionExpiry: "1795317550",
+		CreatedAt:                    time.Now(),
+	}
+	require.NoError(t, st.SavePendingAuth(ctx, state, pendingReq, 15*time.Minute))
+
+	// Simulate callback carrying new dedicated session cookie from Grafana
+	callbackReq := httptest.NewRequest(
+		http.MethodGet,
+		"/mcp/auth/callback?mcp_state="+state,
+		nil,
+	)
+	callbackReq.AddCookie(&http.Cookie{Name: "mcp_auth_state", Value: state})
+	callbackReq.AddCookie(&http.Cookie{Name: "grafana_session", Value: "valid_grafana_session_123"}) // Accepted by mockGrafana
+
+	callbackRec := httptest.NewRecorder()
+	h.HandleCallback(callbackRec, callbackReq)
+
+	assert.Equal(t, http.StatusFound, callbackRec.Code)
+	location := callbackRec.Header().Get("Location")
+	assert.Contains(t, location, "http://127.0.0.1:54321/callback?code=")
+
+	// Verify that response cookies restore the original browser session
+	var restoredSession, restoredExpiry string
+	for _, c := range callbackRec.Result().Cookies() {
+		if c.Name == "grafana_session" && c.Value != "" {
+			restoredSession = c.Value
+		} else if c.Name == "grafana_session_expiry" && c.Value != "" {
+			restoredExpiry = c.Value
+		}
+	}
+	assert.Equal(t, "original_web_cookie_111", restoredSession, "Browser cookie must be restored to original web session")
+	assert.Equal(t, "1795317550", restoredExpiry, "Browser expiry cookie must be restored to original expiry")
+
+	// Verify that MCP authorization code was issued with the NEW dedicated Grafana session
+	u, err := url.Parse(location)
+	require.NoError(t, err)
+	code := u.Query().Get("code")
+	require.NotEmpty(t, code)
+
+	authCtx, err := st.GetAuthCode(ctx, code)
+	require.NoError(t, err)
+	assert.Equal(t, "valid_grafana_session_123", authCtx.GrafanaSession, "MCP client must receive the newly minted dedicated Grafana session")
+}

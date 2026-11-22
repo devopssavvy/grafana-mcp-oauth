@@ -157,6 +157,7 @@ func New(opts Options) (*Server, error) {
 		CIMDAllowInsecureHTTP: cfg.CIMDAllowInsecureHTTP,
 		CIMDCacheTTL:          cfg.CIMDCacheTTL,
 		CIMDCache:             cimdCache,
+		ForceDedicatedSession: cfg.ForceDedicatedSession,
 		TrustedProxies:        cfg.TrustedProxies,
 		RedisClient:           rdb,
 		Logger:                logger,

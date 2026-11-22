@@ -47,6 +47,7 @@ type Config struct {
 	CIMDCacheTTL          time.Duration         // Cache TTL for CIMD metadata
 	CIMDCache             cimd.Cache            // Custom or distributed CIMD cache (optional)
 	CIMDFetcher           *cimd.Fetcher         // Custom or mock CIMD fetcher (optional)
+	ForceDedicatedSession bool                  // Enforce dedicated Grafana session creation and browser cookie restoration
 	HTTPClient            *http.Client
 	Logger                *slog.Logger
 }
@@ -284,18 +285,21 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check if the user already has an active, authenticated Grafana session.
-	// If active and prompt != "login", issue the authorization code directly,
+	// If active, prompt != "login", and ForceDedicatedSession is false, issue the authorization code directly,
 	// preventing redundant SSO redirects and eliminating the "stuck on Grafana page" loop.
-	if q.Get("prompt") != "login" {
-		var grafanaSession string
-		for _, c := range r.Cookies() {
-			if c.Name == "grafana_session" {
-				grafanaSession = c.Value
-				break
-			}
+	var origBrowserSession string
+	var origBrowserSessionExpiry string
+	for _, c := range r.Cookies() {
+		if c.Name == "grafana_session" && isValidGrafanaSession(c.Value) {
+			origBrowserSession = c.Value
+		} else if c.Name == "grafana_session_expiry" {
+			origBrowserSessionExpiry = c.Value
 		}
-		if grafanaSession != "" && isValidGrafanaSession(grafanaSession) {
-			userInfo, err := h.fetchGrafanaUser(r.Context(), grafanaSession)
+	}
+
+	if q.Get("prompt") != "login" && !h.cfg.ForceDedicatedSession {
+		if origBrowserSession != "" {
+			userInfo, err := h.fetchGrafanaUser(r.Context(), origBrowserSession)
 			if err == nil && userInfo != nil {
 				authCode, err := crypto.GenerateRandomToken("mcp_code_", 32)
 				if err != nil {
@@ -304,7 +308,7 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 				}
 
 				authCtx := &store.AuthCodeContext{
-					GrafanaSession:      grafanaSession,
+					GrafanaSession:      origBrowserSession,
 					UserInfo:            userInfo,
 					ClientID:            clientID,
 					RedirectURI:         redirectURI,
@@ -358,12 +362,14 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 
 	// Save pending request to distributed Redis store with 15-minute TTL
 	pendingReq := &store.PendingAuthRequest{
-		ClientID:            clientID,
-		RedirectURI:         redirectURI,
-		ClientState:         clientState,
-		CodeChallenge:       codeChallenge,
-		CodeChallengeMethod: codeChallengeMethod,
-		CreatedAt:           time.Now(),
+		ClientID:                     clientID,
+		RedirectURI:                  redirectURI,
+		ClientState:                  clientState,
+		CodeChallenge:                codeChallenge,
+		CodeChallengeMethod:          codeChallengeMethod,
+		OriginalBrowserSession:       origBrowserSession,
+		OriginalBrowserSessionExpiry: origBrowserSessionExpiry,
+		CreatedAt:                    time.Now(),
 	}
 	if err := h.store.SavePendingAuth(r.Context(), internalState, pendingReq, h.cfg.PendingAuthTTL); err != nil {
 		h.cfg.Logger.Error("Failed to save pending auth request to store", "error", err)
@@ -560,9 +566,59 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid redirect target: must be local loopback", http.StatusBadRequest)
 			return
 		}
+
+		// Restore original web session cookie to the browser if a distinct session existed prior to MCP login.
+		// This keeps the user's web dashboards active on their original session while the MCP proxy operates
+		// on its dedicated Grafana session stored in Redis.
+		if req.OriginalBrowserSession != "" && req.OriginalBrowserSession != grafanaSession {
+			http.SetCookie(w, &http.Cookie{
+				Name:     "grafana_session",
+				Value:    req.OriginalBrowserSession,
+				Path:     "/",
+				HttpOnly: true,
+				SameSite: http.SameSiteLaxMode,
+				Secure:   h.cfg.CookieSecure,
+				MaxAge:   2592000,
+			})
+			if req.OriginalBrowserSessionExpiry != "" {
+				http.SetCookie(w, &http.Cookie{
+					Name:     "grafana_session_expiry",
+					Value:    req.OriginalBrowserSessionExpiry,
+					Path:     "/",
+					SameSite: http.SameSiteLaxMode,
+					Secure:   h.cfg.CookieSecure,
+					MaxAge:   2592000,
+				})
+			}
+			h.cfg.Logger.Info("Restored original web session cookie to browser", "username", userInfo.Login)
+		}
+
 		w.Header().Set("Location", redirectTarget.String())
 		w.WriteHeader(http.StatusFound)
 		return
+	}
+
+	// Restore original web session cookie for direct browser confirmation if applicable
+	if req.OriginalBrowserSession != "" && req.OriginalBrowserSession != grafanaSession {
+		http.SetCookie(w, &http.Cookie{
+			Name:     "grafana_session",
+			Value:    req.OriginalBrowserSession,
+			Path:     "/",
+			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+			Secure:   h.cfg.CookieSecure,
+			MaxAge:   2592000,
+		})
+		if req.OriginalBrowserSessionExpiry != "" {
+			http.SetCookie(w, &http.Cookie{
+				Name:     "grafana_session_expiry",
+				Value:    req.OriginalBrowserSessionExpiry,
+				Path:     "/",
+				SameSite: http.SameSiteLaxMode,
+				Secure:   h.cfg.CookieSecure,
+				MaxAge:   2592000,
+			})
+		}
 	}
 
 	// Direct browser confirmation fallback (XSS sanitized & anti-cache)
