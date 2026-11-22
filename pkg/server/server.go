@@ -147,6 +147,7 @@ func New(opts Options) (*Server, error) {
 		GrafanaPublicURL:      cfg.GrafanaPublicURL,
 		CallbackBaseURL:       cfg.CallbackBaseURL,
 		CookieSecure:          cfg.CookieSecure,
+		CookiePath:            cfg.CookiePath,
 		SessionTTL:            cfg.SessionTTL,
 		RefreshTTL:            cfg.RefreshTTL,
 		PendingAuthTTL:        cfg.PendingAuthTTL,

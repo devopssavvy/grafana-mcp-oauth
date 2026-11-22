@@ -1637,3 +1637,88 @@ func TestHandleLogin_ForceDedicatedSession_PreservesOriginalBrowserSessionWithou
 	assert.Equal(t, "1795317999", pending.OriginalBrowserSessionExpiry)
 }
 
+func TestHandler_CookiePath_Custom(t *testing.T) {
+	_, st, mockGrafana := setupOAuthTestEnv(t)
+	defer mockGrafana.Close()
+
+	customCookiePath := "/grafana/"
+	cfg := oauth.Config{
+		BaseURL:               "http://localhost:8080",
+		GrafanaURL:            mockGrafana.URL,
+		GrafanaPublicURL:      mockGrafana.URL,
+		CallbackBaseURL:       "http://localhost:8080/mcp/auth/callback",
+		SessionTTL:            1 * time.Hour,
+		RefreshTTL:            24 * time.Hour,
+		HTTPClient:            mockGrafana.Client(),
+		CIMDEnforcement:       "disabled",
+		ForceDedicatedSession: true,
+		CookiePath:            customCookiePath,
+	}
+	h := oauth.NewHandler(cfg, st)
+	defer h.Close()
+
+	ctx := context.Background()
+	_, challenge := generateTestPKCE()
+
+	// 1. Verify HandleLogin sets redirect_to with custom cookie path
+	loginReq := httptest.NewRequest(
+		http.MethodGet,
+		"/mcp/auth/login?redirect_uri=http://127.0.0.1:54321/callback&code_challenge="+challenge+"&code_challenge_method=S256&client_id=test-client",
+		nil,
+	)
+	loginRec := httptest.NewRecorder()
+	h.HandleLogin(loginRec, loginReq)
+	assert.Equal(t, http.StatusFound, loginRec.Code)
+
+	var foundRedirectTo, foundRedirect_to bool
+	for _, c := range loginRec.Result().Cookies() {
+		if c.Name == "redirectTo" {
+			assert.Equal(t, customCookiePath, c.Path)
+			foundRedirectTo = true
+		}
+		if c.Name == "redirect_to" {
+			assert.Equal(t, customCookiePath, c.Path)
+			foundRedirect_to = true
+		}
+	}
+	assert.True(t, foundRedirectTo)
+	assert.True(t, foundRedirect_to)
+
+	// 2. Verify HandleCallback restores grafana_session with custom cookie path
+	state := "mcp_st_custom_path_test_1"
+	pendingReq := &store.PendingAuthRequest{
+		ClientID:                     "test-client",
+		RedirectURI:                  "http://127.0.0.1:54321/callback",
+		ClientState:                  "custom-state",
+		CodeChallenge:                challenge,
+		CodeChallengeMethod:          "S256",
+		OriginalBrowserSession:       "original_web_session_999",
+		OriginalBrowserSessionExpiry: "1795319999",
+		CreatedAt:                    time.Now(),
+	}
+	require.NoError(t, st.SavePendingAuth(ctx, state, pendingReq, 15*time.Minute))
+
+	callbackReq := httptest.NewRequest(http.MethodGet, "/mcp/auth/callback?mcp_state="+state, nil)
+	callbackReq.AddCookie(&http.Cookie{Name: "mcp_auth_state", Value: state})
+	callbackReq.AddCookie(&http.Cookie{Name: "grafana_session", Value: "valid_grafana_session_123"})
+
+	callbackRec := httptest.NewRecorder()
+	h.HandleCallback(callbackRec, callbackReq)
+	assert.Equal(t, http.StatusFound, callbackRec.Code)
+
+	var foundSession, foundExpiry bool
+	for _, c := range callbackRec.Result().Cookies() {
+		if c.Name == "grafana_session" && c.Value == "original_web_session_999" {
+			assert.Equal(t, customCookiePath, c.Path)
+			foundSession = true
+		}
+		if c.Name == "grafana_session_expiry" && c.Value == "1795319999" {
+			assert.Equal(t, customCookiePath, c.Path)
+			foundExpiry = true
+		}
+	}
+	assert.True(t, foundSession, "Restored grafana_session must use custom CookiePath")
+	assert.True(t, foundExpiry, "Restored grafana_session_expiry must use custom CookiePath")
+}
+
+

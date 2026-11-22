@@ -48,8 +48,16 @@ type Config struct {
 	CIMDCache             cimd.Cache            // Custom or distributed CIMD cache (optional)
 	CIMDFetcher           *cimd.Fetcher         // Custom or mock CIMD fetcher (optional)
 	ForceDedicatedSession bool                  // Enforce dedicated Grafana session creation and browser cookie restoration
+	CookiePath            string                // Cookie Path for Grafana session and redirect cookies (default: "/")
 	HTTPClient            *http.Client
 	Logger                *slog.Logger
+}
+
+func (h *Handler) cookiePath() string {
+	if h.cfg.CookiePath != "" {
+		return h.cfg.CookiePath
+	}
+	return "/"
 }
 
 // Handler manages browser SSO login, MCP client discovery (RFC 9728, RFC 8414), PKCE, and token lifecycle.
@@ -400,7 +408,7 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     "redirect_to",
 		Value:    url.QueryEscape(callbackPath),
-		Path:     "/",
+		Path:     h.cookiePath(),
 		SameSite: http.SameSiteLaxMode,
 		Secure:   h.cfg.CookieSecure,
 		MaxAge:   int(h.cfg.PendingAuthTTL.Seconds()),
@@ -409,7 +417,7 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     "redirectTo",
 		Value:    url.QueryEscape(callbackPath),
-		Path:     "/",
+		Path:     h.cookiePath(),
 		SameSite: http.SameSiteLaxMode,
 		Secure:   h.cfg.CookieSecure,
 		MaxAge:   int(h.cfg.PendingAuthTTL.Seconds()),
@@ -464,7 +472,7 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     "redirect_to",
 		Value:    "",
-		Path:     "/",
+		Path:     h.cookiePath(),
 		SameSite: http.SameSiteLaxMode,
 		Secure:   h.cfg.CookieSecure,
 		MaxAge:   -1,
@@ -473,7 +481,7 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     "redirectTo",
 		Value:    "",
-		Path:     "/",
+		Path:     h.cookiePath(),
 		SameSite: http.SameSiteLaxMode,
 		Secure:   h.cfg.CookieSecure,
 		MaxAge:   -1,
@@ -574,7 +582,7 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 			http.SetCookie(w, &http.Cookie{
 				Name:     "grafana_session",
 				Value:    req.OriginalBrowserSession,
-				Path:     "/",
+				Path:     h.cookiePath(),
 				HttpOnly: true,
 				SameSite: http.SameSiteLaxMode,
 				Secure:   h.cfg.CookieSecure,
@@ -584,7 +592,7 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 				http.SetCookie(w, &http.Cookie{
 					Name:     "grafana_session_expiry",
 					Value:    req.OriginalBrowserSessionExpiry,
-					Path:     "/",
+					Path:     h.cookiePath(),
 					SameSite: http.SameSiteLaxMode,
 					Secure:   h.cfg.CookieSecure,
 					MaxAge:   2592000,
@@ -603,7 +611,7 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		http.SetCookie(w, &http.Cookie{
 			Name:     "grafana_session",
 			Value:    req.OriginalBrowserSession,
-			Path:     "/",
+			Path:     h.cookiePath(),
 			HttpOnly: true,
 			SameSite: http.SameSiteLaxMode,
 			Secure:   h.cfg.CookieSecure,
@@ -613,7 +621,7 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 			http.SetCookie(w, &http.Cookie{
 				Name:     "grafana_session_expiry",
 				Value:    req.OriginalBrowserSessionExpiry,
-				Path:     "/",
+				Path:     h.cookiePath(),
 				SameSite: http.SameSiteLaxMode,
 				Secure:   h.cfg.CookieSecure,
 				MaxAge:   2592000,

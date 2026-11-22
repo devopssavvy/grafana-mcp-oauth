@@ -30,6 +30,7 @@ func main() {
 		flagGRPCHost        = flag.String("grpc-host", "", "gRPC host/interface to listen on [env: GRPC_HOST or BIND_HOST]")
 		flagGRPCPort        = flag.String("grpc-port", "", "gRPC port to listen on for Envoy ext_authz [env: GRPC_PORT]")
 		flagCookieSecure    = flag.String("cookie-secure", "", "Force Secure flag on cookies ('true' or 'false') [env: COOKIE_SECURE]")
+		flagCookiePath      = flag.String("cookie-path", "", "Cookie Path for Grafana session and redirect cookies (default '/') [env: COOKIE_PATH]")
 		flagTargetMCPURL    = flag.String("target-mcp-url", "", "Upstream stock MCP Server URL for proxying [env: TARGET_MCP_URL]")
 		flagCIMDEnforcement        = flag.String("cimd-enforcement", "", "CIMD enforcement mode: 'required' (default), 'permissive', or 'disabled' [env: CIMD_ENFORCEMENT]")
 		flagForceDedicatedSession  = flag.String("force-dedicated-session", "", "Enforce dedicated Grafana session creation and browser cookie restoration ('true' or 'false') [env: FORCE_DEDICATED_SESSION]")
@@ -64,6 +65,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  CIMD_ENFORCEMENT     CIMD enforcement mode: required (default), permissive, disabled\n")
 		fmt.Fprintf(os.Stderr, "  CIMD_ALLOW_INSECURE_HTTP Allow insecure HTTP and loopback for CIMD in dev (default false)\n")
 		fmt.Fprintf(os.Stderr, "  CIMD_CACHE_TTL       Cache TTL for CIMD metadata (default 1h)\n")
+		fmt.Fprintf(os.Stderr, "  COOKIE_PATH          Cookie path for Grafana session and redirect cookies (default /)\n")
 		fmt.Fprintf(os.Stderr, "  FORCE_DEDICATED_SESSION Enforce dedicated Grafana session creation and browser cookie restoration (default true)\n")
 		fmt.Fprintf(os.Stderr, "  TRUSTED_PROXIES      Comma-separated list of trusted proxy IPs/CIDRs for X-Forwarded-For\n")
 	}
@@ -105,6 +107,9 @@ func main() {
 			cfg.CookieSecure = cs
 		}
 	}
+	if *flagCookiePath != "" {
+		cfg.CookiePath = *flagCookiePath
+	}
 	if *flagTargetMCPURL != "" {
 		cfg.TargetMCPURL = *flagTargetMCPURL
 	}
@@ -132,6 +137,7 @@ func main() {
 		"grpc_host", cfg.GRPCHost,
 		"grpc_port", cfg.GRPCPort,
 		"cookie_secure", cfg.CookieSecure,
+		"cookie_path", cfg.CookiePath,
 		"target_mcp_url", cfg.TargetMCPURL,
 		"base_url", cfg.BaseURL,
 		"grafana_url", cfg.GrafanaURL,

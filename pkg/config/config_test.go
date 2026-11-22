@@ -19,6 +19,7 @@ func TestLoadFromEnv_Defaults(t *testing.T) {
 	os.Unsetenv("HTTP_PORT")
 	os.Unsetenv("GRPC_PORT")
 	os.Unsetenv("FORCE_DEDICATED_SESSION")
+	os.Unsetenv("COOKIE_PATH")
 
 	cfg := config.LoadFromEnv()
 	assert.Equal(t, "proxy", cfg.Mode)
@@ -42,6 +43,7 @@ func TestLoadFromEnv_Defaults(t *testing.T) {
 	assert.Equal(t, 1*time.Hour, cfg.CIMDCacheTTL)
 	assert.Equal(t, 5*time.Minute, cfg.GrafanaRotationInterval)
 	assert.True(t, cfg.ForceDedicatedSession)
+	assert.Equal(t, "/", cfg.CookiePath)
 }
 
 func TestLoadFromEnv_ProductionWithoutMasterSecret(t *testing.T) {
@@ -244,4 +246,25 @@ func TestLoadFromEnv_ForceDedicatedSession(t *testing.T) {
 		assert.True(t, cfg.ForceDedicatedSession)
 	})
 }
+
+func TestLoadFromEnv_CookiePath(t *testing.T) {
+	t.Run("default is slash", func(t *testing.T) {
+		os.Unsetenv("COOKIE_PATH")
+		cfg := config.LoadFromEnv()
+		assert.Equal(t, "/", cfg.CookiePath)
+	})
+
+	t.Run("custom path with leading slash", func(t *testing.T) {
+		t.Setenv("COOKIE_PATH", "/grafana/")
+		cfg := config.LoadFromEnv()
+		assert.Equal(t, "/grafana/", cfg.CookiePath)
+	})
+
+	t.Run("custom path missing leading slash is normalized", func(t *testing.T) {
+		t.Setenv("COOKIE_PATH", "grafana/subpath")
+		cfg := config.LoadFromEnv()
+		assert.Equal(t, "/grafana/subpath", cfg.CookiePath)
+	})
+}
+
 

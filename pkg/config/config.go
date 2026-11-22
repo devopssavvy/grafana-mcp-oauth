@@ -20,6 +20,7 @@ type AppConfig struct {
 	GRPCHost                   string
 	GRPCPort                   string
 	CookieSecure               bool
+	CookiePath                 string        // Path for Grafana session and redirect cookies (default "/")
 	TargetMCPURL               string
 	GrafanaURL                 string
 	GrafanaPublicURL           string
@@ -238,6 +239,13 @@ func LoadFromEnv() *AppConfig {
 		}
 	}
 
+	cookiePath := strings.TrimSpace(getEnv("COOKIE_PATH", "/"))
+	if cookiePath == "" {
+		cookiePath = "/"
+	} else if !strings.HasPrefix(cookiePath, "/") {
+		cookiePath = "/" + cookiePath
+	}
+
 	logLevel := slog.LevelInfo
 	switch strings.ToLower(os.Getenv("LOG_LEVEL")) {
 	case "debug":
@@ -259,6 +267,7 @@ func LoadFromEnv() *AppConfig {
 		GRPCHost:                   grpcHost,
 		GRPCPort:                   grpcPort,
 		CookieSecure:               cookieSecure,
+		CookiePath:                 cookiePath,
 		TargetMCPURL:               targetMCPURL,
 		GrafanaURL:                 grafanaURL,
 		GrafanaPublicURL:           grafanaPublicURL,
