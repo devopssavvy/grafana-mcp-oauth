@@ -42,7 +42,7 @@ func TestLoadFromEnv_Defaults(t *testing.T) {
 	assert.False(t, cfg.CIMDAllowInsecureHTTP)
 	assert.Equal(t, 1*time.Hour, cfg.CIMDCacheTTL)
 	assert.Equal(t, 5*time.Minute, cfg.GrafanaRotationInterval)
-	assert.True(t, cfg.ForceDedicatedSession)
+	assert.False(t, cfg.ForceDedicatedSession)
 	assert.Equal(t, "/", cfg.CookiePath)
 }
 
@@ -228,10 +228,10 @@ func TestLoadFromEnv_TrustedProxies(t *testing.T) {
 }
 
 func TestLoadFromEnv_ForceDedicatedSession(t *testing.T) {
-	t.Run("default is true", func(t *testing.T) {
+	t.Run("default is false", func(t *testing.T) {
 		os.Unsetenv("FORCE_DEDICATED_SESSION")
 		cfg := config.LoadFromEnv()
-		assert.True(t, cfg.ForceDedicatedSession)
+		assert.False(t, cfg.ForceDedicatedSession)
 	})
 
 	t.Run("explicitly disabled", func(t *testing.T) {

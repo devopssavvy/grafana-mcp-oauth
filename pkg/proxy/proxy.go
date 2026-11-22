@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"grafana-mcp-oauth/pkg/crypto"
@@ -610,20 +611,50 @@ func isSelf(a, b string) bool {
 }
 
 type activeSessionInfo struct {
-	token        string
-	username     string
-	lastActivity time.Time
+	token            string
+	username         string
+	lastActivityNano atomic.Int64
+	lastRotatedNano  atomic.Int64
+}
+
+func (a *activeSessionInfo) LastActivity() time.Time {
+	return time.Unix(0, a.lastActivityNano.Load())
+}
+
+func (a *activeSessionInfo) SetLastActivity(t time.Time) {
+	a.lastActivityNano.Store(t.UnixNano())
+}
+
+func (a *activeSessionInfo) LastRotated() time.Time {
+	return time.Unix(0, a.lastRotatedNano.Load())
+}
+
+func (a *activeSessionInfo) SetLastRotated(t time.Time) {
+	a.lastRotatedNano.Store(t.UnixNano())
+}
+
+func newActiveSessionInfo(token, username string, lastActivity, lastRotated time.Time) *activeSessionInfo {
+	info := &activeSessionInfo{
+		token:    token,
+		username: username,
+	}
+	info.SetLastActivity(lastActivity)
+	info.SetLastRotated(lastRotated)
+	return info
 }
 
 func (p *Proxy) touchActiveSession(token, username string) {
 	if token == "" {
 		return
 	}
-	p.activeSessions.Store(token, &activeSessionInfo{
-		token:        token,
-		username:     username,
-		lastActivity: time.Now(),
-	})
+	now := time.Now()
+	if val, ok := p.activeSessions.Load(token); ok {
+		if info, ok := val.(*activeSessionInfo); ok && info != nil {
+			info.SetLastActivity(now)
+			return
+		}
+	}
+	p.activeSessions.Store(token, newActiveSessionInfo(token, username, now, now))
 }
 
 func (p *Proxy) startKeepaliveWorker(ctx context.Context) {
@@ -647,18 +678,21 @@ func (p *Proxy) startKeepaliveWorker(ctx context.Context) {
 				token, ok := key.(string)
 				if !ok || token == "" {
 					p.activeSessions.Delete(key)
+					p.rotationCooldown.Delete(key)
 					return true
 				}
 				info, ok := val.(*activeSessionInfo)
 				if !ok || info == nil {
 					p.activeSessions.Delete(key)
+					p.rotationCooldown.Delete(key)
 					return true
 				}
 
 				// If session has been inactive longer than sessionTTL, prune it
-				remainingTTL := p.sessionTTL - time.Since(info.lastActivity)
+				remainingTTL := p.sessionTTL - time.Since(info.LastActivity())
 				if remainingTTL <= 0 {
 					p.activeSessions.Delete(key)
+					p.rotationCooldown.Delete(key)
 					return true
 				}
 
@@ -666,12 +700,26 @@ func (p *Proxy) startKeepaliveWorker(ctx context.Context) {
 					return true
 				}
 
-				sCtx, sCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				// Fast in-memory check to prevent redundant Redis calls and HKDF-SHA3-512 decryptions every tick
+				if time.Since(info.LastRotated()) < p.rotationInterval {
+					return true
+				}
+
+				sCtx, sCancel := context.WithTimeout(ctx, 5*time.Second)
 				sess, err := p.store.GetSession(sCtx, info.token)
 				sCancel()
 				if err != nil {
-					// Session expired or revoked in store
-					p.activeSessions.Delete(key)
+					if errors.Is(err, store.ErrSessionNotFound) || errors.Is(err, store.ErrSessionExpired) {
+						// Session expired or revoked in store
+						p.activeSessions.Delete(key)
+						p.rotationCooldown.Delete(key)
+					} else {
+						// Transient network or Redis timeout; preserve active session for retry on next tick
+						p.logger.Warn("Transient store error during keepalive check; retaining for next tick",
+							"error", err,
+							"username", info.username,
+						)
+					}
 					return true
 				}
 
@@ -684,11 +732,17 @@ func (p *Proxy) startKeepaliveWorker(ctx context.Context) {
 					lastRotated = sess.CreatedAt
 				}
 
+				// Synchronize in-memory lastRotated if another replica rotated this session
+				if lastRotated.After(info.LastRotated()) {
+					info.SetLastRotated(lastRotated)
+				}
+
 				if time.Since(lastRotated) >= p.rotationInterval {
 					if remainingTTL > p.sessionTTL {
 						remainingTTL = p.sessionTTL
 					}
 					p.triggerAsyncGrafanaRotation(info.token, sess.GrafanaSession, info.username, remainingTTL)
+					info.SetLastRotated(time.Now())
 				}
 				return true
 			})
@@ -705,7 +759,7 @@ func (p *Proxy) Close() {
 
 func (p *Proxy) triggerAsyncGrafanaRotation(token, currentSession, username string, slidingTTL time.Duration) {
 	if nextRetry, ok := p.rotationCooldown.Load(token); ok {
-		if time.Now().Before(nextRetry.(time.Time)) {
+		if t, ok := nextRetry.(time.Time); ok && time.Now().Before(t) {
 			return // Cooldown active after previous rotation failure to prevent upstream stampede
 		}
 		p.rotationCooldown.Delete(token)
@@ -746,6 +800,11 @@ func (p *Proxy) triggerAsyncGrafanaRotation(token, currentSession, username stri
 					lastRotated = latestSession.CreatedAt
 				}
 				if time.Since(lastRotated) < p.rotationInterval {
+					if val, ok := p.activeSessions.Load(token); ok {
+						if info, ok := val.(*activeSessionInfo); ok && info != nil {
+							info.SetLastRotated(lastRotated)
+						}
+					}
 					return // Already rotated by another pod/goroutine
 				}
 				if latestSession.GrafanaSession != "" {
@@ -758,6 +817,7 @@ func (p *Proxy) triggerAsyncGrafanaRotation(token, currentSession, username stri
 		if err != nil {
 			if errors.Is(err, oauth.ErrGrafanaSessionInvalid) {
 				p.activeSessions.Delete(token)
+				p.rotationCooldown.Delete(token)
 				p.logger.Warn("Grafana session expired or revoked upstream; pruned from active keepalive", "username", username)
 				return
 			}
@@ -768,6 +828,11 @@ func (p *Proxy) triggerAsyncGrafanaRotation(token, currentSession, username stri
 		}
 
 		p.rotationCooldown.Delete(token)
+		if val, ok := p.activeSessions.Load(token); ok {
+			if info, ok := val.(*activeSessionInfo); ok && info != nil {
+				info.SetLastRotated(time.Now())
+			}
+		}
 
 		if newSession == "" {
 			newSession = currentSession

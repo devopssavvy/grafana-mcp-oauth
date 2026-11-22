@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -28,19 +29,35 @@ func setupOAuthTestEnv(t *testing.T) (*oauth.Handler, *store.RedisSessionStore, 
 	mockGrafana := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/user" {
 			cookie, err := r.Cookie("grafana_session")
-			if err != nil || cookie.Value != "valid_grafana_session_123" {
+			if err != nil {
 				w.WriteHeader(http.StatusUnauthorized)
 				_, _ = w.Write([]byte(`{"message":"Unauthorized"}`))
 				return
 			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(oauth.GrafanaUser{
-				ID:    42,
-				Email: "bob@company.com",
-				Name:  "Bob Developer",
-				Login: "bob",
-				OrgID: 1,
-			})
+			if cookie.Value == "valid_grafana_session_123" || strings.HasPrefix(cookie.Value, "original_") || cookie.Value == "valid_grafana_session_default" {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(oauth.GrafanaUser{
+					ID:    42,
+					Email: "bob@company.com",
+					Name:  "Bob Developer",
+					Login: "bob",
+					OrgID: 1,
+				})
+				return
+			}
+			if cookie.Value == "mismatched_user_session" {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(oauth.GrafanaUser{
+					ID:    99,
+					Email: "alice@company.com",
+					Name:  "Alice Admin",
+					Login: "alice",
+					OrgID: 1,
+				})
+				return
+			}
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"message":"Unauthorized"}`))
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)
@@ -1532,6 +1549,7 @@ func TestHandleCallback_RestoresOriginalBrowserSession(t *testing.T) {
 	ctx := context.Background()
 	state := "mcp_st_restore_test_999"
 
+	futureExpiry := strconv.FormatInt(time.Now().Add(24*time.Hour).Unix(), 10)
 	pendingReq := &store.PendingAuthRequest{
 		ClientID:                     "test-client",
 		RedirectURI:                  "http://127.0.0.1:54321/callback",
@@ -1539,7 +1557,7 @@ func TestHandleCallback_RestoresOriginalBrowserSession(t *testing.T) {
 		CodeChallenge:                "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
 		CodeChallengeMethod:          "S256",
 		OriginalBrowserSession:       "original_web_cookie_111",
-		OriginalBrowserSessionExpiry: "1795317550",
+		OriginalBrowserSessionExpiry: futureExpiry,
 		CreatedAt:                    time.Now(),
 	}
 	require.NoError(t, st.SavePendingAuth(ctx, state, pendingReq, 15*time.Minute))
@@ -1570,7 +1588,7 @@ func TestHandleCallback_RestoresOriginalBrowserSession(t *testing.T) {
 		}
 	}
 	assert.Equal(t, "original_web_cookie_111", restoredSession, "Browser cookie must be restored to original web session")
-	assert.Equal(t, "1795317550", restoredExpiry, "Browser expiry cookie must be restored to original expiry")
+	assert.Equal(t, futureExpiry, restoredExpiry, "Browser expiry cookie must be restored to original expiry")
 
 	// Verify that MCP authorization code was issued with the NEW dedicated Grafana session
 	u, err := url.Parse(location)
@@ -1686,6 +1704,7 @@ func TestHandler_CookiePath_Custom(t *testing.T) {
 
 	// 2. Verify HandleCallback restores grafana_session with custom cookie path
 	state := "mcp_st_custom_path_test_1"
+	futureExpiry := strconv.FormatInt(time.Now().Add(24*time.Hour).Unix(), 10)
 	pendingReq := &store.PendingAuthRequest{
 		ClientID:                     "test-client",
 		RedirectURI:                  "http://127.0.0.1:54321/callback",
@@ -1693,7 +1712,7 @@ func TestHandler_CookiePath_Custom(t *testing.T) {
 		CodeChallenge:                challenge,
 		CodeChallengeMethod:          "S256",
 		OriginalBrowserSession:       "original_web_session_999",
-		OriginalBrowserSessionExpiry: "1795319999",
+		OriginalBrowserSessionExpiry: futureExpiry,
 		CreatedAt:                    time.Now(),
 	}
 	require.NoError(t, st.SavePendingAuth(ctx, state, pendingReq, 15*time.Minute))
@@ -1712,7 +1731,7 @@ func TestHandler_CookiePath_Custom(t *testing.T) {
 			assert.Equal(t, customCookiePath, c.Path)
 			foundSession = true
 		}
-		if c.Name == "grafana_session_expiry" && c.Value == "1795319999" {
+		if c.Name == "grafana_session_expiry" && c.Value == futureExpiry {
 			assert.Equal(t, customCookiePath, c.Path)
 			foundExpiry = true
 		}
@@ -1802,6 +1821,76 @@ func TestHandleCallback_RestoresTransientSessionCookieWithoutExpiry(t *testing.T
 	require.NotNil(t, restoredSessionCookie)
 	assert.Equal(t, 0, restoredSessionCookie.MaxAge, "Transient browser session cookie must not have MaxAge set")
 	assert.False(t, foundExpiry, "No expiry cookie should be set when OriginalBrowserSessionExpiry was absent")
+}
+
+func TestHandleCallback_DoesNotRestoreMismatchedUserSession(t *testing.T) {
+	h, st, mockGrafana := setupOAuthTestEnv(t)
+	defer h.Close()
+	defer mockGrafana.Close()
+
+	ctx := context.Background()
+	state := "mcp_st_mismatched_user_test"
+
+	pendingReq := &store.PendingAuthRequest{
+		ClientID:               "test-client",
+		RedirectURI:            "http://127.0.0.1:54321/callback",
+		ClientState:            "custom-state",
+		CodeChallenge:          "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+		CodeChallengeMethod:    "S256",
+		OriginalBrowserSession: "mismatched_user_session", // User ID 99 (Alice)
+		CreatedAt:              time.Now(),
+	}
+	require.NoError(t, st.SavePendingAuth(ctx, state, pendingReq, 15*time.Minute))
+
+	// Authenticating user in callback is User ID 42 (Bob)
+	callbackReq := httptest.NewRequest(http.MethodGet, "/mcp/auth/callback?mcp_state="+state, nil)
+	callbackReq.AddCookie(&http.Cookie{Name: "mcp_auth_state", Value: state})
+	callbackReq.AddCookie(&http.Cookie{Name: "grafana_session", Value: "valid_grafana_session_123"})
+
+	callbackRec := httptest.NewRecorder()
+	h.HandleCallback(callbackRec, callbackReq)
+
+	assert.Equal(t, http.StatusFound, callbackRec.Code)
+
+	// Must NOT restore the mismatched user's session cookie
+	for _, c := range callbackRec.Result().Cookies() {
+		assert.NotEqual(t, "mismatched_user_session", c.Value, "Must not restore session belonging to a different user ID")
+	}
+}
+
+func TestHandleCallback_DoesNotRestoreExpiredSession(t *testing.T) {
+	h, st, mockGrafana := setupOAuthTestEnv(t)
+	defer h.Close()
+	defer mockGrafana.Close()
+
+	ctx := context.Background()
+	state := "mcp_st_expired_session_test"
+
+	pendingReq := &store.PendingAuthRequest{
+		ClientID:                     "test-client",
+		RedirectURI:                  "http://127.0.0.1:54321/callback",
+		ClientState:                  "custom-state",
+		CodeChallenge:                "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+		CodeChallengeMethod:          "S256",
+		OriginalBrowserSession:       "original_web_cookie_111",
+		OriginalBrowserSessionExpiry: "1000000000", // Timestamp in the distant past (2001)
+		CreatedAt:                    time.Now(),
+	}
+	require.NoError(t, st.SavePendingAuth(ctx, state, pendingReq, 15*time.Minute))
+
+	callbackReq := httptest.NewRequest(http.MethodGet, "/mcp/auth/callback?mcp_state="+state, nil)
+	callbackReq.AddCookie(&http.Cookie{Name: "mcp_auth_state", Value: state})
+	callbackReq.AddCookie(&http.Cookie{Name: "grafana_session", Value: "valid_grafana_session_123"})
+
+	callbackRec := httptest.NewRecorder()
+	h.HandleCallback(callbackRec, callbackReq)
+
+	assert.Equal(t, http.StatusFound, callbackRec.Code)
+
+	// Must NOT restore expired session cookie
+	for _, c := range callbackRec.Result().Cookies() {
+		assert.NotEqual(t, "original_web_cookie_111", c.Value, "Must not restore an expired session cookie")
+	}
 }
 
 

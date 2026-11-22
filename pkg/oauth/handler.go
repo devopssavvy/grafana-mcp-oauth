@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -407,7 +408,7 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	// #nosec G124 -- Secure flag dynamically matches CookieSecure configuration
 	http.SetCookie(w, &http.Cookie{
 		Name:     "redirect_to",
-		Value:    url.QueryEscape(callbackPath),
+		Value:    callbackPath,
 		Path:     h.cookiePath(),
 		SameSite: http.SameSiteLaxMode,
 		Secure:   h.cfg.CookieSecure,
@@ -416,7 +417,7 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	// #nosec G124 -- Secure flag dynamically matches CookieSecure configuration
 	http.SetCookie(w, &http.Cookie{
 		Name:     "redirectTo",
-		Value:    url.QueryEscape(callbackPath),
+		Value:    callbackPath,
 		Path:     h.cookiePath(),
 		SameSite: http.SameSiteLaxMode,
 		Secure:   h.cfg.CookieSecure,
@@ -578,29 +579,7 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		// Restore original web session cookie to the browser if a distinct session existed prior to MCP login.
 		// This keeps the user's web dashboards active on their original session while the MCP proxy operates
 		// on its dedicated Grafana session stored in Redis.
-		if req.OriginalBrowserSession != "" && req.OriginalBrowserSession != grafanaSession {
-			sessCookie := &http.Cookie{
-				Name:     "grafana_session",
-				Value:    req.OriginalBrowserSession,
-				Path:     h.cookiePath(),
-				HttpOnly: true,
-				SameSite: http.SameSiteLaxMode,
-				Secure:   h.cfg.CookieSecure,
-			}
-			if req.OriginalBrowserSessionExpiry != "" {
-				sessCookie.MaxAge = 2592000
-				http.SetCookie(w, &http.Cookie{
-					Name:     "grafana_session_expiry",
-					Value:    req.OriginalBrowserSessionExpiry,
-					Path:     h.cookiePath(),
-					SameSite: http.SameSiteLaxMode,
-					Secure:   h.cfg.CookieSecure,
-					MaxAge:   2592000,
-				})
-			}
-			http.SetCookie(w, sessCookie)
-			h.cfg.Logger.Info("Restored original web session cookie to browser", "username", userInfo.Login)
-		}
+		h.restoreOriginalBrowserSession(w, r, req, grafanaSession, userInfo)
 
 		w.Header().Set("Location", redirectTarget.String())
 		w.WriteHeader(http.StatusFound)
@@ -608,28 +587,7 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Restore original web session cookie for direct browser confirmation if applicable
-	if req.OriginalBrowserSession != "" && req.OriginalBrowserSession != grafanaSession {
-		sessCookie := &http.Cookie{
-			Name:     "grafana_session",
-			Value:    req.OriginalBrowserSession,
-			Path:     h.cookiePath(),
-			HttpOnly: true,
-			SameSite: http.SameSiteLaxMode,
-			Secure:   h.cfg.CookieSecure,
-		}
-		if req.OriginalBrowserSessionExpiry != "" {
-			sessCookie.MaxAge = 2592000
-			http.SetCookie(w, &http.Cookie{
-				Name:     "grafana_session_expiry",
-				Value:    req.OriginalBrowserSessionExpiry,
-				Path:     h.cookiePath(),
-				SameSite: http.SameSiteLaxMode,
-				Secure:   h.cfg.CookieSecure,
-				MaxAge:   2592000,
-			})
-		}
-		http.SetCookie(w, sessCookie)
-	}
+	h.restoreOriginalBrowserSession(w, r, req, grafanaSession, userInfo)
 
 	// Direct browser confirmation fallback (XSS sanitized & anti-cache)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -930,7 +888,22 @@ func (h *Handler) fetchGrafanaUser(ctx context.Context, grafanaSession string) (
 	}
 	req.Header.Set("Cookie", fmt.Sprintf("grafana_session=%s", grafanaSession))
 
-	resp, err := h.cfg.HTTPClient.Do(req)
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	if h.cfg.HTTPClient != nil {
+		if h.cfg.HTTPClient.Timeout > 0 {
+			client.Timeout = h.cfg.HTTPClient.Timeout
+		}
+		if h.cfg.HTTPClient.Transport != nil {
+			client.Transport = h.cfg.HTTPClient.Transport
+		}
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("http request to grafana failed: %w", err)
 	}
@@ -1037,6 +1010,65 @@ func isValidGrafanaExpiry(s string) bool {
 		}
 	}
 	return true
+}
+
+// restoreOriginalBrowserSession restores the original web session cookie to the browser if a distinct,
+// valid session existed prior to MCP login and belongs to the exact same authenticated user.
+func (h *Handler) restoreOriginalBrowserSession(w http.ResponseWriter, r *http.Request, req *store.PendingAuthRequest, currentSession string, userInfo *store.GrafanaUser) {
+	if req.OriginalBrowserSession == "" || req.OriginalBrowserSession == currentSession || userInfo == nil {
+		return
+	}
+
+	// Verify that the original browser session is still valid in Grafana and belongs to the exact same user identity
+	origUser, err := h.fetchGrafanaUser(r.Context(), req.OriginalBrowserSession)
+	if err != nil || origUser == nil {
+		h.cfg.Logger.Debug("Original browser session is expired or invalid; skipping restoration", "error", err)
+		return
+	}
+	if origUser.ID != userInfo.ID {
+		h.cfg.Logger.Warn("Original browser session user mismatch; skipping restoration to prevent identity confusion",
+			"original_user_id", origUser.ID,
+			"authenticated_user_id", userInfo.ID,
+		)
+		return
+	}
+
+	var maxAge int
+	if req.OriginalBrowserSessionExpiry != "" {
+		exp, err := strconv.ParseInt(req.OriginalBrowserSessionExpiry, 10, 64)
+		if err != nil {
+			h.cfg.Logger.Debug("Failed to parse original session expiry timestamp; omitting max-age", "error", err)
+		} else {
+			remaining := int(exp - time.Now().Unix())
+			if remaining <= 0 {
+				h.cfg.Logger.Debug("Original browser session has expired; skipping restoration", "expiry", exp)
+				return
+			}
+			maxAge = remaining
+		}
+	}
+
+	sessCookie := &http.Cookie{
+		Name:     "grafana_session",
+		Value:    req.OriginalBrowserSession,
+		Path:     h.cookiePath(),
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   h.cfg.CookieSecure,
+		MaxAge:   maxAge,
+	}
+	if maxAge > 0 {
+		http.SetCookie(w, &http.Cookie{
+			Name:     "grafana_session_expiry",
+			Value:    req.OriginalBrowserSessionExpiry,
+			Path:     h.cookiePath(),
+			SameSite: http.SameSiteLaxMode,
+			Secure:   h.cfg.CookieSecure,
+			MaxAge:   maxAge,
+		})
+	}
+	http.SetCookie(w, sessCookie)
+	h.cfg.Logger.Info("Restored original web session cookie to browser", "username", userInfo.Login)
 }
 
 // Close gracefully releases handler resources including background rate limiter tickers.
