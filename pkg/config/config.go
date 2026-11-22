@@ -20,6 +20,7 @@ type AppConfig struct {
 	GRPCHost                   string
 	GRPCPort                   string
 	CookieSecure               bool
+	CookiePath                 string        // Path for Grafana session and redirect cookies (default "/")
 	TargetMCPURL               string
 	GrafanaURL                 string
 	GrafanaPublicURL           string
@@ -47,6 +48,7 @@ type AppConfig struct {
 	CIMDCacheTTL               time.Duration // Cache TTL for fetched CIMD metadata (default 1 hour)
 	InstanceURL                string        // Reachable URL for this proxy instance used for cross-replica peer forwarding (e.g. "http://mcp-proxy-1:8080")
 	GrafanaRotationInterval    time.Duration // Sliding keep-alive rotation interval for Grafana session cookie (default 5m)
+	ForceDedicatedSession      bool          // Enforce creating a separate, dedicated Grafana session for MCP and restoring web cookie (default true)
 	LogLevel                   slog.Level
 }
 
@@ -136,11 +138,20 @@ func LoadFromEnv() *AppConfig {
 		slog.Info("MCP_MASTER_SECRET not set; running in Zero-Knowledge Client-Derived Key mode (zero-config multi-pod sync)")
 	}
 
-	sessionHours := 2
-	if shStr := os.Getenv("SESSION_TTL_HOURS"); shStr != "" {
-		if sh, err := strconv.Atoi(shStr); err == nil && sh > 0 {
-			sessionHours = sh
+	var sessionTTL time.Duration
+	if stStr := os.Getenv("SESSION_TTL"); stStr != "" {
+		if d, err := time.ParseDuration(stStr); err == nil && d > 0 {
+			sessionTTL = d
 		}
+	}
+	if sessionTTL == 0 {
+		sessionHours := 2
+		if shStr := os.Getenv("SESSION_TTL_HOURS"); shStr != "" {
+			if sh, err := strconv.Atoi(shStr); err == nil && sh > 0 {
+				sessionHours = sh
+			}
+		}
+		sessionTTL = time.Duration(sessionHours) * time.Hour
 	}
 
 	refreshDays := 30
@@ -164,17 +175,28 @@ func LoadFromEnv() *AppConfig {
 		}
 	}
 
-	grafanaRotationMinutes := 5
-	if grmStr := os.Getenv("GRAFANA_ROTATION_INTERVAL_MINUTES"); grmStr != "" {
-		if grm, err := strconv.Atoi(grmStr); err == nil {
-			grafanaRotationMinutes = grm
+	var grafanaRotationInterval time.Duration
+	if griStr := os.Getenv("GRAFANA_ROTATION_INTERVAL"); griStr != "" {
+		if d, err := time.ParseDuration(griStr); err == nil {
+			if d <= 0 {
+				grafanaRotationInterval = -1
+			} else {
+				grafanaRotationInterval = d
+			}
 		}
 	}
-	var grafanaRotationInterval time.Duration
-	if grafanaRotationMinutes <= 0 {
-		grafanaRotationInterval = -1 // Explicitly disabled
-	} else {
-		grafanaRotationInterval = time.Duration(grafanaRotationMinutes) * time.Minute
+	if grafanaRotationInterval == 0 {
+		grafanaRotationMinutes := 5
+		if grmStr := os.Getenv("GRAFANA_ROTATION_INTERVAL_MINUTES"); grmStr != "" {
+			if grm, err := strconv.Atoi(grmStr); err == nil {
+				grafanaRotationMinutes = grm
+			}
+		}
+		if grafanaRotationMinutes <= 0 {
+			grafanaRotationInterval = -1 // Explicitly disabled
+		} else {
+			grafanaRotationInterval = time.Duration(grafanaRotationMinutes) * time.Minute
+		}
 	}
 
 	rateLimitLoginRPM := 60
@@ -210,6 +232,24 @@ func LoadFromEnv() *AppConfig {
 		}
 	}
 
+	forceDedicatedSession := true
+	if v := os.Getenv("FORCE_DEDICATED_SESSION"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			forceDedicatedSession = b
+		}
+	}
+
+	cookiePath := strings.TrimSpace(getEnv("COOKIE_PATH", "/"))
+	if cookiePath == "" {
+		cookiePath = "/"
+	} else if !strings.HasPrefix(cookiePath, "/") {
+		cookiePath = "/" + cookiePath
+	}
+	if !IsValidCookiePath(cookiePath) {
+		slog.Warn("Invalid characters in COOKIE_PATH; falling back to '/'", "cookie_path", cookiePath)
+		cookiePath = "/"
+	}
+
 	logLevel := slog.LevelInfo
 	switch strings.ToLower(os.Getenv("LOG_LEVEL")) {
 	case "debug":
@@ -231,6 +271,7 @@ func LoadFromEnv() *AppConfig {
 		GRPCHost:                   grpcHost,
 		GRPCPort:                   grpcPort,
 		CookieSecure:               cookieSecure,
+		CookiePath:                 cookiePath,
 		TargetMCPURL:               targetMCPURL,
 		GrafanaURL:                 grafanaURL,
 		GrafanaPublicURL:           grafanaPublicURL,
@@ -245,7 +286,7 @@ func LoadFromEnv() *AppConfig {
 		RedisTLSInsecureSkipVerify: redisTLSInsecureSkipVerify,
 		RedisTLSServerName:         redisTLSServerName,
 		MasterSecret:               masterSecret,
-		SessionTTL:                 time.Duration(sessionHours) * time.Hour,
+		SessionTTL:                 sessionTTL,
 		RefreshTTL:                 time.Duration(refreshDays) * 24 * time.Hour,
 		PendingAuthTTL:             time.Duration(pendingAuthMinutes) * time.Minute,
 		AuthCodeTTL:                time.Duration(authCodeSeconds) * time.Second,
@@ -258,6 +299,7 @@ func LoadFromEnv() *AppConfig {
 		CIMDCacheTTL:               cimdCacheTTL,
 		InstanceURL:                instanceURL,
 		GrafanaRotationInterval:    grafanaRotationInterval,
+		ForceDedicatedSession:      forceDedicatedSession,
 		LogLevel:                   logLevel,
 	}
 }
@@ -314,4 +356,18 @@ func ParseTrustedProxies(raw string) []*net.IPNet {
 		}
 	}
 	return list
+}
+
+// IsValidCookiePath validates that a cookie path string conforms to safe URL path characters.
+func IsValidCookiePath(p string) bool {
+	if len(p) == 0 || len(p) > 256 {
+		return false
+	}
+	for i := 0; i < len(p); i++ {
+		c := p[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '/' || c == '_' || c == '-' || c == '.') {
+			return false
+		}
+	}
+	return true
 }

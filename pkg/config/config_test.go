@@ -18,6 +18,8 @@ func TestLoadFromEnv_Defaults(t *testing.T) {
 	os.Unsetenv("PORT")
 	os.Unsetenv("HTTP_PORT")
 	os.Unsetenv("GRPC_PORT")
+	os.Unsetenv("FORCE_DEDICATED_SESSION")
+	os.Unsetenv("COOKIE_PATH")
 
 	cfg := config.LoadFromEnv()
 	assert.Equal(t, "proxy", cfg.Mode)
@@ -40,6 +42,8 @@ func TestLoadFromEnv_Defaults(t *testing.T) {
 	assert.False(t, cfg.CIMDAllowInsecureHTTP)
 	assert.Equal(t, 1*time.Hour, cfg.CIMDCacheTTL)
 	assert.Equal(t, 5*time.Minute, cfg.GrafanaRotationInterval)
+	assert.True(t, cfg.ForceDedicatedSession)
+	assert.Equal(t, "/", cfg.CookiePath)
 }
 
 func TestLoadFromEnv_ProductionWithoutMasterSecret(t *testing.T) {
@@ -222,3 +226,61 @@ func TestLoadFromEnv_TrustedProxies(t *testing.T) {
 		assert.True(t, cfg.TrustedProxies[1].Contains(net.ParseIP("172.16.5.5")))
 	})
 }
+
+func TestLoadFromEnv_ForceDedicatedSession(t *testing.T) {
+	t.Run("default is true", func(t *testing.T) {
+		os.Unsetenv("FORCE_DEDICATED_SESSION")
+		cfg := config.LoadFromEnv()
+		assert.True(t, cfg.ForceDedicatedSession)
+	})
+
+	t.Run("explicitly disabled", func(t *testing.T) {
+		t.Setenv("FORCE_DEDICATED_SESSION", "false")
+		cfg := config.LoadFromEnv()
+		assert.False(t, cfg.ForceDedicatedSession)
+	})
+
+	t.Run("explicitly enabled", func(t *testing.T) {
+		t.Setenv("FORCE_DEDICATED_SESSION", "true")
+		cfg := config.LoadFromEnv()
+		assert.True(t, cfg.ForceDedicatedSession)
+	})
+}
+
+func TestLoadFromEnv_CookiePath(t *testing.T) {
+	t.Run("default is slash", func(t *testing.T) {
+		os.Unsetenv("COOKIE_PATH")
+		cfg := config.LoadFromEnv()
+		assert.Equal(t, "/", cfg.CookiePath)
+	})
+
+	t.Run("custom path with leading slash", func(t *testing.T) {
+		t.Setenv("COOKIE_PATH", "/grafana/")
+		cfg := config.LoadFromEnv()
+		assert.Equal(t, "/grafana/", cfg.CookiePath)
+	})
+
+	t.Run("custom path missing leading slash is normalized", func(t *testing.T) {
+		t.Setenv("COOKIE_PATH", "grafana/subpath")
+		cfg := config.LoadFromEnv()
+		assert.Equal(t, "/grafana/subpath", cfg.CookiePath)
+	})
+
+	t.Run("invalid characters in path fallback to slash", func(t *testing.T) {
+		t.Setenv("COOKIE_PATH", "/grafana; Secure; SameSite=None")
+		cfg := config.LoadFromEnv()
+		assert.Equal(t, "/", cfg.CookiePath)
+	})
+}
+
+func TestIsValidCookiePath(t *testing.T) {
+	assert.True(t, config.IsValidCookiePath("/"))
+	assert.True(t, config.IsValidCookiePath("/grafana"))
+	assert.True(t, config.IsValidCookiePath("/grafana/sub-path_1.0/"))
+	assert.False(t, config.IsValidCookiePath(""))
+	assert.False(t, config.IsValidCookiePath("/grafana; evil"))
+	assert.False(t, config.IsValidCookiePath("/grafana\r\n"))
+	assert.False(t, config.IsValidCookiePath("/grafana?query=1"))
+}
+
+

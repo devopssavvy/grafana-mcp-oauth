@@ -67,12 +67,14 @@ type GrafanaUser struct {
 
 // PendingAuthRequest tracks an ongoing OAuth login authorization flow.
 type PendingAuthRequest struct {
-	ClientID            string    `json:"client_id"`
-	RedirectURI         string    `json:"redirect_uri"`
-	ClientState         string    `json:"client_state"`
-	CodeChallenge       string    `json:"code_challenge"`
-	CodeChallengeMethod string    `json:"code_challenge_method"`
-	CreatedAt           time.Time `json:"created_at"`
+	ClientID                     string    `json:"client_id"`
+	RedirectURI                  string    `json:"redirect_uri"`
+	ClientState                  string    `json:"client_state"`
+	CodeChallenge                string    `json:"code_challenge"`
+	CodeChallengeMethod          string    `json:"code_challenge_method"`
+	OriginalBrowserSession       string    `json:"original_browser_session,omitempty"`
+	OriginalBrowserSessionExpiry string    `json:"original_browser_session_expiry,omitempty"`
+	CreatedAt                    time.Time `json:"created_at"`
 }
 
 // AuthCodeContext holds state associated with an issued authorization code.

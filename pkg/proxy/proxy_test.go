@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"grafana-mcp-oauth/pkg/oauth"
 	"grafana-mcp-oauth/pkg/store"
 )
 
@@ -58,6 +60,9 @@ func (m *mockStore) UpdateGrafanaSession(ctx context.Context, token string, newG
 		cp := *s
 		cp.GrafanaSession = newGrafanaSession
 		cp.LastRotatedAt = time.Now()
+		if ttl > 0 {
+			cp.ExpiresAt = time.Now().Add(ttl)
+		}
 		m.sessions[token] = &cp
 		return nil
 	}
@@ -1175,5 +1180,351 @@ func TestProxy_SlidingKeepAlive_ErrorResilience(t *testing.T) {
 	sess, _ := s.GetSession(context.Background(), "error-token")
 	if sess.GrafanaSession != "resilient-cookie" {
 		t.Errorf("cookie should remain resilient-cookie, got: %s", sess.GrafanaSession)
+	}
+}
+
+func TestProxy_BackgroundKeepaliveWorker(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":{"tools":[]},"id":1}`))
+	}))
+	defer upstream.Close()
+
+	initialExpiresAt := time.Now().Add(10 * time.Minute)
+	s := &mockStore{
+		sessions: map[string]*store.SessionData{
+			"bg-token": {
+				UserID:         "user-bg",
+				Username:       "bob",
+				GrafanaSession: "cookie-initial-bg",
+				CreatedAt:      time.Now().Add(-10 * time.Minute),
+				LastRotatedAt:  time.Now().Add(-10 * time.Minute),
+				ExpiresAt:      initialExpiresAt,
+			},
+		},
+	}
+
+	rotationCh := make(chan string, 5)
+	p, err := NewProxy(Config{
+		TargetURL:        upstream.URL,
+		BaseURL:          "http://localhost:8080",
+		InstanceURL:      "http://localhost:8080",
+		GrafanaURL:       "http://grafana:3000",
+		RotationInterval: 40 * time.Millisecond,
+		SessionTTL:       2 * time.Hour,
+		RotateFunc: func(ctx context.Context, grafanaURL string, currentSession string) (string, error) {
+			rotationCh <- currentSession
+			return "cookie-rotated-bg", nil
+		},
+	}, s)
+	if err != nil {
+		t.Fatalf("failed to create proxy: %v", err)
+	}
+	defer p.Close()
+
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	// Send an initial request to touch/register the active session
+	body := []byte(`{"jsonrpc":"2.0","method":"tools/list","id":1}`)
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/mcp", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer bg-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("initial request failed: %v", err)
+	}
+	resp.Body.Close()
+
+	// Drain any immediate rotation from ServeHTTP
+	select {
+	case <-rotationCh:
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	// Update LastRotatedAt in store to simulate rotation interval elapsed
+	s.mu.Lock()
+	if sess, ok := s.sessions["bg-token"]; ok {
+		sess.LastRotatedAt = time.Now().Add(-100 * time.Millisecond)
+		sess.GrafanaSession = "cookie-before-bg-worker"
+	}
+	s.mu.Unlock()
+
+	// DO NOT send any more HTTP requests!
+	// The background keepalive worker MUST detect that rotation is due and rotate automatically!
+	select {
+	case oldSess := <-rotationCh:
+		if oldSess != "cookie-before-bg-worker" {
+			t.Errorf("expected bg worker rotation with cookie-before-bg-worker, got: %s", oldSess)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("background keepalive worker did NOT trigger rotation without incoming requests!")
+	}
+
+	// Verify store was updated and session TTL was slid forward
+	time.Sleep(50 * time.Millisecond)
+	updatedSess, err := s.GetSession(context.Background(), "bg-token")
+	if err != nil {
+		t.Fatalf("failed to get updated session: %v", err)
+	}
+	if updatedSess.GrafanaSession != "cookie-rotated-bg" {
+		t.Errorf("expected store session updated to cookie-rotated-bg, got: %s", updatedSess.GrafanaSession)
+	}
+	if !updatedSess.ExpiresAt.After(initialExpiresAt) {
+		t.Errorf("expected ExpiresAt to slide forward past %v, got %v", initialExpiresAt, updatedSess.ExpiresAt)
+	}
+}
+
+func TestProxy_SlidingKeepAlive_SkipRotationThreshold(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":{"tools":[]},"id":1}`))
+	}))
+	defer upstream.Close()
+
+	s := &mockStore{
+		sessions: map[string]*store.SessionData{
+			"skip-token": {
+				UserID:         "user-skip",
+				Username:       "charlie",
+				GrafanaSession: "steady-cookie",
+				CreatedAt:      time.Now().Add(-10 * time.Minute),
+				LastRotatedAt:  time.Now().Add(-10 * time.Minute),
+				ExpiresAt:      time.Now().Add(30 * time.Minute),
+			},
+		},
+	}
+
+	rotatedCalled := make(chan struct{}, 1)
+	p, err := NewProxy(Config{
+		TargetURL:        upstream.URL,
+		BaseURL:          "http://localhost:8080",
+		InstanceURL:      "http://localhost:8080",
+		GrafanaURL:       "http://grafana:3000",
+		RotationInterval: 1 * time.Minute,
+		SessionTTL:       2 * time.Hour,
+		RotateFunc: func(ctx context.Context, grafanaURL string, currentSession string) (string, error) {
+			rotatedCalled <- struct{}{}
+			// Return same cookie simulating Grafana 200 OK without Set-Cookie (SkipRotationTime)
+			return currentSession, nil
+		},
+	}, s)
+	if err != nil {
+		t.Fatalf("failed to create proxy: %v", err)
+	}
+	defer p.Close()
+
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	body := []byte(`{"jsonrpc":"2.0","method":"tools/list","id":1}`)
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/mcp", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer skip-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	resp.Body.Close()
+
+	select {
+	case <-rotatedCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("rotation was not called")
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	sess, err := s.GetSession(context.Background(), "skip-token")
+	if err != nil {
+		t.Fatalf("failed to get session: %v", err)
+	}
+	// Cookie value remains steady
+	if sess.GrafanaSession != "steady-cookie" {
+		t.Errorf("expected cookie to remain steady-cookie, got: %s", sess.GrafanaSession)
+	}
+	// But LastRotatedAt was updated and ExpiresAt was slid forward
+	if time.Since(sess.LastRotatedAt) > 2*time.Second {
+		t.Errorf("expected LastRotatedAt updated to now, got: %v", sess.LastRotatedAt)
+	}
+	if !sess.ExpiresAt.After(time.Now().Add(1 * time.Hour)) {
+		t.Errorf("expected ExpiresAt slid forward to ~2h, got: %v", sess.ExpiresAt)
+	}
+}
+
+func TestProxy_BackgroundKeepalive_RemainingTTLOnIdleSession(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":{"tools":[]},"id":1}`))
+	}))
+	defer upstream.Close()
+
+	s := &mockStore{
+		sessions: map[string]*store.SessionData{
+			"idle-token": {
+				UserID:         "user-idle",
+				Username:       "dave",
+				GrafanaSession: "cookie-before-idle-rot",
+				CreatedAt:      time.Now().Add(-50 * time.Minute),
+				LastRotatedAt:  time.Now().Add(-50 * time.Minute),
+				ExpiresAt:      time.Now().Add(10 * time.Minute),
+			},
+		},
+	}
+
+	rotated := make(chan struct{}, 1)
+	p, err := NewProxy(Config{
+		TargetURL:        upstream.URL,
+		BaseURL:          "http://localhost:8080",
+		InstanceURL:      "http://localhost:8080",
+		GrafanaURL:       "http://grafana:3000",
+		RotationInterval: 30 * time.Millisecond,
+		SessionTTL:       1 * time.Hour,
+		RotateFunc: func(ctx context.Context, grafanaURL string, currentSession string) (string, error) {
+			rotated <- struct{}{}
+			return "cookie-after-idle-rot", nil
+		},
+	}, s)
+	if err != nil {
+		t.Fatalf("failed to create proxy: %v", err)
+	}
+	defer p.Close()
+
+	// Simulate an active session whose lastActivity was 45 minutes ago (15 minutes remaining on 1h TTL)
+	p.activeSessions.Store("idle-token", newActiveSessionInfo("idle-token", "dave", time.Now().Add(-45*time.Minute), time.Now()))
+
+	select {
+	case <-rotated:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected background rotation for idle session")
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	sess, err := s.GetSession(context.Background(), "idle-token")
+	if err != nil {
+		t.Fatalf("failed to get updated session: %v", err)
+	}
+	if sess.GrafanaSession != "cookie-after-idle-rot" {
+		t.Errorf("expected rotated cookie, got: %s", sess.GrafanaSession)
+	}
+
+	// The session expiration must be bounded to ~15 minutes (lastActivity + sessionTTL), NOT extended to a full 1h from now
+	maxExpectedExpiry := time.Now().Add(20 * time.Minute)
+	minExpectedExpiry := time.Now().Add(10 * time.Minute)
+	if sess.ExpiresAt.After(maxExpectedExpiry) {
+		t.Errorf("expected ExpiresAt bounded by remaining idle TTL (~15m), but got: %v (more than %v)", sess.ExpiresAt, maxExpectedExpiry)
+	}
+	if sess.ExpiresAt.Before(minExpectedExpiry) {
+		t.Errorf("expected ExpiresAt at least %v, but got: %v", minExpectedExpiry, sess.ExpiresAt)
+	}
+}
+
+type transientErrorStore struct {
+	store.SessionStore
+	failGet bool
+}
+
+func (s *transientErrorStore) GetSession(ctx context.Context, token string) (*store.SessionData, error) {
+	if s.failGet {
+		return nil, errors.New("i/o timeout: temporary connection blip")
+	}
+	return s.SessionStore.GetSession(ctx, token)
+}
+
+func TestProxy_BackgroundKeepalive_RetainsSessionOnTransientStoreError(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	baseStore := &mockStore{
+		sessions: map[string]*store.SessionData{
+			"transient-token": {
+				Username:       "eve",
+				GrafanaSession: "valid-cookie",
+				CreatedAt:      time.Now().Add(-10 * time.Minute),
+				LastRotatedAt:  time.Now().Add(-10 * time.Minute),
+				ExpiresAt:      time.Now().Add(1 * time.Hour),
+			},
+		},
+	}
+	flakyStore := &transientErrorStore{SessionStore: baseStore, failGet: true}
+
+	p, err := NewProxy(Config{
+		TargetURL:        upstream.URL,
+		BaseURL:          "http://localhost:8080",
+		GrafanaURL:       "http://grafana:3000",
+		RotationInterval: 20 * time.Millisecond,
+		SessionTTL:       1 * time.Hour,
+	}, flakyStore)
+	if err != nil {
+		t.Fatalf("failed to create proxy: %v", err)
+	}
+	defer p.Close()
+
+	p.activeSessions.Store("transient-token", newActiveSessionInfo("transient-token", "eve", time.Now(), time.Now()))
+
+	// Wait for keepalive ticker to run across the transient error
+	time.Sleep(100 * time.Millisecond)
+
+	// Session must still be retained in activeSessions despite transient store failure
+	if _, ok := p.activeSessions.Load("transient-token"); !ok {
+		t.Errorf("expected session to be retained in activeSessions during transient store error, but it was deleted")
+	}
+}
+
+func TestProxy_BackgroundKeepalive_PrunesStaleCooldown(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	s := &mockStore{
+		sessions: map[string]*store.SessionData{
+			"expired-token": {
+				Username:       "mallory",
+				GrafanaSession: "expired-cookie",
+				CreatedAt:      time.Now().Add(-2 * time.Hour),
+				LastRotatedAt:  time.Now().Add(-2 * time.Hour),
+				ExpiresAt:      time.Now().Add(-1 * time.Hour),
+			},
+		},
+	}
+
+	p, err := NewProxy(Config{
+		TargetURL:        upstream.URL,
+		BaseURL:          "http://localhost:8080",
+		GrafanaURL:       "http://grafana:3000",
+		RotationInterval: 20 * time.Millisecond,
+		SessionTTL:       1 * time.Hour,
+		RotateFunc: func(ctx context.Context, grafanaURL string, currentSession string) (string, error) {
+			return "", oauth.ErrGrafanaSessionInvalid
+		},
+	}, s)
+	if err != nil {
+		t.Fatalf("failed to create proxy: %v", err)
+	}
+	defer p.Close()
+
+	// Seed rotationCooldown with token
+	p.rotationCooldown.Store("expired-token", time.Now().Add(1*time.Minute))
+	p.activeSessions.Store("expired-token", newActiveSessionInfo("expired-token", "mallory", time.Now().Add(-2*time.Hour), time.Now().Add(-2*time.Hour)))
+
+	// Wait for keepalive worker to prune idle/expired session
+	time.Sleep(100 * time.Millisecond)
+
+	if _, ok := p.activeSessions.Load("expired-token"); ok {
+		t.Errorf("expected expired session to be deleted from activeSessions")
+	}
+	if _, ok := p.rotationCooldown.Load("expired-token"); ok {
+		t.Errorf("expected expired session to be deleted from rotationCooldown")
 	}
 }

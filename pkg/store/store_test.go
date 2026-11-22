@@ -224,12 +224,14 @@ func TestStore_PendingAuthFlow(t *testing.T) {
 
 	state := "mcp_st_sample_oauth_state_12345"
 	req := &store.PendingAuthRequest{
-		ClientID:            "cursor-client-1",
-		RedirectURI:         "http://127.0.0.1:54321/callback",
-		ClientState:         "client_custom_state_abc",
-		CodeChallenge:       "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
-		CodeChallengeMethod: "S256",
-		CreatedAt:           time.Now(),
+		ClientID:                     "cursor-client-1",
+		RedirectURI:                  "http://127.0.0.1:54321/callback",
+		ClientState:                  "client_custom_state_abc",
+		CodeChallenge:                "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+		CodeChallengeMethod:          "S256",
+		OriginalBrowserSession:       "orig_web_session_cookie_123",
+		OriginalBrowserSessionExpiry: "1795317550",
+		CreatedAt:                    time.Now(),
 	}
 
 	err := st.SavePendingAuth(ctx, state, req, 15*time.Minute)
@@ -253,6 +255,8 @@ func TestStore_PendingAuthFlow(t *testing.T) {
 	assert.Equal(t, req.ClientID, retrieved.ClientID)
 	assert.Equal(t, req.RedirectURI, retrieved.RedirectURI)
 	assert.Equal(t, req.CodeChallenge, retrieved.CodeChallenge)
+	assert.Equal(t, req.OriginalBrowserSession, retrieved.OriginalBrowserSession)
+	assert.Equal(t, req.OriginalBrowserSessionExpiry, retrieved.OriginalBrowserSessionExpiry)
 	assert.Equal(t, req.CodeChallengeMethod, retrieved.CodeChallengeMethod)
 
 	// Delete pending auth

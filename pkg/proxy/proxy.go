@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"grafana-mcp-oauth/pkg/crypto"
@@ -40,6 +42,7 @@ type Config struct {
 	InstanceURL      string
 	GrafanaURL       string        // Backend Grafana API URL (e.g. http://grafana:3000)
 	RotationInterval time.Duration // Interval to trigger sliding keep-alive rotation (default 5m)
+	SessionTTL       time.Duration // Session validity lifetime to slide on rotation (default 2h)
 	Logger           *slog.Logger
 	PeerClient       *http.Client
 	GrafanaClient    *http.Client
@@ -54,6 +57,7 @@ type Proxy struct {
 	instanceURL      string
 	grafanaURL       string
 	rotationInterval time.Duration
+	sessionTTL       time.Duration
 	store            store.SessionStore
 	logger           *slog.Logger
 	peerClient       *http.Client
@@ -62,6 +66,8 @@ type Proxy struct {
 	rp               *httputil.ReverseProxy
 	inFlightRotation sync.Map
 	rotationCooldown sync.Map
+	activeSessions   sync.Map
+	stopKeepalive    context.CancelFunc
 }
 
 // NewProxy creates a new authenticated MCP reverse proxy.
@@ -167,17 +173,29 @@ func NewProxy(cfg Config, s store.SessionStore) (*Proxy, error) {
 		}
 	}
 
+	sessionTTL := cfg.SessionTTL
+	if sessionTTL <= 0 {
+		sessionTTL = 2 * time.Hour
+	}
+
 	p := &Proxy{
 		targetURL:        target,
 		baseURL:          cfg.BaseURL,
 		instanceURL:      cfg.InstanceURL,
 		grafanaURL:       strings.TrimRight(cfg.GrafanaURL, "/"),
 		rotationInterval: rotationInterval,
+		sessionTTL:       sessionTTL,
 		store:            s,
 		logger:           cfg.Logger,
 		peerClient:       peerClient,
 		grafanaClient:    grafanaClient,
 		rotateFunc:       rotateFunc,
+	}
+
+	keepaliveCtx, keepaliveCancel := context.WithCancel(context.Background())
+	p.stopKeepalive = keepaliveCancel
+	if p.rotationInterval > 0 && p.grafanaURL != "" {
+		go p.startKeepaliveWorker(keepaliveCtx)
 	}
 
 	rp := &httputil.ReverseProxy{
@@ -220,12 +238,20 @@ func NewProxy(cfg Config, s store.SessionStore) (*Proxy, error) {
 			if strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
 				resp.Header.Set("X-Accel-Buffering", "no")
 				if resp.Request != nil && resp.Body != nil {
+					var token, username string
+					if t, ok := resp.Request.Context().Value(bearerTokenContextKey).(string); ok {
+						token = t
+					}
+					username = resp.Request.Header.Get("X-Forwarded-User")
+
 					sseCtx, cancel := context.WithCancel(resp.Request.Context())
 					resp.Body = &sseBodyWrapper{
 						ReadCloser: resp.Body,
 						proxy:      p,
 						ctx:        sseCtx,
 						cancel:     cancel,
+						token:      token,
+						username:   username,
 					}
 				}
 				return nil
@@ -414,6 +440,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	grafanaSession := session.GrafanaSession
 	username := session.Username
 
+	// Record active session for continuous sliding keepalive
+	p.touchActiveSession(token, username)
+
 	// Trigger proactive sliding keep-alive rotation of Grafana session if due
 	if p.grafanaURL != "" && p.rotationInterval > 0 && grafanaSession != "" {
 		lastRotated := session.LastRotatedAt
@@ -421,7 +450,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			lastRotated = session.CreatedAt
 		}
 		if time.Since(lastRotated) >= p.rotationInterval {
-			p.triggerAsyncGrafanaRotation(token, grafanaSession, username)
+			p.triggerAsyncGrafanaRotation(token, grafanaSession, username, p.sessionTTL)
 		}
 	}
 
@@ -476,6 +505,8 @@ type sseBodyWrapper struct {
 	registered bool
 	buf        []byte
 	mu         sync.Mutex
+	token      string
+	username   string
 }
 
 func (w *sseBodyWrapper) Read(p []byte) (int, error) {
@@ -511,6 +542,9 @@ func (w *sseBodyWrapper) Read(p []byte) (int, error) {
 							tCtx, tCancel := context.WithTimeout(context.Background(), 5*time.Second)
 							_ = w.proxy.store.RegisterMCPSession(tCtx, sid, w.proxy.instanceURL, 120*time.Second)
 							tCancel()
+							if w.token != "" {
+								w.proxy.touchActiveSession(w.token, w.username)
+							}
 						}
 					}
 				}(sessID, w.ctx)
@@ -576,9 +610,156 @@ func isSelf(a, b string) bool {
 	return false
 }
 
-func (p *Proxy) triggerAsyncGrafanaRotation(token, currentSession, username string) {
+type activeSessionInfo struct {
+	token            string
+	username         string
+	lastActivityNano atomic.Int64
+	lastRotatedNano  atomic.Int64
+}
+
+func (a *activeSessionInfo) LastActivity() time.Time {
+	return time.Unix(0, a.lastActivityNano.Load())
+}
+
+func (a *activeSessionInfo) SetLastActivity(t time.Time) {
+	a.lastActivityNano.Store(t.UnixNano())
+}
+
+func (a *activeSessionInfo) LastRotated() time.Time {
+	return time.Unix(0, a.lastRotatedNano.Load())
+}
+
+func (a *activeSessionInfo) SetLastRotated(t time.Time) {
+	a.lastRotatedNano.Store(t.UnixNano())
+}
+
+func newActiveSessionInfo(token, username string, lastActivity, lastRotated time.Time) *activeSessionInfo {
+	info := &activeSessionInfo{
+		token:    token,
+		username: username,
+	}
+	info.SetLastActivity(lastActivity)
+	info.SetLastRotated(lastRotated)
+	return info
+}
+
+func (p *Proxy) touchActiveSession(token, username string) {
+	if token == "" {
+		return
+	}
+	now := time.Now()
+	if val, ok := p.activeSessions.Load(token); ok {
+		if info, ok := val.(*activeSessionInfo); ok && info != nil {
+			info.SetLastActivity(now)
+			return
+		}
+	}
+	p.activeSessions.Store(token, newActiveSessionInfo(token, username, now, now))
+}
+
+func (p *Proxy) startKeepaliveWorker(ctx context.Context) {
+	checkInterval := p.rotationInterval / 2
+	if checkInterval > time.Minute {
+		checkInterval = time.Minute
+	}
+	if checkInterval < 10*time.Millisecond {
+		checkInterval = 10 * time.Millisecond
+	}
+
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.activeSessions.Range(func(key, val any) bool {
+				token, ok := key.(string)
+				if !ok || token == "" {
+					p.activeSessions.Delete(key)
+					p.rotationCooldown.Delete(key)
+					return true
+				}
+				info, ok := val.(*activeSessionInfo)
+				if !ok || info == nil {
+					p.activeSessions.Delete(key)
+					p.rotationCooldown.Delete(key)
+					return true
+				}
+
+				// If session has been inactive longer than sessionTTL, prune it
+				remainingTTL := p.sessionTTL - time.Since(info.LastActivity())
+				if remainingTTL <= 0 {
+					p.activeSessions.Delete(key)
+					p.rotationCooldown.Delete(key)
+					return true
+				}
+
+				if p.store == nil || p.grafanaURL == "" || p.rotationInterval <= 0 {
+					return true
+				}
+
+				// Fast in-memory check to prevent redundant Redis calls and HKDF-SHA3-512 decryptions every tick
+				if time.Since(info.LastRotated()) < p.rotationInterval {
+					return true
+				}
+
+				sCtx, sCancel := context.WithTimeout(ctx, 5*time.Second)
+				sess, err := p.store.GetSession(sCtx, info.token)
+				sCancel()
+				if err != nil {
+					if errors.Is(err, store.ErrSessionNotFound) || errors.Is(err, store.ErrSessionExpired) {
+						// Session expired or revoked in store
+						p.activeSessions.Delete(key)
+						p.rotationCooldown.Delete(key)
+					} else {
+						// Transient network or Redis timeout; preserve active session for retry on next tick
+						p.logger.Warn("Transient store error during keepalive check; retaining for next tick",
+							"error", err,
+							"username", info.username,
+						)
+					}
+					return true
+				}
+
+				if sess.GrafanaSession == "" {
+					return true
+				}
+
+				lastRotated := sess.LastRotatedAt
+				if lastRotated.IsZero() {
+					lastRotated = sess.CreatedAt
+				}
+
+				// Synchronize in-memory lastRotated if another replica rotated this session
+				if lastRotated.After(info.LastRotated()) {
+					info.SetLastRotated(lastRotated)
+				}
+
+				if time.Since(lastRotated) >= p.rotationInterval {
+					if remainingTTL > p.sessionTTL {
+						remainingTTL = p.sessionTTL
+					}
+					p.triggerAsyncGrafanaRotation(info.token, sess.GrafanaSession, info.username, remainingTTL)
+					info.SetLastRotated(time.Now())
+				}
+				return true
+			})
+		}
+	}
+}
+
+// Close gracefully stops the proxy background keepalive worker.
+func (p *Proxy) Close() {
+	if p.stopKeepalive != nil {
+		p.stopKeepalive()
+	}
+}
+
+func (p *Proxy) triggerAsyncGrafanaRotation(token, currentSession, username string, slidingTTL time.Duration) {
 	if nextRetry, ok := p.rotationCooldown.Load(token); ok {
-		if time.Now().Before(nextRetry.(time.Time)) {
+		if t, ok := nextRetry.(time.Time); ok && time.Now().Before(t) {
 			return // Cooldown active after previous rotation failure to prevent upstream stampede
 		}
 		p.rotationCooldown.Delete(token)
@@ -610,10 +791,36 @@ func (p *Proxy) triggerAsyncGrafanaRotation(token, currentSession, username stri
 			defer func() {
 				_ = p.store.ReleaseRotationLock(ctx, token, lockID)
 			}()
+
+			// Re-fetch latest session under distributed lock to prevent double-rotation race conditions
+			latestSession, err := p.store.GetSession(ctx, token)
+			if err == nil && latestSession != nil {
+				lastRotated := latestSession.LastRotatedAt
+				if lastRotated.IsZero() {
+					lastRotated = latestSession.CreatedAt
+				}
+				if time.Since(lastRotated) < p.rotationInterval {
+					if val, ok := p.activeSessions.Load(token); ok {
+						if info, ok := val.(*activeSessionInfo); ok && info != nil {
+							info.SetLastRotated(lastRotated)
+						}
+					}
+					return // Already rotated by another pod/goroutine
+				}
+				if latestSession.GrafanaSession != "" {
+					currentSession = latestSession.GrafanaSession
+				}
+			}
 		}
 
 		newSession, err := p.rotateFunc(ctx, p.grafanaURL, currentSession)
 		if err != nil {
+			if errors.Is(err, oauth.ErrGrafanaSessionInvalid) {
+				p.activeSessions.Delete(token)
+				p.rotationCooldown.Delete(token)
+				p.logger.Warn("Grafana session expired or revoked upstream; pruned from active keepalive", "username", username)
+				return
+			}
 			// Enforce a 1-minute cooldown so failure does not stampede Grafana on subsequent requests
 			p.rotationCooldown.Store(token, time.Now().Add(1*time.Minute))
 			p.logger.Warn("Failed to rotate Grafana session cookie in background", "error", err, "username", username)
@@ -621,13 +828,22 @@ func (p *Proxy) triggerAsyncGrafanaRotation(token, currentSession, username stri
 		}
 
 		p.rotationCooldown.Delete(token)
+		if val, ok := p.activeSessions.Load(token); ok {
+			if info, ok := val.(*activeSessionInfo); ok && info != nil {
+				info.SetLastRotated(time.Now())
+			}
+		}
 
 		if newSession == "" {
 			newSession = currentSession
 		}
 
+		if slidingTTL <= 0 {
+			slidingTTL = p.sessionTTL
+		}
+
 		if p.store != nil {
-			if err := p.store.UpdateGrafanaSession(ctx, token, newSession, 0); err != nil {
+			if err := p.store.UpdateGrafanaSession(ctx, token, newSession, slidingTTL); err != nil {
 				p.logger.Warn("Failed to persist rotated Grafana session cookie in store", "error", err, "username", username)
 				return
 			}
@@ -638,7 +854,7 @@ func (p *Proxy) triggerAsyncGrafanaRotation(token, currentSession, username stri
 				"username", username,
 			)
 		} else {
-			p.logger.Debug("Grafana session kept active without cookie change (SkipRotation threshold)",
+			p.logger.Info("Successfully kept Grafana session active in background (SkipRotation threshold)",
 				"username", username,
 			)
 		}
