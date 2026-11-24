@@ -539,12 +539,35 @@ func (w *sseBodyWrapper) Read(p []byte) (int, error) {
 						case <-bgCtx.Done():
 							return
 						case <-ticker.C:
+							if w.token != "" && w.proxy.store != nil {
+								chkCtx, chkCancel := context.WithTimeout(context.Background(), 5*time.Second)
+								_, err := w.proxy.store.GetSession(chkCtx, w.token)
+								chkCancel()
+								if err != nil {
+									if errors.Is(err, store.ErrSessionNotFound) || errors.Is(err, store.ErrSessionExpired) {
+										w.proxy.logger.Warn("Terminating active MCP SSE session: session expired or revoked",
+											"session_id", sid,
+											"username", w.username,
+										)
+										delCtx, delCancel := context.WithTimeout(context.Background(), 5*time.Second)
+										_ = w.proxy.store.DeleteMCPSession(delCtx, sid)
+										delCancel()
+										w.cancel()
+										return
+									}
+									// Transient network or Redis timeout; preserve active SSE session for next tick
+									w.proxy.logger.Warn("Transient store error during SSE session verification; retaining",
+										"error", err,
+										"session_id", sid,
+										"username", w.username,
+									)
+								} else {
+									w.proxy.touchActiveSession(w.token, w.username)
+								}
+							}
 							tCtx, tCancel := context.WithTimeout(context.Background(), 5*time.Second)
 							_ = w.proxy.store.RegisterMCPSession(tCtx, sid, w.proxy.instanceURL, 120*time.Second)
 							tCancel()
-							if w.token != "" {
-								w.proxy.touchActiveSession(w.token, w.username)
-							}
 						}
 					}
 				}(sessID, w.ctx)
@@ -818,7 +841,12 @@ func (p *Proxy) triggerAsyncGrafanaRotation(token, currentSession, username stri
 			if errors.Is(err, oauth.ErrGrafanaSessionInvalid) {
 				p.activeSessions.Delete(token)
 				p.rotationCooldown.Delete(token)
-				p.logger.Warn("Grafana session expired or revoked upstream; pruned from active keepalive", "username", username)
+				if p.store != nil {
+					if delErr := p.store.DeleteSession(ctx, token); delErr != nil {
+						p.logger.Warn("Failed to delete expired/revoked session from store", "error", delErr, "username", username)
+					}
+				}
+				p.logger.Warn("Grafana session expired or revoked upstream; pruned from active keepalive and session store", "username", username)
 				return
 			}
 			// Enforce a 1-minute cooldown so failure does not stampede Grafana on subsequent requests

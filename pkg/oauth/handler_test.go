@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -58,6 +59,10 @@ func setupOAuthTestEnv(t *testing.T) (*oauth.Handler, *store.RedisSessionStore, 
 			}
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = w.Write([]byte(`{"message":"Unauthorized"}`))
+			return
+		}
+		if r.URL.Path == "/logout" {
+			w.WriteHeader(http.StatusOK)
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)
@@ -1892,5 +1897,497 @@ func TestHandleCallback_DoesNotRestoreExpiredSession(t *testing.T) {
 		assert.NotEqual(t, "original_web_cookie_111", c.Value, "Must not restore an expired session cookie")
 	}
 }
+
+func TestHandleRevoke_AccessToken_Success(t *testing.T) {
+	var logoutCalled atomic.Bool
+	var receivedGrafanaCookie string
+
+	mockGrafana := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/logout" {
+			logoutCalled.Store(true)
+			if c, err := r.Cookie("grafana_session"); err == nil {
+				receivedGrafanaCookie = c.Value
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer mockGrafana.Close()
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st, err := store.NewRedisSessionStore(rdb, []byte("super-secret-master-salt-1234567890"))
+	require.NoError(t, err)
+
+	cfg := oauth.Config{
+		BaseURL:          "http://localhost:8080",
+		GrafanaURL:       mockGrafana.URL,
+		GrafanaPublicURL: mockGrafana.URL,
+		CallbackBaseURL:  "http://localhost:8080/mcp/auth/callback",
+		SessionTTL:       1 * time.Hour,
+		RefreshTTL:       24 * time.Hour,
+		HTTPClient:       mockGrafana.Client(),
+		CIMDEnforcement:  "disabled",
+	}
+	h := oauth.NewHandler(cfg, st)
+	defer h.Close()
+
+	ctx := context.Background()
+	at := "at_revoke_test_123"
+	rt := "rt_revoke_test_123"
+	grafanaSess := "grafana_sess_dedicated_999"
+	clientID := "test-client-rev"
+
+	sess := &store.SessionData{
+		UserID:         "42",
+		Username:       "bob",
+		ClientID:       clientID,
+		GrafanaSession: grafanaSess,
+		RefreshToken:   rt,
+		ExpiresAt:      time.Now().Add(1 * time.Hour),
+	}
+	require.NoError(t, st.SaveSession(ctx, at, sess, 1*time.Hour))
+	require.NoError(t, st.SaveRefreshTokenSession(ctx, rt, sess, 24*time.Hour))
+
+	form := url.Values{}
+	form.Set("token", at)
+	form.Set("token_type_hint", "access_token")
+	form.Set("client_id", clientID)
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp/auth/revoke", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+
+	h.HandleRevoke(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+	assert.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
+	assert.Equal(t, "{}", strings.TrimSpace(rec.Body.String()))
+
+	// Verify session and refresh token are deleted from store
+	_, err = st.GetSession(ctx, at)
+	assert.ErrorIs(t, err, store.ErrSessionNotFound, "Access token must be deleted from Redis")
+
+	_, err = st.GetRefreshSession(ctx, rt)
+	assert.ErrorIs(t, err, store.ErrInvalidRefreshToken, "Refresh token must be deleted from Redis")
+
+	// Verify upstream Grafana /logout was invoked with dedicated session
+	assert.True(t, logoutCalled.Load(), "Upstream Grafana /logout must be called")
+	assert.Equal(t, grafanaSess, receivedGrafanaCookie, "Upstream /logout must receive the correct grafana_session cookie")
+}
+
+func TestHandleRevoke_RefreshToken_Success(t *testing.T) {
+	var logoutCalled atomic.Bool
+	var receivedGrafanaCookie string
+
+	mockGrafana := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/logout" {
+			logoutCalled.Store(true)
+			if c, err := r.Cookie("grafana_session"); err == nil {
+				receivedGrafanaCookie = c.Value
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer mockGrafana.Close()
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st, err := store.NewRedisSessionStore(rdb, []byte("super-secret-master-salt-1234567890"))
+	require.NoError(t, err)
+
+	cfg := oauth.Config{
+		BaseURL:          "http://localhost:8080",
+		GrafanaURL:       mockGrafana.URL,
+		GrafanaPublicURL: mockGrafana.URL,
+		CallbackBaseURL:  "http://localhost:8080/mcp/auth/callback",
+		SessionTTL:       1 * time.Hour,
+		RefreshTTL:       24 * time.Hour,
+		HTTPClient:       mockGrafana.Client(),
+		CIMDEnforcement:  "disabled",
+	}
+	h := oauth.NewHandler(cfg, st)
+	defer h.Close()
+
+	ctx := context.Background()
+	rt := "rt_direct_revoke_456"
+	grafanaSess := "grafana_sess_dedicated_888"
+	clientID := "test-client-ref"
+
+	sess := &store.SessionData{
+		UserID:         "42",
+		Username:       "bob",
+		ClientID:       clientID,
+		GrafanaSession: grafanaSess,
+		RefreshToken:   rt,
+		ExpiresAt:      time.Now().Add(1 * time.Hour),
+	}
+	require.NoError(t, st.SaveRefreshTokenSession(ctx, rt, sess, 24*time.Hour))
+
+	form := url.Values{}
+	form.Set("token", rt)
+	form.Set("token_type_hint", "refresh_token")
+	form.Set("client_id", clientID)
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp/auth/revoke", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+
+	h.HandleRevoke(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "{}", strings.TrimSpace(rec.Body.String()))
+
+	_, err = st.GetRefreshSession(ctx, rt)
+	assert.ErrorIs(t, err, store.ErrInvalidRefreshToken, "Refresh token must be deleted from Redis")
+
+	assert.True(t, logoutCalled.Load(), "Upstream Grafana /logout must be called")
+	assert.Equal(t, grafanaSess, receivedGrafanaCookie)
+}
+
+func TestHandleRevoke_AuthorizationHeader_Fallback(t *testing.T) {
+	h, st, mockGrafana := setupOAuthTestEnv(t)
+	defer h.Close()
+	defer mockGrafana.Close()
+
+	ctx := context.Background()
+	at := "at_bearer_fallback_789"
+	sess := &store.SessionData{
+		UserID:         "42",
+		Username:       "bob",
+		ClientID:       "test-client",
+		GrafanaSession: "valid_grafana_session_123",
+		ExpiresAt:      time.Now().Add(1 * time.Hour),
+	}
+	require.NoError(t, st.SaveSession(ctx, at, sess, 1*time.Hour))
+
+	form := url.Values{}
+	form.Set("client_id", "test-client")
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp/auth/revoke", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Authorization", "Bearer "+at)
+	rec := httptest.NewRecorder()
+
+	h.HandleRevoke(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	_, err := st.GetSession(ctx, at)
+	assert.ErrorIs(t, err, store.ErrSessionNotFound)
+}
+
+func TestHandleRevoke_NonexistentOrExpiredToken_Returns200OK(t *testing.T) {
+	h, _, mockGrafana := setupOAuthTestEnv(t)
+	defer h.Close()
+	defer mockGrafana.Close()
+
+	form := url.Values{}
+	form.Set("token", "nonexistent_token_abc_xyz")
+	form.Set("client_id", "test-client")
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp/auth/revoke", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+
+	h.HandleRevoke(rec, req)
+
+	// RFC 7009 Section 2.2: returns 200 OK for invalid or nonexistent tokens
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "{}", strings.TrimSpace(rec.Body.String()))
+}
+
+func TestHandleRevoke_MissingToken_Returns400(t *testing.T) {
+	h, _, mockGrafana := setupOAuthTestEnv(t)
+	defer h.Close()
+	defer mockGrafana.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp/auth/revoke", strings.NewReader(""))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+
+	h.HandleRevoke(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "invalid_request")
+}
+
+func TestHandleRevoke_ClientIDMismatch_Returns400(t *testing.T) {
+	h, st, mockGrafana := setupOAuthTestEnv(t)
+	defer h.Close()
+	defer mockGrafana.Close()
+
+	ctx := context.Background()
+	at := "at_client_mismatch"
+	sess := &store.SessionData{
+		UserID:         "42",
+		Username:       "bob",
+		ClientID:       "expected-client-id",
+		GrafanaSession: "valid_grafana_session_123",
+		ExpiresAt:      time.Now().Add(1 * time.Hour),
+	}
+	require.NoError(t, st.SaveSession(ctx, at, sess, 1*time.Hour))
+
+	form := url.Values{}
+	form.Set("token", at)
+	form.Set("client_id", "wrong-client-id")
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp/auth/revoke", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+
+	h.HandleRevoke(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "invalid_grant")
+
+	// Session must NOT be deleted if client_id verification fails
+	remaining, err := st.GetSession(ctx, at)
+	require.NoError(t, err)
+	assert.NotNil(t, remaining)
+}
+
+func TestHandleRevoke_MethodNotAllowed(t *testing.T) {
+	h, _, mockGrafana := setupOAuthTestEnv(t)
+	defer h.Close()
+	defer mockGrafana.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "/mcp/auth/revoke", nil)
+	rec := httptest.NewRecorder()
+
+	h.HandleRevoke(rec, req)
+
+	assert.Equal(t, http.StatusMethodNotAllowed, rec.Code)
+	assert.Equal(t, "POST", rec.Header().Get("Allow"))
+}
+
+func TestHandleToken_MethodNotAllowed(t *testing.T) {
+	h, _, mockGrafana := setupOAuthTestEnv(t)
+	defer h.Close()
+	defer mockGrafana.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "/mcp/auth/token", nil)
+	rec := httptest.NewRecorder()
+
+	h.HandleToken(rec, req)
+
+	assert.Equal(t, http.StatusMethodNotAllowed, rec.Code)
+	assert.Equal(t, "POST", rec.Header().Get("Allow"))
+}
+
+func TestHandleRevoke_HintRefreshToken_FallbackAccessToken(t *testing.T) {
+	h, st, mockGrafana := setupOAuthTestEnv(t)
+	defer h.Close()
+	defer mockGrafana.Close()
+
+	ctx := context.Background()
+	at := "at_fallback_test_hint_rt"
+	sess := &store.SessionData{
+		UserID:         "42",
+		Username:       "bob",
+		ClientID:       "test-client",
+		GrafanaSession: "grafana_sess_fallback_123",
+		ExpiresAt:      time.Now().Add(1 * time.Hour),
+	}
+	require.NoError(t, st.SaveSession(ctx, at, sess, 1*time.Hour))
+
+	// Pass token_type_hint="refresh_token" even though token is an access token
+	form := url.Values{}
+	form.Set("token", at)
+	form.Set("token_type_hint", "refresh_token")
+	form.Set("client_id", "test-client")
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp/auth/revoke", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+
+	h.HandleRevoke(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+	assert.Equal(t, "no-store", rec.Header().Get("Cache-Control"))
+
+	// Verify access token is deleted from store via fallback
+	_, err := st.GetSession(ctx, at)
+	assert.ErrorIs(t, err, store.ErrSessionNotFound, "Access token must be deleted via RFC 7009 fallback")
+}
+
+func TestHandleRevoke_CIMDRequired_MissingClientID_Rejected(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st, err := store.NewRedisSessionStore(rdb, []byte("super-secret-master-salt-1234567890"))
+	require.NoError(t, err)
+
+	cfg := oauth.Config{
+		BaseURL:         "http://localhost:8080",
+		CIMDEnforcement: "required",
+	}
+	h := oauth.NewHandler(cfg, st)
+	defer h.Close()
+
+	// Non-existent token without client_id must be rejected with 400 invalid_client upfront
+	form := url.Values{}
+	form.Set("token", "some_nonexistent_token")
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp/auth/revoke", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+
+	h.HandleRevoke(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "invalid_client")
+	assert.Contains(t, rec.Body.String(), "client_id parameter is required")
+}
+
+func TestHandleRevoke_BodyTooLarge_Rejected(t *testing.T) {
+	h, _, mockGrafana := setupOAuthTestEnv(t)
+	defer h.Close()
+	defer mockGrafana.Close()
+
+	// Send body exceeding 64KB
+	hugeToken := strings.Repeat("A", 70*1024)
+	form := url.Values{}
+	form.Set("token", hugeToken)
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp/auth/revoke", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+
+	h.HandleRevoke(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "invalid_request")
+}
+
+func TestHandleRevoke_QueryParamToken_Rejected(t *testing.T) {
+	h, _, mockGrafana := setupOAuthTestEnv(t)
+	defer h.Close()
+	defer mockGrafana.Close()
+
+	// Pass token via query string
+	req := httptest.NewRequest(http.MethodPost, "/mcp/auth/revoke?token=leaked_query_token", nil)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+
+	h.HandleRevoke(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "invalid_request")
+	assert.Contains(t, rec.Body.String(), "token parameter must be provided in request body, not in query string")
+}
+
+func TestHandleRevoke_RefreshToken_RevokesAssociatedAccessToken(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st, err := store.NewRedisSessionStore(rdb, []byte("super-secret-master-salt-1234567890"))
+	require.NoError(t, err)
+
+	cfg := oauth.Config{
+		BaseURL:         "http://localhost:8080",
+		CIMDEnforcement: "disabled",
+	}
+	h := oauth.NewHandler(cfg, st)
+	defer h.Close()
+
+	ctx := context.Background()
+	at := "mcp_at_linked_test_123"
+	rt := "mcp_rt_linked_test_456"
+
+	sess := &store.SessionData{
+		UserID:         "42",
+		Username:       "bob",
+		ClientID:       "test-client-linked",
+		GrafanaSession: "grafana_sess_dedicated_999",
+		AccessToken:    at,
+		RefreshToken:   rt,
+		ExpiresAt:      time.Now().Add(1 * time.Hour),
+	}
+	require.NoError(t, st.SaveSession(ctx, at, sess, 1*time.Hour))
+	require.NoError(t, st.SaveRefreshTokenSession(ctx, rt, sess, 24*time.Hour))
+
+	form := url.Values{}
+	form.Set("token", rt)
+	form.Set("token_type_hint", "refresh_token")
+	form.Set("client_id", "test-client-linked")
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp/auth/revoke", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+
+	h.HandleRevoke(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	// Both refresh token AND linked access token must be purged from Redis
+	_, err = st.GetRefreshSession(ctx, rt)
+	assert.ErrorIs(t, err, store.ErrInvalidRefreshToken)
+
+	_, err = st.GetSession(ctx, at)
+	assert.ErrorIs(t, err, store.ErrSessionNotFound, "Linked access token must be purged when refresh token is revoked")
+}
+
+func TestHandleRevoke_SharedBrowserSession_DoesNotCallUpstreamLogout(t *testing.T) {
+	var logoutCalled atomic.Bool
+	mockGrafana := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/logout" {
+			logoutCalled.Store(true)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer mockGrafana.Close()
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st, err := store.NewRedisSessionStore(rdb, []byte("super-secret-master-salt-1234567890"))
+	require.NoError(t, err)
+
+	cfg := oauth.Config{
+		BaseURL:         "http://localhost:8080",
+		GrafanaURL:      mockGrafana.URL,
+		HTTPClient:      mockGrafana.Client(),
+		CIMDEnforcement: "disabled",
+	}
+	h := oauth.NewHandler(cfg, st)
+	defer h.Close()
+
+	ctx := context.Background()
+	at := "at_shared_sess_test"
+	sess := &store.SessionData{
+		UserID:               "42",
+		Username:             "bob",
+		ClientID:             "test-client-shared",
+		GrafanaSession:       "grafana_sess_shared_browser_123",
+		SharedBrowserSession: true, // Non-dedicated shared session
+		ExpiresAt:            time.Now().Add(1 * time.Hour),
+	}
+	require.NoError(t, st.SaveSession(ctx, at, sess, 1*time.Hour))
+
+	form := url.Values{}
+	form.Set("token", at)
+	form.Set("client_id", "test-client-shared")
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp/auth/revoke", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+
+	h.HandleRevoke(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	// Access token must be purged from Redis
+	_, err = st.GetSession(ctx, at)
+	assert.ErrorIs(t, err, store.ErrSessionNotFound)
+
+	// Upstream Grafana /logout must NOT be called for shared browser sessions
+	assert.False(t, logoutCalled.Load(), "Upstream /logout must not be invoked for shared browser sessions")
+}
+
+
 
 

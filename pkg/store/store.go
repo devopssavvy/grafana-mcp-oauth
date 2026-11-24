@@ -43,17 +43,19 @@ const (
 
 // SessionData represents the user identity and Grafana session credentials.
 type SessionData struct {
-	UserID         string                 `json:"user_id"`
-	Username       string                 `json:"username"`
-	Email          string                 `json:"email"`
-	ClientID       string                 `json:"client_id,omitempty"`
-	GrafanaSession string                 `json:"grafana_session"`
-	RefreshToken   string                 `json:"refresh_token,omitempty"`
-	IDToken        string                 `json:"id_token,omitempty"`
-	UserClaims     map[string]interface{} `json:"user_claims,omitempty"`
-	CreatedAt      time.Time              `json:"created_at"`
-	ExpiresAt      time.Time              `json:"expires_at"`
-	LastRotatedAt  time.Time              `json:"last_rotated_at,omitempty"`
+	UserID               string                 `json:"user_id"`
+	Username             string                 `json:"username"`
+	Email                string                 `json:"email"`
+	ClientID             string                 `json:"client_id,omitempty"`
+	GrafanaSession       string                 `json:"grafana_session"`
+	AccessToken          string                 `json:"access_token,omitempty"`
+	RefreshToken         string                 `json:"refresh_token,omitempty"`
+	IDToken              string                 `json:"id_token,omitempty"`
+	UserClaims           map[string]interface{} `json:"user_claims,omitempty"`
+	CreatedAt            time.Time              `json:"created_at"`
+	ExpiresAt            time.Time              `json:"expires_at"`
+	LastRotatedAt        time.Time              `json:"last_rotated_at,omitempty"`
+	SharedBrowserSession bool                   `json:"shared_browser_session,omitempty"`
 }
 
 // GrafanaUser represents user info returned by Grafana /api/user.
@@ -79,13 +81,14 @@ type PendingAuthRequest struct {
 
 // AuthCodeContext holds state associated with an issued authorization code.
 type AuthCodeContext struct {
-	GrafanaSession      string       `json:"grafana_session"`
-	UserInfo            *GrafanaUser `json:"user_info"`
-	ClientID            string       `json:"client_id"`
-	RedirectURI         string       `json:"redirect_uri"`
-	CodeChallenge       string       `json:"code_challenge"`
-	CodeChallengeMethod string       `json:"code_challenge_method"`
-	ExpiresAt           time.Time    `json:"expires_at"`
+	GrafanaSession       string       `json:"grafana_session"`
+	UserInfo             *GrafanaUser `json:"user_info"`
+	ClientID             string       `json:"client_id"`
+	RedirectURI          string       `json:"redirect_uri"`
+	CodeChallenge        string       `json:"code_challenge"`
+	CodeChallengeMethod  string       `json:"code_challenge_method"`
+	ExpiresAt            time.Time    `json:"expires_at"`
+	SharedBrowserSession bool         `json:"shared_browser_session,omitempty"`
 }
 
 // SessionStore defines the interface for secure distributed session and OAuth state storage.
@@ -95,6 +98,7 @@ type SessionStore interface {
 	DeleteSession(ctx context.Context, token string) error
 	UpdateGrafanaSession(ctx context.Context, token string, newGrafanaSession string, ttl time.Duration) error
 	SaveRefreshTokenSession(ctx context.Context, refreshToken string, session *SessionData, ttl time.Duration) error
+	GetRefreshSession(ctx context.Context, refreshToken string) (*SessionData, error)
 	GetAndDeleteRefreshSession(ctx context.Context, refreshToken string) (*SessionData, error)
 	SaveRefreshToken(ctx context.Context, refreshToken string, token string, ttl time.Duration) error
 	GetTokenByRefreshToken(ctx context.Context, refreshToken string) (string, error)
@@ -272,6 +276,35 @@ func (s *RedisSessionStore) SaveRefreshTokenSession(ctx context.Context, refresh
 	return nil
 }
 
+// GetRefreshSession retrieves a refresh token session without deleting it.
+func (s *RedisSessionStore) GetRefreshSession(ctx context.Context, refreshToken string) (*SessionData, error) {
+	redisKey := refreshKeyPrefix + crypto.HashTokenKey(refreshToken, s.masterSecret)
+
+	res, err := s.client.Get(ctx, redisKey).Result()
+	if errors.Is(err, redis.Nil) || res == "" {
+		return nil, ErrInvalidRefreshToken
+	} else if err != nil {
+		return nil, fmt.Errorf("redis get refresh session failed: %w", err)
+	}
+
+	encKey, err := crypto.DeriveKeyHKDF(refreshToken, s.masterSecret, []byte(hkdfInfoRefresh))
+	if err != nil {
+		return nil, fmt.Errorf("failed to derive refresh encryption key: %w", err)
+	}
+
+	decrypted, err := crypto.Decrypt([]byte(res), encKey)
+	if err != nil {
+		return nil, ErrInvalidRefreshToken
+	}
+
+	var session SessionData
+	if err := json.Unmarshal(decrypted, &session); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal refresh session: %w", err)
+	}
+
+	return &session, nil
+}
+
 // GetAndDeleteRefreshSession atomically retrieves and deletes a refresh token session using a Lua script.
 // This enforces single-use refresh token rotation and eliminates race conditions.
 func (s *RedisSessionStore) GetAndDeleteRefreshSession(ctx context.Context, refreshToken string) (*SessionData, error) {
@@ -356,10 +389,11 @@ func (s *RedisSessionStore) GetTokenByRefreshToken(ctx context.Context, refreshT
 	return string(token), nil
 }
 
-// DeleteRefreshToken removes a refresh token mapping from Redis.
+// DeleteRefreshToken removes a refresh token mapping and session from Redis.
 func (s *RedisSessionStore) DeleteRefreshToken(ctx context.Context, refreshToken string) error {
-	redisKey := legacyRefreshKeyPrefix + crypto.HashTokenKey(refreshToken, s.masterSecret)
-	return s.client.Del(ctx, redisKey).Err()
+	redisKey := refreshKeyPrefix + crypto.HashTokenKey(refreshToken, s.masterSecret)
+	legacyKey := legacyRefreshKeyPrefix + crypto.HashTokenKey(refreshToken, s.masterSecret)
+	return s.client.Del(ctx, redisKey, legacyKey).Err()
 }
 
 // SavePendingAuth encrypts and stores an ongoing OAuth authorization flow state with TTL.
@@ -636,16 +670,18 @@ func (s *RedisSessionStore) ReleaseRotationLock(ctx context.Context, token strin
 
 func sessionToMap(s *SessionData) map[string]any {
 	m := map[string]any{
-		"user_id":         s.UserID,
-		"username":        s.Username,
-		"email":           s.Email,
-		"client_id":       s.ClientID,
-		"grafana_session": s.GrafanaSession,
-		"refresh_token":   s.RefreshToken,
-		"id_token":        s.IDToken,
-		"user_claims":     s.UserClaims,
-		"created_at":      s.CreatedAt,
-		"expires_at":      s.ExpiresAt,
+		"user_id":                s.UserID,
+		"username":               s.Username,
+		"email":                  s.Email,
+		"client_id":              s.ClientID,
+		"grafana_session":        s.GrafanaSession,
+		"access_token":           s.AccessToken,
+		"refresh_token":          s.RefreshToken,
+		"id_token":               s.IDToken,
+		"user_claims":            s.UserClaims,
+		"created_at":             s.CreatedAt,
+		"expires_at":             s.ExpiresAt,
+		"shared_browser_session": s.SharedBrowserSession,
 	}
 	if !s.LastRotatedAt.IsZero() {
 		m["last_rotated_at"] = s.LastRotatedAt

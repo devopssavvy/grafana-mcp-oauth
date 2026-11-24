@@ -332,6 +332,42 @@ func TestStore_RefreshTokenSessionFlow(t *testing.T) {
 	assert.ErrorIs(t, err, store.ErrInvalidRefreshToken)
 }
 
+func TestStore_GetRefreshSession_NonDestructive(t *testing.T) {
+	ctx := context.Background()
+	st, _ := setupTestStore(t)
+
+	refreshToken := "mcp_rt_session_peek_111"
+	sess := &store.SessionData{
+		UserID:         "user_111",
+		Username:       "alice",
+		Email:          "alice@example.com",
+		GrafanaSession: "grafana_sess_alice_secret",
+		ExpiresAt:      time.Now().Add(2 * time.Hour),
+	}
+
+	err := st.SaveRefreshTokenSession(ctx, refreshToken, sess, 30*24*time.Hour)
+	require.NoError(t, err)
+
+	// Non-destructive read
+	retrieved1, err := st.GetRefreshSession(ctx, refreshToken)
+	require.NoError(t, err)
+	assert.Equal(t, sess.Username, retrieved1.Username)
+	assert.Equal(t, sess.GrafanaSession, retrieved1.GrafanaSession)
+
+	// Second non-destructive read must still succeed
+	retrieved2, err := st.GetRefreshSession(ctx, refreshToken)
+	require.NoError(t, err)
+	assert.Equal(t, sess.Username, retrieved2.Username)
+
+	// Explicit deletion removes it
+	err = st.DeleteRefreshToken(ctx, refreshToken)
+	require.NoError(t, err)
+
+	// Subsequent read must return ErrInvalidRefreshToken
+	_, err = st.GetRefreshSession(ctx, refreshToken)
+	assert.ErrorIs(t, err, store.ErrInvalidRefreshToken)
+}
+
 func TestStore_AtomicAuthCodeSingleUse_And_RaceProtection(t *testing.T) {
 	ctx := context.Background()
 	st, _ := setupTestStore(t)
