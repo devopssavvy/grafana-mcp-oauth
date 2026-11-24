@@ -84,3 +84,48 @@ func RotateGrafanaSession(ctx context.Context, grafanaURL string, currentSession
 	// Grafana returns 200 OK without Set-Cookie if SkipRotationTime was triggered; session is still valid.
 	return currentSession, nil
 }
+
+// RevokeGrafanaSession calls Grafana's GET /logout endpoint with the existing session cookie,
+// explicitly destroying the session upstream in Grafana's database.
+func RevokeGrafanaSession(ctx context.Context, grafanaURL string, currentSession string, client *http.Client) error {
+	if grafanaURL == "" {
+		return errors.New("grafanaURL must not be empty")
+	}
+	if currentSession == "" {
+		return nil
+	}
+
+	reqURL := fmt.Sprintf("%s/logout", strings.TrimRight(grafanaURL, "/"))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create logout request: %w", err)
+	}
+
+	req.Header.Set("Cookie", fmt.Sprintf("grafana_session=%s", currentSession))
+
+	rotClient := &http.Client{
+		Timeout: 5 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	if client != nil {
+		if client.Timeout > 0 {
+			rotClient.Timeout = client.Timeout
+		}
+		if client.Transport != nil {
+			rotClient.Transport = client.Transport
+		}
+	}
+
+	resp, err := rotClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to execute logout request: %w", err)
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		_ = resp.Body.Close()
+	}()
+
+	return nil
+}

@@ -75,11 +75,29 @@ cmd/
 ## 4. Verification & Testing
 
 Every code modification must be verified before pushing:
+
+### 4.1 Unit and Integration Tests
 ```bash
 # Run unit and integration tests
 go test -v ./...
 
-# Verify container build and linting
-make docker-build
+# Verify container build
+docker build --network=host -t grafana-mcp-oauth:latest -f Dockerfile .
+```
+
+### 4.2 Real Grafana Setup E2E Testing
+To verify end-to-end behavior against a live multi-replica Grafana, Redis, and Envoy ecosystem:
+```bash
+# 1. Build and start the real Grafana multi-replica stack (set FORCE_DEDICATED_SESSION=false for upstream expiry simulation)
+FORCE_DEDICATED_SESSION=false docker compose -f deploy/docker-compose.multi.yml up -d --build
+
+# 2. Run the live Grafana session expiration, keepalive pruning & refresh token test
+python3 test/test_real_grafana_session_expiry_e2e.py
+
+# 3. Run the live Grafana Streamable HTTP & tool calls verification test
+python3 test/test_streamable_tool_calls_e2e.py
+
+# 4. Run the multi-replica HA and peer-forwarding verification test
+python3 test/test_multi_replica_e2e.py
 ```
 Ensure that any new functionality is accompanied by comprehensive tests in the corresponding package.

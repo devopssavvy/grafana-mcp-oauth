@@ -40,7 +40,7 @@ func (m *mockStore) GetSession(ctx context.Context, token string) (*store.Sessio
 	defer m.mu.Unlock()
 	s, ok := m.sessions[token]
 	if !ok {
-		return nil, fmt.Errorf("session not found")
+		return nil, store.ErrSessionNotFound
 	}
 	cp := *s
 	return &cp, nil
@@ -71,6 +71,10 @@ func (m *mockStore) UpdateGrafanaSession(ctx context.Context, token string, newG
 
 func (m *mockStore) SaveRefreshTokenSession(ctx context.Context, refreshToken string, session *store.SessionData, ttl time.Duration) error {
 	return nil
+}
+
+func (m *mockStore) GetRefreshSession(ctx context.Context, refreshToken string) (*store.SessionData, error) {
+	return nil, store.ErrInvalidRefreshToken
 }
 
 func (m *mockStore) GetAndDeleteRefreshSession(ctx context.Context, refreshToken string) (*store.SessionData, error) {
@@ -1526,5 +1530,75 @@ func TestProxy_BackgroundKeepalive_PrunesStaleCooldown(t *testing.T) {
 	}
 	if _, ok := p.rotationCooldown.Load("expired-token"); ok {
 		t.Errorf("expected expired session to be deleted from rotationCooldown")
+	}
+}
+
+func TestProxy_BackgroundKeepalive_ErrGrafanaSessionInvalid_PrunesStoreAndRejectsSubsequentRequests(t *testing.T) {
+	upstreamHit := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	s := &mockStore{
+		sessions: map[string]*store.SessionData{
+			"active-token": {
+				Username:       "alice",
+				GrafanaSession: "expired-cookie",
+				CreatedAt:      time.Now().Add(-10 * time.Minute),
+				LastRotatedAt:  time.Now().Add(-10 * time.Minute),
+				ExpiresAt:      time.Now().Add(1 * time.Hour),
+			},
+		},
+	}
+
+	p, err := NewProxy(Config{
+		TargetURL:        upstream.URL,
+		BaseURL:          "http://localhost:8080",
+		GrafanaURL:       "http://grafana:3000",
+		RotationInterval: 20 * time.Millisecond,
+		SessionTTL:       1 * time.Hour,
+		RotateFunc: func(ctx context.Context, grafanaURL string, currentSession string) (string, error) {
+			return "", oauth.ErrGrafanaSessionInvalid
+		},
+	}, s)
+	if err != nil {
+		t.Fatalf("failed to create proxy: %v", err)
+	}
+	defer p.Close()
+
+	// Store active session with recent activity
+	p.activeSessions.Store("active-token", newActiveSessionInfo("active-token", "alice", time.Now(), time.Now().Add(-10*time.Minute)))
+
+	// Wait for keepalive worker to attempt rotation and detect ErrGrafanaSessionInvalid
+	time.Sleep(100 * time.Millisecond)
+
+	// 1. Session must be deleted from in-memory activeSessions
+	if _, ok := p.activeSessions.Load("active-token"); ok {
+		t.Errorf("expected active-token to be deleted from activeSessions")
+	}
+
+	// 2. Session MUST be deleted from persistent store (s.sessions) to prevent zombie sessions
+	if _, err := s.GetSession(context.Background(), "active-token"); err == nil {
+		t.Errorf("expected active-token to be deleted from store, but it was still present")
+	}
+
+	// 3. Subsequent HTTP requests with active-token MUST be rejected with 401 Unauthorized
+	req := httptest.NewRequest(http.MethodGet, "http://localhost:8080/mcp", nil)
+	req.Header.Set("Authorization", "Bearer active-token")
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("expected subsequent request to be rejected with 401, got %d", rec.Code)
+	}
+	if upstreamHit {
+		t.Errorf("expected upstream request NOT to be forwarded for invalid Grafana session")
+	}
+
+	// 4. Token must NOT be resurrected in activeSessions
+	if _, ok := p.activeSessions.Load("active-token"); ok {
+		t.Errorf("expected active-token NOT to be resurrected in activeSessions after 401")
 	}
 }

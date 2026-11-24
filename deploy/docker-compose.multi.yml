@@ -39,6 +39,8 @@ services:
       - REDIS_ADDR=redis:6379
       - CIMD_ALLOW_INSECURE_HTTP=true
       - CIMD_ENFORCEMENT=permissive
+      - FORCE_DEDICATED_SESSION=${FORCE_DEDICATED_SESSION:-true}
+      - GRAFANA_ROTATION_INTERVAL=${GRAFANA_ROTATION_INTERVAL:-2s}
       - LOG_LEVEL=debug
     depends_on:
       - redis
@@ -79,6 +81,8 @@ services:
       - REDIS_ADDR=redis:6379
       - CIMD_ALLOW_INSECURE_HTTP=true
       - CIMD_ENFORCEMENT=permissive
+      - FORCE_DEDICATED_SESSION=${FORCE_DEDICATED_SESSION:-true}
+      - GRAFANA_ROTATION_INTERVAL=${GRAFANA_ROTATION_INTERVAL:-2s}
       - LOG_LEVEL=debug
     depends_on:
       - redis

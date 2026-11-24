@@ -191,7 +191,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	// OAuth Endpoints
 	mux.HandleFunc("GET /mcp/auth/login", wrap(h.HandleLogin))
 	mux.HandleFunc("GET /mcp/auth/callback", wrap(h.HandleCallback))
-	mux.HandleFunc("POST /mcp/auth/token", wrap(h.HandleToken))
+	mux.HandleFunc("/mcp/auth/token", wrap(h.HandleToken))
+	mux.HandleFunc("/mcp/auth/revoke", wrap(h.HandleRevoke))
 	mux.HandleFunc("GET /mcp/auth/health", wrap(h.HandleHealth))
 }
 
@@ -214,14 +215,16 @@ func (h *Handler) HandleAuthorizationServerMetadata(w http.ResponseWriter, r *ht
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	meta := map[string]interface{}{
-		"issuer":                                h.cfg.BaseURL,
-		"authorization_endpoint":                fmt.Sprintf("%s/mcp/auth/login", h.cfg.BaseURL),
-		"token_endpoint":                        fmt.Sprintf("%s/mcp/auth/token", h.cfg.BaseURL),
-		"response_types_supported":              []string{"code"},
-		"grant_types_supported":                 []string{"authorization_code", "refresh_token"},
-		"code_challenge_methods_supported":      []string{"S256"},
-		"token_endpoint_auth_methods_supported": []string{"none", "client_secret_post"},
-		"scopes_supported":                      []string{"mcp"},
+		"issuer":                                     h.cfg.BaseURL,
+		"authorization_endpoint":                     fmt.Sprintf("%s/mcp/auth/login", h.cfg.BaseURL),
+		"token_endpoint":                             fmt.Sprintf("%s/mcp/auth/token", h.cfg.BaseURL),
+		"revocation_endpoint":                        fmt.Sprintf("%s/mcp/auth/revoke", h.cfg.BaseURL),
+		"response_types_supported":                   []string{"code"},
+		"grant_types_supported":                      []string{"authorization_code", "refresh_token"},
+		"code_challenge_methods_supported":           []string{"S256"},
+		"token_endpoint_auth_methods_supported":      []string{"none", "client_secret_post"},
+		"revocation_endpoint_auth_methods_supported": []string{"none", "client_secret_post"},
+		"scopes_supported":                           []string{"mcp"},
 	}
 	if h.cfg.CIMDEnforcement != "disabled" {
 		meta["client_id_metadata_document_supported"] = true
@@ -317,13 +320,14 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 				}
 
 				authCtx := &store.AuthCodeContext{
-					GrafanaSession:      origBrowserSession,
-					UserInfo:            userInfo,
-					ClientID:            clientID,
-					RedirectURI:         redirectURI,
-					CodeChallenge:       codeChallenge,
-					CodeChallengeMethod: codeChallengeMethod,
-					ExpiresAt:           time.Now().Add(h.cfg.AuthCodeTTL),
+					GrafanaSession:       origBrowserSession,
+					UserInfo:             userInfo,
+					ClientID:             clientID,
+					RedirectURI:          redirectURI,
+					CodeChallenge:        codeChallenge,
+					CodeChallengeMethod:  codeChallengeMethod,
+					ExpiresAt:            time.Now().Add(h.cfg.AuthCodeTTL),
+					SharedBrowserSession: true,
 				}
 
 				if err := h.store.SaveAuthCode(r.Context(), authCode, authCtx, h.cfg.AuthCodeTTL); err != nil {
@@ -609,6 +613,7 @@ func (h *Handler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 // HandleToken handles OAuth 2.1 token exchange (authorization_code with PKCE) and refresh.
 func (h *Handler) HandleToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -725,12 +730,14 @@ func (h *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 
 	expiresAt := time.Now().Add(h.cfg.SessionTTL)
 	sessionData := &store.SessionData{
-		UserID:         fmt.Sprintf("%d", authCtx.UserInfo.ID),
-		Username:       authCtx.UserInfo.Login,
-		Email:          authCtx.UserInfo.Email,
-		ClientID:       authCtx.ClientID,
-		GrafanaSession: authCtx.GrafanaSession,
-		RefreshToken:   refreshToken,
+		UserID:               fmt.Sprintf("%d", authCtx.UserInfo.ID),
+		Username:             authCtx.UserInfo.Login,
+		Email:                authCtx.UserInfo.Email,
+		ClientID:             authCtx.ClientID,
+		GrafanaSession:       authCtx.GrafanaSession,
+		AccessToken:          accessToken,
+		RefreshToken:         refreshToken,
+		SharedBrowserSession: authCtx.SharedBrowserSession,
 		UserClaims: map[string]interface{}{
 			"org_id": authCtx.UserInfo.OrgID,
 			"name":   authCtx.UserInfo.Name,
@@ -842,6 +849,7 @@ func (h *Handler) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request
 	}
 
 	session.ExpiresAt = time.Now().Add(h.cfg.SessionTTL)
+	session.AccessToken = newAccessToken
 	session.RefreshToken = newRefreshToken
 
 	// Save new access token session (SessionTTL)
@@ -877,6 +885,167 @@ func (h *Handler) HandleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "healthy"})
+}
+
+// HandleRevoke implements RFC 7009 OAuth 2.0 Token Revocation.
+// It accepts access tokens or refresh tokens, revokes the dedicated upstream Grafana session,
+// and purges the token and associated session materials from Redis.
+func (h *Handler) HandleRevoke(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Rate limiting: 60 requests per minute per IP via distributed Redis
+	clientIP := ExtractClientIP(r, h.cfg.TrustedProxies)
+	if h.tokenLimiter != nil && !h.tokenLimiter.Allow(r.Context(), clientIP) {
+		h.cfg.Logger.Warn("Rate limit exceeded on /mcp/auth/revoke", "client_ip", clientIP)
+		w.Header().Set("Retry-After", "60")
+		sendTokenError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "too many revocation requests, please try again later")
+		return
+	}
+
+	// Limit POST request body size to 64KB to prevent memory exhaustion DoS
+	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+
+	if err := r.ParseForm(); err != nil {
+		sendTokenError(w, http.StatusBadRequest, "invalid_request", "invalid form data or body exceeds size limit")
+		return
+	}
+
+	// Reject token passed via URL query string to prevent credential exposure in access logs
+	if r.URL.Query().Get("token") != "" {
+		sendTokenError(w, http.StatusBadRequest, "invalid_request", "token parameter must be provided in request body, not in query string")
+		return
+	}
+
+	token := strings.TrimSpace(r.PostFormValue("token"))
+	tokenTypeHint := strings.TrimSpace(r.FormValue("token_type_hint"))
+	reqClientID := strings.TrimSpace(r.FormValue("client_id"))
+
+	// Fallback to Bearer authorization header if token param is omitted
+	if token == "" {
+		if authHdr := r.Header.Get("Authorization"); authHdr != "" {
+			token = extractBearerToken(authHdr)
+		}
+	}
+
+	// RFC 7009 Section 2.1: token parameter is required
+	if token == "" {
+		sendTokenError(w, http.StatusBadRequest, "invalid_request", "missing required 'token' parameter")
+		return
+	}
+
+	// In required CIMD mode, client_id parameter is strictly mandatory for all revocation requests
+	if h.cfg.CIMDEnforcement == "required" && reqClientID == "" {
+		sendTokenError(w, http.StatusBadRequest, "invalid_client", "client_id parameter is required")
+		return
+	}
+
+	var session *store.SessionData
+	var isAccessToken bool
+	var isRefreshToken bool
+
+	// 1. If hint is access_token or unspecified, check access token first
+	if tokenTypeHint != "refresh_token" {
+		sess, err := h.store.GetSession(r.Context(), token)
+		if err == nil && sess != nil {
+			session = sess
+			isAccessToken = true
+		}
+	}
+
+	// 2. If not found and hint allows, check refresh token
+	if session == nil && tokenTypeHint != "access_token" {
+		refSess, err := h.store.GetRefreshSession(r.Context(), token)
+		if err == nil && refSess != nil {
+			session = refSess
+			isRefreshToken = true
+		}
+	}
+
+	// 3. Fallback: if hint was access_token but token was actually a refresh token
+	if session == nil && tokenTypeHint == "access_token" {
+		refSess, err := h.store.GetRefreshSession(r.Context(), token)
+		if err == nil && refSess != nil {
+			session = refSess
+			isRefreshToken = true
+		}
+	}
+
+	// 4. Fallback: if hint was refresh_token but token was actually an access token (RFC 7009 Section 2.1)
+	if session == nil && tokenTypeHint == "refresh_token" {
+		sess, err := h.store.GetSession(r.Context(), token)
+		if err == nil && sess != nil {
+			session = sess
+			isAccessToken = true
+		}
+	}
+
+	// RFC 7009 Section 2.2: If the token is invalid or already revoked, respond with 200 OK
+	if session == nil {
+		h.cfg.Logger.Debug("Revocation requested for already expired or nonexistent token")
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Pragma", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("{}"))
+		return
+	}
+
+	// Verify client_id binding if session was bound to a client
+	if h.cfg.CIMDEnforcement == "required" || session.ClientID != "" {
+		if reqClientID == "" {
+			sendTokenError(w, http.StatusBadRequest, "invalid_client", "client_id parameter is required")
+			return
+		}
+		if subtle.ConstantTimeCompare([]byte(reqClientID), []byte(session.ClientID)) != 1 {
+			sendTokenError(w, http.StatusBadRequest, "invalid_grant", "client_id mismatch")
+			return
+		}
+	} else if reqClientID != "" {
+		if subtle.ConstantTimeCompare([]byte(reqClientID), []byte(session.ClientID)) != 1 {
+			sendTokenError(w, http.StatusBadRequest, "invalid_grant", "client_id mismatch")
+			return
+		}
+	}
+
+	// Upstream Grafana Revocation: Call GET /logout with the dedicated session cookie.
+	// Only execute upstream Grafana logout if this was NOT a shared browser session,
+	// preventing accidental web UI logout when running with FORCE_DEDICATED_SESSION=false.
+	if session.GrafanaSession != "" && h.cfg.GrafanaURL != "" && !session.SharedBrowserSession {
+		if err := RevokeGrafanaSession(r.Context(), h.cfg.GrafanaURL, session.GrafanaSession, h.cfg.HTTPClient); err != nil {
+			h.cfg.Logger.Warn("Failed to execute upstream Grafana session logout during revocation", "error", err, "username", session.Username)
+		} else {
+			h.cfg.Logger.Info("Successfully revoked upstream Grafana session during client-side revocation", "username", session.Username)
+		}
+	}
+
+	// Local & Distributed Redis Purging
+	if isAccessToken {
+		_ = h.store.DeleteSession(r.Context(), token)
+		if session.RefreshToken != "" {
+			_ = h.store.DeleteRefreshToken(r.Context(), session.RefreshToken)
+		}
+	} else if isRefreshToken {
+		_ = h.store.DeleteRefreshToken(r.Context(), token)
+		if session.AccessToken != "" {
+			_ = h.store.DeleteSession(r.Context(), session.AccessToken)
+		}
+	}
+
+	h.cfg.Logger.Info("Successfully revoked MCP token and session materials",
+		"username", session.Username,
+		"token_type_hint", tokenTypeHint,
+	)
+
+	// RFC 7009 Section 2.2: HTTP 200 OK
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("{}"))
 }
 
 // fetchGrafanaUser calls Grafana /api/user with the harvested session cookie, bounded to 1MB body.
@@ -1099,4 +1268,15 @@ func (h *Handler) validateCIMD(ctx context.Context, clientID, redirectURI string
 
 func isPossibleURL(raw string) bool {
 	return strings.HasPrefix(raw, "https://") || strings.HasPrefix(raw, "http://")
+}
+
+func extractBearerToken(header string) string {
+	if header == "" {
+		return ""
+	}
+	parts := strings.SplitN(header, " ", 2)
+	if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+		return strings.TrimSpace(parts[1])
+	}
+	return ""
 }

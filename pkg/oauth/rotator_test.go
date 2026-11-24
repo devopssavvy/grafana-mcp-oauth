@@ -131,3 +131,34 @@ func TestRotateGrafanaSession_InvalidArguments(t *testing.T) {
 	_, err = oauth.RotateGrafanaSession(timeoutCtx, "http://127.0.0.1:54321", "sess_123", nil)
 	assert.Error(t, err)
 }
+
+func TestRevokeGrafanaSession_Success(t *testing.T) {
+	var receivedCookie string
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/logout", r.URL.Path)
+		assert.Equal(t, http.MethodGet, r.Method)
+		if c, err := r.Cookie("grafana_session"); err == nil {
+			receivedCookie = c.Value
+		}
+		// Grafana redirects to /login on logout
+		http.Redirect(w, r, "/login", http.StatusFound)
+	}))
+	defer mockServer.Close()
+
+	ctx := context.Background()
+	err := oauth.RevokeGrafanaSession(ctx, mockServer.URL, "sess_to_revoke_123", nil)
+	require.NoError(t, err)
+	assert.Equal(t, "sess_to_revoke_123", receivedCookie)
+}
+
+func TestRevokeGrafanaSession_EmptyArgs(t *testing.T) {
+	ctx := context.Background()
+
+	// Empty grafanaURL returns error
+	err := oauth.RevokeGrafanaSession(ctx, "", "sess_123", nil)
+	assert.Error(t, err)
+
+	// Empty currentSession is a no-op
+	err = oauth.RevokeGrafanaSession(ctx, "http://localhost:3000", "", nil)
+	assert.NoError(t, err)
+}
